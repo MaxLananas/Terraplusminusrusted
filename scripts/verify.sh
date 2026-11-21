@@ -29,6 +29,7 @@ run_step clippy "${cargo_command[@]}" clippy --locked --workspace --all-targets 
 run_step tests "${cargo_command[@]}" test --locked --workspace
 run_step fixture-integrity scripts/check-fixtures.sh
 run_step dependency-licenses scripts/check-dependencies.sh
+run_step horizon-mod-against-stub scripts/check-horizon-mod.sh
 
 if $with_oracle; then
     run_step oracle tools/oracle/build-oracle.sh

@@ -1,0 +1,13 @@
+id = "terraplusminus"
+name = "TerraPlusMinus"
+version = "0.1.0"
+description = "Real-world terrain at 1:1 scale from elevation data, with /tpll teleportation."
+authors = ["MaxLananas"]
+license = "MIT"
+api = "0.2"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "ffd59c4e0cebd16c0982016f040b3a9b70e8b83b"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

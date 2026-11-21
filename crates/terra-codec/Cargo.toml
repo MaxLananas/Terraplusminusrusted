@@ -1,0 +1,11 @@
+[package]
+name = "terra-codec"
+description = "Bounded DEFLATE, gzip, zlib and PNG decoding for geographic raster inputs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

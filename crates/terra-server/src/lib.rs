@@ -4,6 +4,7 @@
 pub mod config;
 pub mod coordinates;
 pub mod java_text;
+pub mod region_index;
 pub mod stack;
 pub mod teleports;
 pub mod tpll;
@@ -13,3 +14,4 @@ pub use config::{ConfigError, NetworkConfig, PermissionLevels, ServerConfig, par
 pub use tpll::{Authorization, LevelHeight, LinkedWorld, LinkedWorlds, LinkedWorldsMethod, TeamBounds, TeleportWorld, TpllRequest, TpllStep, TpllTarget, parse_tpll_arguments};
 pub use stack::{StackError, TerraStack};
 pub use teleports::{PendingTeleports, TeleportOutcome, TeleportRefusal};
+pub use region_index::RegionIndex;

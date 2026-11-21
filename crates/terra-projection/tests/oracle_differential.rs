@@ -164,3 +164,45 @@ fn web_mercator_matches_upstream() {
     assert_matches(&compare("web_mercator_z13_from_geo.tsv.gz", projection.as_ref(), Direction::FromGeo, tolerance));
     assert_matches(&compare("web_mercator_z13_to_geo.tsv.gz", projection.as_ref(), Direction::ToGeo, 0.0));
 }
+
+/// Tissot's indicatrix differentiates `fromGeo` over 1e-7 rad (about 0.73 blocks), so the forward
+/// agreement (below 1e-8 blocks) bounds the relative error of each derivative near 1e-8.
+const TISSOT_RELATIVE_TOLERANCE: f64 = 1e-6;
+/// The angular distortion `2 asin(b'/a')` comes from `b' = sqrt(h^2 + k^2 - 2hk sin t)`, which
+/// cancels where the projection is nearly conformal, so it is compared as an absolute angle: 1e-6
+/// rad is below the 1e-4 degree that /distortion prints.
+const TISSOT_ANGLE_TOLERANCE_RADIANS: f64 = 1e-6;
+
+#[test]
+fn bte_tissot_matches_upstream() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/commands/golden/tissot_bte.tsv.gz");
+    let compressed = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let text = String::from_utf8(terra_codec::gunzip(&compressed, 16 << 20).expect("valid gzip fixture")).expect("utf-8 fixture");
+    let projection = bte();
+    let bits = |field: &str| f64::from_bits(u64::from_str_radix(field, 16).expect("hex bits"));
+    let (mut compared, mut worst, mut worst_angle) = (0, 0.0_f64, 0.0_f64);
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let (longitude, latitude) = (bits(fields[0]), bits(fields[1]));
+        let actual = projection.tissot(longitude, latitude);
+        if fields[2] != "ok" {
+            assert!(actual.is_err(), "{line}");
+            continue;
+        }
+        let actual = actual.unwrap_or_else(|error| panic!("{line}: {error:?}"));
+        for (index, (component, field)) in actual.iter().zip(&fields[3..7]).enumerate() {
+            let expected = bits(field);
+            if index == 1 {
+                worst_angle = worst_angle.max((component - expected).abs());
+                assert!((component - expected).abs() <= TISSOT_ANGLE_TOLERANCE_RADIANS, "{line}: angle {component} vs {expected}");
+            } else {
+                let error = (component - expected).abs() / expected.abs();
+                worst = worst.max(error);
+                assert!(error <= TISSOT_RELATIVE_TOLERANCE, "{line}: {component} vs {expected}");
+            }
+        }
+        compared += 1;
+    }
+    assert_eq!(compared, 400);
+    eprintln!("tissot: {compared} points, worst relative error {worst:e}, worst angle error {worst_angle:e} rad");
+}

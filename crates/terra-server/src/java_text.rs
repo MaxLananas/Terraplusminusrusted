@@ -349,6 +349,105 @@ impl PatternParser<'_> {
     }
 }
 
+/// Shortest round-trip decimal digits and the decimal exponent of the first digit:
+/// `value = 0.d1d2d3... * 10^(exponent + 1)`, from Rust's shortest representation.
+fn shortest_digits(value: f64) -> (String, i32) {
+    shortest_digits_of(&format!("{:e}", value.abs()))
+}
+
+fn shortest_digits_of(scientific: &str) -> (String, i32) {
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((scientific, "0"));
+    (mantissa.replace('.', ""), exponent.parse().unwrap_or(0))
+}
+
+/// `Double.toString` (JDK 19 and later): the shortest decimal that rounds to `value`, or when that
+/// has one digit, the closest two-digit decimal that does (`4.9E-324`, not `5.0E-324`).
+pub fn java_double_to_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0.0");
+    }
+    let (mut digits, mut exponent) = shortest_digits(value);
+    if digits.len() == 1 {
+        let two_digits = format!("{:.1e}", value.abs());
+        if two_digits.parse::<f64>().ok() == Some(value.abs()) {
+            let (closest, closest_exponent) = shortest_digits_of(&two_digits);
+            digits = closest.trim_end_matches('0').to_owned();
+            if digits.is_empty() {
+                digits.push('0');
+            }
+            exponent = closest_exponent;
+        }
+    }
+    let magnitude = value.abs();
+    if (1e-3..1e7).contains(&magnitude) {
+        let text = if exponent >= 0 {
+            let split = exponent as usize + 1;
+            let integer: String = digits.chars().chain(std::iter::repeat('0')).take(split.max(digits.len()).min(split)).collect();
+            let fraction = if digits.len() > split { &digits[split..] } else { "0" };
+            format!("{integer}.{fraction}")
+        } else {
+            format!("0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+        };
+        format!("{sign}{text}")
+    } else {
+        let fraction = if digits.len() > 1 { &digits[1..] } else { "0" };
+        format!("{sign}{}.{fraction}E{exponent}", &digits[..1])
+    }
+}
+
+/// `String.format(Locale.ROOT, "%.<decimals>f", value)`: Java rounds the shortest decimal
+/// representation half-up, not the exact binary value.
+pub fn java_format_fixed(value: f64, decimals: usize) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let (digits, exponent) = if value == 0.0 { ("0".to_owned(), 0) } else { shortest_digits(value) };
+    let point = exponent + 1;
+    let mut scaled: Vec<u8> = Vec::new();
+    let leading_zeros = (-point).max(0) as usize;
+    scaled.extend(std::iter::repeat_n(0u8, leading_zeros));
+    scaled.extend(digits.bytes().map(|digit| digit - b'0'));
+    let integer_length = point.max(0) as usize;
+    if scaled.len() < integer_length {
+        scaled.resize(integer_length, 0);
+    }
+    let point_index = if point > 0 { integer_length } else { 0 };
+    let keep = point_index + decimals;
+    let round_up = scaled.get(keep).is_some_and(|digit| *digit >= 5);
+    scaled.resize(keep, 0);
+    if round_up {
+        let mut index = keep;
+        loop {
+            if index == 0 {
+                scaled.insert(0, 1);
+                break;
+            }
+            index -= 1;
+            if scaled[index] == 9 {
+                scaled[index] = 0;
+            } else {
+                scaled[index] += 1;
+                break;
+            }
+        }
+    }
+    let integer_digits = scaled.len() - decimals;
+    let integer: String = if integer_digits == 0 { "0".into() } else { scaled[..integer_digits].iter().map(|digit| char::from(b'0' + digit)).collect() };
+    let fraction: String = scaled[integer_digits..].iter().map(|digit| char::from(b'0' + digit)).collect();
+    if decimals == 0 { format!("{sign}{integer}") } else { format!("{sign}{integer}.{fraction}") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

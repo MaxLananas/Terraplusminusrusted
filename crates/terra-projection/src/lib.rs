@@ -123,6 +123,28 @@ pub trait GeographicProjection: Send + Sync + fmt::Debug {
         }
     }
 
+    /// `GeographicProjection.tissot(longitude, latitude)`: area inflation, maximum angular
+    /// distortion (radians), maximum and minimum scale factor, by finite differences of 1e-7 rad.
+    fn tissot(&self, longitude: f64, latitude: f64) -> ProjectionResult<[f64; 4]> {
+        const STEP: f64 = 1e-7;
+        let radius = EARTH_CIRCUMFERENCE / (2.0 * std::f64::consts::PI);
+        let step_degrees = java_math::to_degrees(STEP);
+        let base = self.from_geo(GeoCoordinate::new(longitude, latitude))?;
+        let longitude_offset = self.from_geo(GeoCoordinate::new(longitude + step_degrees, latitude))?;
+        let latitude_offset = self.from_geo(GeoCoordinate::new(longitude, latitude + step_degrees))?;
+        let dx_dl = (longitude_offset.x - base.x) / STEP;
+        let dx_dp = (latitude_offset.x - base.x) / STEP;
+        let dy_dl = (longitude_offset.y - base.y) / STEP;
+        let dy_dp = (latitude_offset.y - base.y) / STEP;
+        let cos_latitude = java_math::cos(java_math::to_radians(latitude));
+        let h = (dx_dp * dx_dp + dy_dp * dy_dp).sqrt() / radius;
+        let k = (dx_dl * dx_dl + dy_dl * dy_dl).sqrt() / (cos_latitude * radius);
+        let sin_theta = (dy_dp * dx_dl - dx_dp * dy_dl).abs() / (radius * radius * cos_latitude * h * k);
+        let a_prime = (h * h + k * k + 2.0 * h * k * sin_theta).sqrt();
+        let b_prime = (h * h + k * k - 2.0 * h * k * sin_theta).sqrt();
+        Ok([h * k * sin_theta, 2.0 * java_math::asin(b_prime / a_prime), (a_prime + b_prime) / 2.0, (a_prime - b_prime) / 2.0])
+    }
+
     /// `GeographicProjection.vector`: projected displacement of moving `north`/`east` metres.
     fn vector(&self, point: ProjectedCoordinate, north: f64, east: f64) -> ProjectionResult<[f64; 2]> {
         let geo = self.to_geo(point)?;

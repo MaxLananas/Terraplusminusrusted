@@ -152,4 +152,9 @@ mkdir -p "$coordinate_fixtures"
 rm -f "$coordinate_fixtures"/*.tsv.gz
 run_harness terraplusminus.oracle.CoordinateParseGoldenDump "$root/fixtures/coordinates/parse_inputs.txt" "$coordinate_fixtures"
 record_provenance "$coordinate_fixtures"
-echo "fixtures written to $fixtures, $elevation_fixtures and $coordinate_fixtures"
+command_fixtures="$root/fixtures/commands/golden"
+mkdir -p "$command_fixtures"
+rm -f "$command_fixtures"/*.tsv.gz
+run_harness terraplusminus.oracle.CommandTextGoldenDump "$command_fixtures"
+record_provenance "$command_fixtures"
+echo "fixtures written to $fixtures, $elevation_fixtures, $coordinate_fixtures and $command_fixtures"

@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "terra-acquisition"
+version = "0.1.0"
+dependencies = [
+ "terra-codec",
+ "terra-elevation",
+]
+
+[[package]]
 name = "terra-chunk-generation"
 version = "0.1.0"
 dependencies = [

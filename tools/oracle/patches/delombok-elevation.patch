@@ -1,0 +1,43 @@
+diff -ru a/net/buildtheearth/terraminusminus/dataset/BlendMode.java b/net/buildtheearth/terraminusminus/dataset/BlendMode.java
+--- a/net/buildtheearth/terraminusminus/dataset/BlendMode.java
++++ b/net/buildtheearth/terraminusminus/dataset/BlendMode.java
+@@ -121,6 +121,11 @@
+         }
+     };
+ 
++    BlendMode(double offset, int size) {
++        this.offset = offset;
++        this.size = size;
++    }
++
+     public final double offset;
+     public final int size;
+ 
+diff -ru a/net/buildtheearth/terraminusminus/util/bvh/Bounds2dImpl.java b/net/buildtheearth/terraminusminus/util/bvh/Bounds2dImpl.java
+--- a/net/buildtheearth/terraminusminus/util/bvh/Bounds2dImpl.java
++++ b/net/buildtheearth/terraminusminus/util/bvh/Bounds2dImpl.java
+@@ -41,4 +41,24 @@
+         this.minZ = minZ;
+         this.maxZ = maxZ;
+     }
++
++    @Override
++    public double minX() {
++        return this.minX;
++    }
++
++    @Override
++    public double maxX() {
++        return this.maxX;
++    }
++
++    @Override
++    public double minZ() {
++        return this.minZ;
++    }
++
++    @Override
++    public double maxZ() {
++        return this.maxZ;
++    }
+ }

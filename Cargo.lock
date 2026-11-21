@@ -17,6 +17,10 @@ version = "0.1.0"
 [[package]]
 name = "terra-elevation"
 version = "0.1.0"
+dependencies = [
+ "terra-codec",
+ "terra-projection",
+]
 
 [[package]]
 name = "terra-projection"

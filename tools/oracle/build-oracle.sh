@@ -78,11 +78,34 @@ if [[ "$(grep -c "EARTH_" "$generated/TerraConstants.java")" -ne 2 ]]; then
     exit 1
 fi
 
+# Upstream sources are copied, mechanically delomboked by the recorded patch, and compiled as-is otherwise.
+upstream_sources=(
+    projection
+    util/MathUtils.java
+    util/IntToDoubleBiFunction.java
+    util/CornerBoundingBox2d.java
+    util/bvh/Bounds2d.java
+    util/bvh/Bounds2dImpl.java
+    substitutes/ChunkPos.java
+    substitutes/BlockPos.java
+    dataset/BlendMode.java
+    config/scalarparse/d/DoubleScalarParser.java
+    config/scalarparse/d/ParseTerrariumPngDSP.java
+)
+patched="$build/patched-src"
+rm -rf "$patched"
+for relative in "${upstream_sources[@]}"; do
+    mkdir -p "$patched/net/buildtheearth/terraminusminus/$(dirname "$relative")"
+    cp -R "$package_root/$relative" "$patched/net/buildtheearth/terraminusminus/$relative"
+done
+for patch_file in "$oracle"/patches/*.patch; do
+    patch --quiet --directory "$patched" --strip 1 --forward < "$patch_file"
+done
+
 sources=()
 while IFS= read -r -d '' file; do sources+=("$file"); done < <(
-    find "$package_root/projection" "$oracle/stubs/src" "$oracle/harness/src" "$build/generated" -name '*.java' -print0
+    find "$patched" "$oracle/stubs/src" "$oracle/harness/src" "$build/generated" -name '*.java' -print0 | sort -z
 )
-sources+=("$package_root/util/MathUtils.java")
 
 "$java" -jar "$toolchain/jars/ecj.jar" -21 -encoding UTF-8 -nowarn -proc:none \
     -classpath "$classpath" -d "$build/classes" "${sources[@]}"
@@ -90,19 +113,35 @@ sources+=("$package_root/util/MathUtils.java")
 resource_dir="$build/classes/net/buildtheearth/terraminusminus/projection/dymaxion"
 cp "$upstream/resources/net/buildtheearth/terraminusminus/projection/dymaxion/conformal.gz" "$resource_dir/"
 
-mkdir -p "$fixtures"
-"$java" -cp "$build/classes:$classpath" terraplusminus.oracle.ProjectionGoldenDump "$fixtures"
+run_harness() {
+    "$java" -Djava.awt.headless=true -cp "$build/classes:$classpath" "$@"
+}
 
-{
-    echo "terraminusminus_commit=$TERRAMINUSMINUS_COMMIT"
-    echo "java_version=$("$java" -version 2>&1 | head -n 1)"
-    echo "jdk_wheel_sha256=$JDK_WHEEL_SHA256"
-    echo "ecj_jar_sha256=$(sha256sum "$toolchain/jars/ecj.jar" | cut -d' ' -f1)"
-    echo "guava_jar_sha256=$(sha256sum "$toolchain/jars/guava.jar" | cut -d' ' -f1)"
-    echo "conformal_gz_sha256=$(sha256sum "$resource_dir/conformal.gz" | cut -d' ' -f1)"
-    echo "harness_sha256=$(cat "$oracle/harness/src/terraplusminus/oracle/"*.java | sha256sum | cut -d' ' -f1)"
-    echo "stubs_sha256=$(find "$oracle/stubs/src" -name '*.java' -print0 | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
-    (cd "$fixtures" && sha256sum ./*.tsv)
-} > "$fixtures/PROVENANCE"
-gzip -9 -n -f "$fixtures"/*.tsv
-echo "fixtures written to $fixtures"
+record_provenance() {
+    local directory="$1"
+    {
+        echo "terraminusminus_commit=$TERRAMINUSMINUS_COMMIT"
+        echo "java_version=$("$java" -version 2>&1 | head -n 1)"
+        echo "jdk_wheel_sha256=$JDK_WHEEL_SHA256"
+        echo "ecj_jar_sha256=$(sha256sum "$toolchain/jars/ecj.jar" | cut -d' ' -f1)"
+        echo "guava_jar_sha256=$(sha256sum "$toolchain/jars/guava.jar" | cut -d' ' -f1)"
+        echo "conformal_gz_sha256=$(sha256sum "$resource_dir/conformal.gz" | cut -d' ' -f1)"
+        echo "harness_sha256=$(cat "$oracle/harness/src/terraplusminus/oracle/"*.java | sha256sum | cut -d' ' -f1)"
+        echo "stubs_sha256=$(find "$oracle/stubs/src" -name '*.java' -print0 | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
+        echo "patches_sha256=$(cat "$oracle"/patches/*.patch | sha256sum | cut -d' ' -f1)"
+        (cd "$directory" && sha256sum ./*.tsv)
+    } > "$directory/PROVENANCE"
+    gzip -9 -n -f "$directory"/*.tsv
+}
+
+mkdir -p "$fixtures"
+rm -f "$fixtures"/*.tsv.gz
+run_harness terraplusminus.oracle.ProjectionGoldenDump "$fixtures"
+record_provenance "$fixtures"
+
+elevation_fixtures="$root/fixtures/elevation/golden"
+mkdir -p "$elevation_fixtures"
+rm -f "$elevation_fixtures"/*.tsv.gz
+run_harness terraplusminus.oracle.ElevationGoldenDump "$root/fixtures/elevation/terrarium" 12 "$elevation_fixtures" 12
+record_provenance "$elevation_fixtures"
+echo "fixtures written to $fixtures and $elevation_fixtures"

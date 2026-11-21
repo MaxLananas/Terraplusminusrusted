@@ -7,6 +7,10 @@ public final class PValidation {
         if (!condition) throw new IllegalArgumentException(message);
     }
 
+    public static void checkArg(boolean condition, String format, Object... arguments) {
+        if (!condition) throw new IllegalArgumentException(String.format(format, arguments));
+    }
+
     public static int notNegative(int value, String name) {
         if (value < 0) throw new IllegalArgumentException(name + " cannot be negative! (" + value + ')');
         return value;

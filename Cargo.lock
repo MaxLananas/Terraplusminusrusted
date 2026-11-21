@@ -5,6 +5,11 @@ version = 4
 [[package]]
 name = "terra-chunk-generation"
 version = "0.1.0"
+dependencies = [
+ "terra-codec",
+ "terra-elevation",
+ "terra-projection",
+]
 
 [[package]]
 name = "terra-cli"

@@ -4,7 +4,9 @@
 pub mod disk_cache;
 pub mod http;
 pub mod policy;
+pub mod routing;
 
 pub use disk_cache::{DiskCache, DiskCacheLimits, DiskCachedFetcher};
 pub use http::{HttpResponse, HttpTransport, PlainHttpTransport, TransportError, TransportLimits};
 pub use policy::{HttpTileFetcher, RetryPolicy};
+pub use routing::RoutingFetcher;

@@ -1,0 +1,10 @@
+// Live AWS Terrain Tiles (the upstream default world layers) fetched over plain HTTP, since
+// this build has no TLS transport. Tiles are cached on disk under ./tile-cache.
+{
+    "world": {"min_y": -2032, "height": 4064},
+    "network": {
+        "plain_http_hosts": ["s3.amazonaws.com"],
+        "cache_directory": "tile-cache",
+        "cache_max_bytes": 4294967296,
+    },
+}

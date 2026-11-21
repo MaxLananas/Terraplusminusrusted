@@ -22,6 +22,11 @@ dependencies = [
 [[package]]
 name = "terra-cli"
 version = "0.1.0"
+dependencies = [
+ "terra-chunk-generation",
+ "terra-projection",
+ "terra-server",
+]
 
 [[package]]
 name = "terra-codec"

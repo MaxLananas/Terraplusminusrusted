@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod coordinates;
+pub mod engine_bridge;
 pub mod java_text;
 pub mod region_index;
 pub mod stack;
@@ -15,3 +16,4 @@ pub use tpll::{Authorization, LevelHeight, LinkedWorld, LinkedWorlds, LinkedWorl
 pub use stack::{StackError, TerraStack};
 pub use teleports::{PendingTeleports, TeleportOutcome, TeleportRefusal};
 pub use region_index::RegionIndex;
+pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, terrain_for_generation, write_chunk};

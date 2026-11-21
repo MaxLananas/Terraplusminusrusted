@@ -24,10 +24,11 @@ pub fn stack(name: &str, extra: &str) -> (TerraStack, PathBuf) {
     )
     .unwrap();
     let biomes = if extra.contains("\"biomes\"") { "" } else { r#""biomes": {"use_dataset": false},"# };
+    let generation = if extra.contains("\"generation\"") { r#""config_version": 1"# } else { r#""generation": {"workers": 2}"# };
     let config = parse_server_config(&format!(
         r#"{{"elevation": {{"heights_config": "heights.json5"}}, {biomes}
             "network": {{"mirrors": {{"mirror://terrarium/": "{}"}}, "cache_directory": "tile-cache"}},
-            "world": {{"min_y": -64, "height": 2096}}, "generation": {{"workers": 2}} {extra}}}"#,
+            "world": {{"min_y": -64, "height": 2096}}, {generation} {extra}}}"#,
         fixtures.display()
     ))
     .unwrap();

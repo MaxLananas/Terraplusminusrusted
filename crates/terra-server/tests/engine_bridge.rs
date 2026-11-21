@@ -72,3 +72,26 @@ fn biome_lookup_matches_the_generator_and_ignores_height() {
         }
     }
 }
+
+#[test]
+fn output_does_not_depend_on_worker_count_or_request_order() {
+    let render = |workers: usize, reverse: bool| {
+        let (stack, _) = common::stack(&format!("bridge-determinism-{workers}"), &format!(r#", "generation": {{"workers": {workers}}}"#));
+        let block = stack.generator().projection().from_geo(terra_projection::GeoCoordinate::new(-113.247, 35.995)).unwrap();
+        let (centre_x, centre_z) = ((block.x.floor() as i32) >> 4, (block.y.floor() as i32) >> 4);
+        let mut chunks: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (centre_x + dx, centre_z + dz))).collect();
+        if reverse {
+            chunks.reverse();
+        }
+        let tickets: Vec<_> = chunks.iter().map(|&(x, z)| stack.loader().request(x, z).unwrap()).collect();
+        let mut output = FakeChunk::default();
+        for (mut ticket, &(x, z)) in tickets.into_iter().zip(&chunks) {
+            let terrain = ticket.wait(std::time::Duration::from_secs(60)).unwrap();
+            write_chunk(&stack, &terrain, x, z, WorldHeight { min_y: -64, max_y: 2032 }, &mut palette(), &mut output);
+        }
+        output.blocks
+    };
+    let single = render(1, false);
+    assert!(single.len() > 9 * 256 * 500);
+    assert_eq!(single, render(2, true));
+}

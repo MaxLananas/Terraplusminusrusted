@@ -41,3 +41,14 @@ version = "0.1.0"
 dependencies = [
  "terra-codec",
 ]
+
+[[package]]
+name = "terra-server"
+version = "0.1.0"
+dependencies = [
+ "terra-acquisition",
+ "terra-chunk-generation",
+ "terra-codec",
+ "terra-elevation",
+ "terra-projection",
+]

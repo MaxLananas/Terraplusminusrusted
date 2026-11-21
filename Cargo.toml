@@ -6,6 +6,7 @@ members = [
     "crates/terra-elevation",
     "crates/terra-acquisition",
     "crates/terra-chunk-generation",
+    "crates/terra-server",
     "crates/terra-cli",
 ]
 

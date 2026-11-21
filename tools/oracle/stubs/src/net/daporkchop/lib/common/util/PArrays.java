@@ -12,4 +12,13 @@ public final class PArrays {
         }
         return array;
     }
+
+    public static int linearSearch(char[] array, char value) {
+        for (int i = 0; i < array.length; i++) {
+            if (array[i] == value) {
+                return i;
+            }
+        }
+        return -1;
+    }
 }

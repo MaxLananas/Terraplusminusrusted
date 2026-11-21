@@ -82,6 +82,9 @@ fi
 upstream_sources=(
     projection
     util/MathUtils.java
+    util/Strings.java
+    util/geo/CoordinateParseUtils.java
+    util/geo/LatLng.java
     util/IntToDoubleBiFunction.java
     util/CornerBoundingBox2d.java
     util/bvh/Bounds2d.java
@@ -144,4 +147,9 @@ mkdir -p "$elevation_fixtures"
 rm -f "$elevation_fixtures"/*.tsv.gz
 run_harness terraplusminus.oracle.ElevationGoldenDump "$root/fixtures/elevation/terrarium" 12 "$elevation_fixtures" 12
 record_provenance "$elevation_fixtures"
-echo "fixtures written to $fixtures and $elevation_fixtures"
+coordinate_fixtures="$root/fixtures/coordinates/golden"
+mkdir -p "$coordinate_fixtures"
+rm -f "$coordinate_fixtures"/*.tsv.gz
+run_harness terraplusminus.oracle.CoordinateParseGoldenDump "$root/fixtures/coordinates/parse_inputs.txt" "$coordinate_fixtures"
+record_provenance "$coordinate_fixtures"
+echo "fixtures written to $fixtures, $elevation_fixtures and $coordinate_fixtures"

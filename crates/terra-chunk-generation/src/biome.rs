@@ -146,6 +146,11 @@ pub struct KoppenMap {
 }
 
 impl KoppenMap {
+    /// The compressed bundled raster, as fingerprinted.
+    pub fn embedded_bytes() -> &'static [u8] {
+        EMBEDDED_KOPPEN
+    }
+
     /// Decodes the raster bundled from TerraPlusMinus; decoded once per process.
     pub fn embedded() -> Result<Arc<KoppenMap>, DecodeError> {
         static MAP: OnceLock<Result<Arc<KoppenMap>, DecodeError>> = OnceLock::new();

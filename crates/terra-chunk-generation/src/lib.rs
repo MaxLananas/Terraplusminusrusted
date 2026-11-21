@@ -2,9 +2,13 @@
 
 pub mod biome;
 pub mod chunk_data;
+pub mod fingerprint;
 pub mod generator;
 pub mod java_random;
+pub mod loader;
 
 pub use biome::{Biome, KoppenMap};
 pub use chunk_data::{ChunkDataBuilder, ChunkTerrain, SurfaceBlock, is_null_island};
 pub use generator::{Block, ColumnSink, FIXED_SPAWN, GenerationError, GeneratorSettings, HeightmapKind, TerrainGenerator, WorldHeight};
+pub use loader::{ChunkKey, ChunkLoader, ChunkTicket, LoaderDiagnostics, LoaderError, LoaderLimits};
+pub use fingerprint::{FINGERPRINT_FILE_NAME, FingerprintError, FingerprintStatus, GenerationFingerprint, verify_or_record};

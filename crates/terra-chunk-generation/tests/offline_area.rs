@@ -3,39 +3,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
+use common::{WORLD, centre_chunk, generator};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use terra_chunk_generation::{Biome, Block, ColumnSink, GeneratorSettings, KoppenMap, TerrainGenerator, WorldHeight};
-use terra_elevation::{AxisBounds, BlendMode, CachingTileProvider, LayeredScalarDataset, MirrorFetcher, ScalarLayer, TileFormat, TiledScalarDataset};
-use terra_projection::{GeoCoordinate, SharedProjection, WebMercatorProjection, terraplusminus_projection};
-
-const MIRROR_PREFIX: &str = "mirror://terrarium/";
-const WORLD: WorldHeight = WorldHeight { min_y: -64, max_y: 2032 };
-
-fn generator(koppen: bool) -> TerrainGenerator {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/elevation/terrarium");
-    let projection: SharedProjection = Arc::new(WebMercatorProjection::new(12).unwrap());
-    let dataset = TiledScalarDataset::new(
-        "offline-terrarium-z12".into(),
-        vec![format!("{MIRROR_PREFIX}12/${{x}}/${{z}}.png")],
-        projection,
-        256,
-        BlendMode::Cubic,
-        TileFormat::TerrariumPng,
-    )
-    .unwrap();
-    let heights = LayeredScalarDataset::new(vec![ScalarLayer {
-        dataset: Arc::new(dataset),
-        bounds: AxisBounds::of(-180.0, 180.0, -85.0, 85.0),
-        priority: 0.0,
-        condition: None,
-    }]);
-    let provider = Arc::new(CachingTileProvider::new(MirrorFetcher::new().with_mapping(MIRROR_PREFIX, root), 16));
-    let settings = GeneratorSettings { use_biome_dataset: koppen, ..GeneratorSettings::default() };
-    let koppen = koppen.then(|| KoppenMap::embedded().unwrap());
-    TerrainGenerator::new(terraplusminus_projection(0, 0).unwrap(), Arc::new(heights), provider, koppen, settings)
-}
+use terra_chunk_generation::{Biome, Block, ColumnSink, KoppenMap};
 
 #[derive(Default)]
 struct RecordingSink {
@@ -49,11 +22,6 @@ impl ColumnSink for RecordingSink {
             self.blocks.insert((x, y, z), block.clone());
         }
     }
-}
-
-fn centre_chunk(generator: &TerrainGenerator) -> (i32, i32) {
-    let block = generator.projection().from_geo(GeoCoordinate::new(-113.247, 35.995)).unwrap();
-    ((block.x.floor() as i32) >> 4, (block.y.floor() as i32) >> 4)
 }
 
 #[test]

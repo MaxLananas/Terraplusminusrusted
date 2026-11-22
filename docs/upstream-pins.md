@@ -21,7 +21,10 @@ under `tools/oracle`.
 | `crates/terra-projection/resources/conformal.gz` | terraminusminus | `crates/terra-projection/resources/NOTICE` |
 | `crates/terra-elevation/resources/heights_world.json5` | terraminusminus `heights.json5` (first two layers) | `crates/terra-elevation/resources/NOTICE` |
 | `crates/terra-osm/resources/osm.json5` | terraminusminus `dataset/osm/osm.json5` (byte-identical) | `crates/terra-osm/resources/NOTICE` |
+| `crates/terra-elevation/resources/tree_cover.json5` | terraminusminus `dataset/scalar/tree_cover.json5` (byte-identical) | `crates/terra-elevation/resources/NOTICE` |
 | `crates/terra-chunk-generation/resources/koppen_map.gz` | TerraPlusMinus (byte-identical) | `crates/terra-chunk-generation/resources/NOTICE` |
+| `crates/terra-chunk-generation/resources/customTrees.json` | TerraPlusMinus `data/customTrees.json` (byte-identical) | `crates/terra-chunk-generation/resources/NOTICE` |
+| `fixtures/tiff/cases/*`, `fixtures/treecover/13/**` | Synthetic, written by the `make-fixture(s).py` scripts beside them | Generated for this repository (MIT) |
 | `fixtures/elevation/terrarium/12/759/1608.png` | maplibre-gl-js `763245d93043f479f6bf3f653b33d6368b68a886`, sha256 `0028d855e2def76dc8b5c7f484b4842f6f22185d8040718252a1142ce22bcceb` | BSD-3-Clause (MapLibre contributors, Mapbox); terrain data attribution per tilezen/joerd `docs/attribution.md` |
 
 ## Oracle toolchain (development only)
@@ -32,6 +35,9 @@ under `tools/oracle`.
 | ECJ (from npm `@vscjava/java-language-server` 0.1.2) | 3.45.0 | npm integrity `sha512-5PrYFqYmqFbPuhXqFIiyIQWvyFisZ7KUZV0B4F0DaDvlxDSrwP2nTbNE2pmsjSApT5S3BX0VrMkeKKzX5SMAfA==` |
 | Guava | 33.5.0 | jar sha256 recorded in each fixture `PROVENANCE` |
 | Gson (from the same npm package as ECJ; terraminusminus pins 2.13.1) | 2.13.2 | jar sha256 recorded in `fixtures/osm/golden/PROVENANCE` |
+
+TIFF reference (development only): Python 3.11.2, tifffile 2026.3.3, imagecodecs 2026.3.6 and
+numpy 2.4.6 from PyPI write the TIFF fixtures and their expected samples.
 
 Each `fixtures/**/PROVENANCE` records the upstream commit, the JDK and the jar digests, and
 digests of the harness, stubs and patches that produced the goldens.

@@ -17,6 +17,12 @@ What works and is tested here:
   indicatrix, compared against the Java oracle.
 - Elevation datasets, terrarium decoding and all four blend modes, matching upstream bit for bit
   on the recorded fixtures.
+- GeoTIFF layers (classic TIFF; none, LZW, Deflate and PackBits compression; predictors 2 and 3)
+  and upstream's parser chain (`add`, `multiply`, `divide`, flips, axis swap) and projection
+  transforms (`scale`, `offset`, flips, axis swap). Decoding matches `tifffile` bit for bit on 16
+  reference files. Upstream's complete `heights.json5` (1979 layers) loads.
+- Tree cover (`TreeCoverBaker`) and TerraPlusMinus's `TreePopulator`: the 16 custom tree
+  schematics, chosen by Köppen class, placed by Paper's populator random. See [Trees](#trees).
 - Chunk terrain, Köppen biomes and the generation fingerprint.
 - Provider acquisition with retries, rate limiting and a bounded disk cache.
 - `/tpll` coordinate parsing and flow, and the chat text of all four commands.
@@ -32,10 +38,9 @@ What is not done:
   signature. The checks a real server run would cover (joining, lighting, collision,
   save/restart) are still open.
 - **Not ported:**
-  - trees and tree cover (OSM tree clearing is computed but nothing places trees yet);
-  - GeoTIFF elevation layers;
-  - HTTPS (use a plain-HTTP mirror). The default OSM server is HTTPS-only, so OSM needs a
-    mirror (see [OpenStreetMap](#openstreetmap));
+  - HTTPS (use a plain-HTTP mirror). The default OSM and tree-cover servers are HTTPS-only, so
+    both need a mirror (see [OpenStreetMap](#openstreetmap) and [Trees](#trees));
+  - the `from_int` TIFF parser and BigTIFF;
   - the SERVER linked-worlds method;
   - auto-teleport on movement;
   - `/tpll -p`.
@@ -154,7 +159,8 @@ closed to generation, and the server log says why.
 ## Configuration
 
 The format is upstream's `config.yml` expressed as JSON5, plus sections for this port: `world`,
-`elevation`, `network`, `permissions`, `generation`, `prefix` and `openstreetmap`. Unknown keys
+`elevation` (`heights_config`, `tree_cover_config`, `unsupported_layers`), `network`,
+`permissions`, `generation`, `prefix` and `openstreetmap`. Unknown keys
 are errors. See `examples/` and `crates/terra-server/src/config.rs`.
 
 ### OpenStreetMap
@@ -185,6 +191,46 @@ Upstream's deprecated `building_outlines_material`, `road_material` and `path_ma
 still work as they do upstream: each replaces the block that `osm.json5` draws for building
 outlines (`minecraft:bricks`), roads (`minecraft:gray_concrete`) or paths (`minecraft:dirt_path`),
 and startup logs upstream's deprecation warning. Editing `osm.json5` is the better way.
+
+### Trees
+
+`generate_trees` is on by default, as upstream. Tree cover comes from upstream's
+`tree_cover.json5` (Hansen tree cover 2000 tiles at
+`https://cloud.daporkchop.net/gis/treecover2000/`), or from the file named by
+`elevation.tree_cover_config`, which uses the same schema. That server is HTTPS-only, so copy
+`tree_cover.json5` from terraminusminus, point its URL at a plain-HTTP or mirrored copy and set
+`tree_cover_config`, or set `generate_trees` to `false`. With trees off, tree cover is never
+fetched (upstream fetched it anyway, TerraPlusMinus issue #77).
+
+How it matches upstream:
+
+- The tree cover is baked as `TreeCoverBaker` bakes it: `ceil(cover / 4 * 255 * 1.5)`, 0 where data
+  is missing, cleared under OSM buildings and water and on null island.
+- Tree positions follow `TreePopulator` and Paper: the decoration seed of the world seed and chunk
+  position, 64 tries compared against the first column's density, `nextBytes` and `nextInt(15)`.
+  The first try that lands below water ends the chunk. Tries outside
+  `min_y < ground + y_offset < max_y - 35` or on an OSM surface block are skipped.
+- The tree families by Köppen class (savanna 4, 6 and 17; spruce 27; none for 28 to 30; oak and
+  birch otherwise, including when the biome dataset is off) and the 16 schematics of
+  `customTrees.json` (byte-identical) are upstream's.
+
+Where it differs:
+
+- Horizon has no populator stage, so each chunk replays its neighbours' populators and keeps the
+  blocks that fall inside it (a tree reaches at most 5 blocks from its trunk, so only the 8
+  neighbours matter). The result is the same as upstream placing whole trees, without the
+  generation-order effects.
+- Upstream picks the schematic and its rotation with an unseeded `new Random()`, and its
+  per-thread density buffer carries over between chunks. Both make upstream's trees differ on
+  every regeneration. Here the schematic and rotation are seeded by the world seed and chunk, and
+  the buffer starts at zero for every chunk, so regeneration is repeatable.
+- The climate class is read at the tree's own column. Upstream reads whichever biome its biome
+  provider computed last, on any thread.
+- Leaves are placed persistent (`persistent=true`). The schematics use fences as trunks, so
+  upstream's default leaves decay unless the server disables leaf decay.
+
+Trees change the generation fingerprint. A world created before trees existed in this port is
+refused while trees are on; set `generate_trees` to `false` to keep extending it.
 
 ## Attribution and license
 

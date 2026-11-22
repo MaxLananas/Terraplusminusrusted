@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use terra_acquisition::{DiskCache, DiskCacheLimits, DiskCachedFetcher, HttpTileFetcher, PlainHttpTransport, RetryPolicy, RoutingFetcher, TransportLimits};
 use terra_chunk_generation::{
-    Block, ChunkLoader, ChunkTerrain, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, LoaderError, TerrainGenerator, verify_or_record,
+    Block, ChunkLoader, ChunkTerrain, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, LoaderError, TerrainGenerator, TreeLibrary, TreePopulator,
+    verify_or_record,
 };
 use terra_osm::{DEFAULT_OSM_CONFIG, OsmDataset, OsmMapper, OsmSettings};
-use terra_elevation::{CachingTileProvider, DEFAULT_WORLD_HEIGHTS, ElevationError, FetchOutcome, TileFetcher, load_heights_config};
+use terra_elevation::{CachingTileProvider, DEFAULT_TREE_COVER, DEFAULT_WORLD_HEIGHTS, ElevationError, FetchOutcome, TileFetcher, load_heights_config, load_tree_cover_config};
 
 #[derive(Debug)]
 pub enum StackError {
@@ -21,6 +22,7 @@ pub enum StackError {
     Biomes(String),
     Projection(String),
     OpenStreetMap(String),
+    Trees(String),
 }
 
 impl std::fmt::Display for StackError {
@@ -31,6 +33,7 @@ impl std::fmt::Display for StackError {
             Self::Biomes(reason) => write!(f, "biome raster: {reason}"),
             Self::Projection(reason) => write!(f, "projection: {reason}"),
             Self::OpenStreetMap(reason) => write!(f, "OpenStreetMap: {reason}"),
+            Self::Trees(reason) => write!(f, "trees: {reason}"),
         }
     }
 }
@@ -63,7 +66,7 @@ impl TerraStack {
             }
             None => DEFAULT_WORLD_HEIGHTS.to_owned(),
         };
-        let layers = load_heights_config(&heights_text, config.unsupported_layers).map_err(StackError::Elevation)?;
+        let mut layers = load_heights_config(&heights_text, config.unsupported_layers).map_err(StackError::Elevation)?;
         let network = &config.network;
         let limits = TransportLimits { connect_timeout: network.connect_timeout, io_timeout: network.io_timeout, total_timeout: network.total_timeout, ..TransportLimits::default() };
         let policy = RetryPolicy { max_attempts: network.attempts, max_per_host: network.max_per_host, ..RetryPolicy::default() };
@@ -83,6 +86,20 @@ impl TerraStack {
         let projection = terra_projection::terraplusminus_projection(config.generator.x_offset, config.generator.z_offset).map_err(|error| StackError::Projection(error.to_string()))?;
         let mut fingerprint = GenerationFingerprint::compute(&config.generator, config.world, heights_text.as_bytes(), koppen.as_ref().map(|_| KoppenMap::embedded_bytes()));
         let mut generator = TerrainGenerator::new(Arc::clone(&projection), Arc::new(layers.dataset), provider, koppen, config.generator.clone());
+        if config.generate_trees {
+            let tree_cover_text = match &config.tree_cover_config {
+                Some(path) => {
+                    let path = base_directory.join(path);
+                    std::fs::read_to_string(&path).map_err(|error| StackError::Io(format!("reading {}: {error}", path.display())))?
+                }
+                None => DEFAULT_TREE_COVER.to_owned(),
+            };
+            let tree_cover = load_tree_cover_config(&tree_cover_text, config.unsupported_layers).map_err(|error| StackError::Trees(format!("tree cover config: {error}")))?;
+            layers.skipped.extend(tree_cover.skipped.into_iter().map(|skipped| format!("tree cover {skipped}")));
+            let library = TreeLibrary::upstream().map_err(|error| StackError::Trees(error.to_string()))?;
+            fingerprint = fingerprint.with_trees(terra_chunk_generation::trees::UPSTREAM_TREES.as_bytes(), tree_cover_text.as_bytes());
+            generator = generator.with_trees(Arc::new(TreePopulator::new(library, config.generator.y_offset)), Arc::new(tree_cover.dataset));
+        }
         let osm_config = &config.openstreetmap;
         if osm_config.enabled {
             let (mapping_text, source) = read_osm_mapping(osm_config.mapping.as_deref(), base_directory)?;
@@ -107,8 +124,9 @@ impl TerraStack {
         self.loader.generator()
     }
 
-    /// Every block the generator can place on the surface from OpenStreetMap features, as block
-    /// state strings (`minecraft:bricks`, `minecraft:oak_slab[type=top]`), deduplicated.
+    /// Every block the generator can place beyond the base terrain blocks: surface blocks from
+    /// OpenStreetMap features and tree blocks, as block state strings (`minecraft:bricks`,
+    /// `minecraft:oak_slab[type=top]`, `minecraft:oak_leaves[persistent=true]`), deduplicated.
     pub fn surface_block_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let replacements = &self.config.generator.surface_replacements;
@@ -120,6 +138,9 @@ impl TerraStack {
                     None => names.push(Block::from_material_name(&name).resource_name().to_owned()),
                 }
             }
+        }
+        if let Some(trees) = self.generator().trees() {
+            names.extend(trees.library().blocks().iter().map(|block| block.resource_name().to_owned()));
         }
         let mut seen = std::collections::HashSet::new();
         names.retain(|name| seen.insert(name.clone()));

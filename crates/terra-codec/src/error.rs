@@ -16,6 +16,8 @@ pub enum DecodeError {
     InvalidPng(&'static str),
     UnsupportedPng(String),
     ImageTooLarge { width: u32, height: u32 },
+    InvalidTiff(&'static str),
+    UnsupportedTiff(String),
     Sink(String),
 }
 
@@ -44,6 +46,8 @@ impl fmt::Display for DecodeError {
             Self::ImageTooLarge { width, height } => {
                 write!(f, "image dimensions {width}x{height} exceed the configured limit")
             }
+            Self::InvalidTiff(reason) => write!(f, "invalid TIFF: {reason}"),
+            Self::UnsupportedTiff(reason) => write!(f, "unsupported TIFF: {reason}"),
             Self::Sink(reason) => write!(f, "output consumer failed: {reason}"),
         }
     }

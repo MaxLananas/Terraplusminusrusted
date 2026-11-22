@@ -156,6 +156,45 @@ pub fn write_chunk<S: Copy, W: BlockWriter<S>>(stack: &TerraStack, terrain: &Chu
     stack.generator().fill_chunk(terrain, chunk_x, chunk_z, world, &mut sink);
 }
 
+/// The chunk an engine asks for, with what tree placement needs to know about the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeTarget {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+    pub world: WorldHeight,
+    /// The world seed, which Paper feeds to every Bukkit `BlockPopulator`.
+    pub level_seed: i64,
+}
+
+/// `TreePopulator` for a chunk whose terrain is already written: the trees of the chunk and the
+/// parts of its neighbours' trees that reach into it, overwriting terrain as upstream's
+/// `LimitedRegion.setType` does. Neighbour data comes from the loader, waiting like the chunk's
+/// own data. Returns the number of blocks written; nothing when trees are disabled.
+pub fn write_trees<S: Copy, W: BlockWriter<S>>(
+    stack: &TerraStack,
+    counters: &GenerationCounters,
+    terrain: &Arc<ChunkTerrain>,
+    target: TreeTarget,
+    palette: &mut BlockPalette<S>,
+    writer: &mut W,
+    log: &mut dyn FnMut(String),
+) -> usize {
+    if stack.generator().trees().is_none() {
+        return 0;
+    }
+    let TreeTarget { chunk_x, chunk_z, world, level_seed } = target;
+    let mut neighbour = |x: i32, z: i32| -> Option<Arc<ChunkTerrain>> {
+        if (x, z) == (chunk_x, chunk_z) { Some(Arc::clone(terrain)) } else { Some(terrain_for_generation(stack, counters, x, z, log)) }
+    };
+    let blocks = stack.generator().tree_blocks(chunk_x, chunk_z, world, level_seed, &mut neighbour);
+    let (base_x, base_z) = (chunk_x.wrapping_shl(4), chunk_z.wrapping_shl(4));
+    for (x, y, z, block) in &blocks {
+        let state = palette.state(block);
+        writer.set_block([base_x + *x as i32, *y, base_z + *z as i32], state);
+    }
+    blocks.len()
+}
+
 const BIOME_CACHE_SLOTS: usize = 1024;
 
 type CachedBiome = Option<(u64, (i32, i32), u16)>;

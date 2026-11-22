@@ -8,9 +8,9 @@ use crate::error::ElevationError;
 use crate::layered::{LayeredScalarDataset, ScalarLayer};
 use std::sync::Arc;
 use terra_codec::{JsonValue, parse_relaxed_json};
-use terra_projection::{SharedProjection, WebMercatorProjection};
+use terra_projection::{FlipHorizontalTransform, FlipVerticalTransform, OffsetTransform, ScaleTransform, SharedProjection, SwapAxesTransform, WebMercatorProjection};
 
-/// What to do with layers whose tile format this implementation cannot decode (GeoTIFF).
+/// What to do with layers whose parser or projection this implementation does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedLayerPolicy {
     /// Fail loading: the config cannot be honoured in full.
@@ -29,27 +29,58 @@ pub struct LoadedLayers {
 /// The two world-wide AWS Terrain Tiles layers of the upstream default `heights.json5`, verbatim.
 pub const DEFAULT_WORLD_HEIGHTS: &str = include_str!("../resources/heights_world.json5");
 
+/// The upstream default `tree_cover.json5` (treecover2000 GeoTIFFs), verbatim.
+pub const DEFAULT_TREE_COVER: &str = include_str!("../resources/tree_cover.json5");
+
 pub fn load_heights_config(text: &str, policy: UnsupportedLayerPolicy) -> Result<LoadedLayers, ElevationError> {
-    let document = parse_relaxed_json(text).map_err(|error| invalid(format!("heights config: {error}")))?;
+    load_scalar_config(text, policy, "heights", "layer")
+}
+
+/// A tree-cover dataset config: the same schema as `heights.json5`, values in `[0, 1]`.
+pub fn load_tree_cover_config(text: &str, policy: UnsupportedLayerPolicy) -> Result<LoadedLayers, ElevationError> {
+    load_scalar_config(text, policy, "tree cover", "tree-cover-layer")
+}
+
+/// Why a layer cannot be loaded: a mistake in the file, or a valid upstream type not ported here.
+enum Problem {
+    Invalid(String),
+    Unsupported(String),
+}
+
+impl From<String> for Problem {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for Problem {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+/// `MultiScalarDataset` configs. `id_prefix` keeps tile cache keys apart between datasets.
+fn load_scalar_config(text: &str, policy: UnsupportedLayerPolicy, kind: &str, id_prefix: &str) -> Result<LoadedLayers, ElevationError> {
+    let document = parse_relaxed_json(text).map_err(|error| invalid(format!("{kind} config: {error}")))?;
     let mut layers = Vec::new();
     let mut skipped = Vec::new();
     for (index, entry) in document.as_array_lenient().iter().enumerate() {
         let context = |message: String| invalid(format!("layer {index}: {message}"));
         let dataset = entry.get("dataset").ok_or_else(|| context("missing `dataset`".into()))?;
-        let format = parse_format(dataset).map_err(context)?;
         let urls = parse_urls(dataset).map_err(context)?;
-        if format == TileFormat::Tiff {
-            match policy {
-                UnsupportedLayerPolicy::Reject => {
-                    return Err(ElevationError::UnsupportedFormat("parse_tiff layers (GeoTIFF) are not supported"));
-                }
+        let parsed = parse_format(dataset.get("parse").ok_or("missing `parse`").map_err(|error| context(error.into()))?, 0)
+            .and_then(|format| Ok((format, parse_projection(dataset.get("projection").ok_or("missing `projection`")?, 0)?)));
+        let (format, projection) = match parsed {
+            Ok(parsed) => parsed,
+            Err(Problem::Invalid(message)) => return Err(context(message)),
+            Err(Problem::Unsupported(message)) => match policy {
+                UnsupportedLayerPolicy::Reject => return Err(ElevationError::UnsupportedFormat(format!("layer {index}: {message}"))),
                 UnsupportedLayerPolicy::Skip => {
-                    skipped.push(format!("layer {index} ({}): GeoTIFF unsupported", urls.first().map_or("", String::as_str)));
+                    skipped.push(format!("layer {index} ({}): {message}", urls.first().map_or("", String::as_str)));
                     continue;
                 }
-            }
-        }
-        let projection = parse_projection(dataset).map_err(context)?;
+            },
+        };
         let resolution = required_number(dataset, "resolution").map_err(context)?;
         if resolution.fract() != 0.0 || !(1.0..=f64::from(u32::MAX)).contains(&resolution) {
             return Err(context(format!("resolution {resolution} is not a positive integer")));
@@ -67,14 +98,14 @@ pub fn load_heights_config(text: &str, policy: UnsupportedLayerPolicy) -> Result
             None | Some(JsonValue::Null) => None,
             Some(value) => Some(parse_condition(value, 0).map_err(context)?),
         };
-        let id = format!("layer-{index}");
+        let id = format!("{id_prefix}-{index}");
         let tiled = Arc::new(TiledScalarDataset::new(id, urls, projection, resolution as u32, blend, format)?);
         for bound in bounds.as_array_lenient() {
             layers.push(ScalarLayer { dataset: Arc::clone(&tiled), bounds: parse_bounds(bound).map_err(context)?, priority, condition: condition.clone() });
         }
     }
     if layers.is_empty() {
-        return Err(invalid("heights config defines no usable layers".into()));
+        return Err(invalid(format!("{kind} config defines no usable layers")));
     }
     Ok(LoadedLayers { dataset: LayeredScalarDataset::new(layers), skipped })
 }
@@ -100,26 +131,60 @@ fn parse_urls(dataset: &JsonValue) -> Result<Vec<String>, String> {
     urls.as_array_lenient().iter().map(|url| url.as_str().map(str::to_owned).ok_or_else(|| "`urls` must be strings".to_owned())).collect()
 }
 
-fn parse_format(dataset: &JsonValue) -> Result<TileFormat, String> {
-    let (name, _) = single_member(dataset.get("parse").ok_or("missing `parse`")?)?;
-    match name {
-        "parse_png_terrarium" => Ok(TileFormat::TerrariumPng),
-        "parse_tiff" => Ok(TileFormat::Tiff),
-        other => Err(format!("unsupported parser `{other}`")),
+const MAX_NESTING: usize = 16;
+
+/// `GlobalParseRegistries.SCALAR_PARSERS_DOUBLE`.
+fn parse_format(value: &JsonValue, depth: usize) -> Result<TileFormat, Problem> {
+    if depth > MAX_NESTING {
+        return Err("parser nesting too deep".into());
     }
+    let (name, settings) = single_member(value)?;
+    let delegate = || -> Result<Box<TileFormat>, Problem> {
+        Ok(Box::new(parse_format(settings.get("delegate").ok_or_else(|| format!("`{name}` requires `delegate`"))?, depth + 1)?))
+    };
+    let number = || required_number(settings, "value").map_err(Problem::from);
+    Ok(match name {
+        "parse_png_terrarium" => TileFormat::TerrariumPng,
+        "parse_tiff" | "parse_tiff_auto" | "parse_tiff_fp" | "parse_tiff_int" => TileFormat::Tiff,
+        "add" => TileFormat::Add(delegate()?, number()?),
+        "multiply" => TileFormat::Multiply(delegate()?, number()?),
+        "divide" => TileFormat::Divide(delegate()?, number()?),
+        "flip_x" => TileFormat::FlipX(delegate()?),
+        "flip_z" => TileFormat::FlipZ(delegate()?),
+        "swap_axes" => TileFormat::SwapAxes(delegate()?),
+        "from_int" => return Err(Problem::Unsupported("integer parsers (`from_int`) are not ported".into())),
+        other => return Err(format!("unknown parser `{other}`").into()),
+    })
 }
 
-fn parse_projection(dataset: &JsonValue) -> Result<SharedProjection, String> {
-    let (name, settings) = single_member(dataset.get("projection").ok_or("missing `projection`")?)?;
+/// The dataset projections the bundled configs use, and the transforms that wrap them.
+fn parse_projection(value: &JsonValue, depth: usize) -> Result<SharedProjection, Problem> {
+    if depth > MAX_NESTING {
+        return Err("projection nesting too deep".into());
+    }
+    let (name, settings) = single_member(value)?;
+    let delegate = || -> Result<SharedProjection, Problem> {
+        parse_projection(settings.get("delegate").ok_or_else(|| format!("`{name}` requires `delegate`"))?, depth + 1)
+    };
+    let shared = |projection: SharedProjection| Ok(projection);
     match name {
         "web_mercator" => {
             let zoom = required_number(settings, "zoom")?;
             if zoom.fract() != 0.0 || !(0.0..=30.0).contains(&zoom) {
-                return Err(format!("invalid web_mercator zoom {zoom}"));
+                return Err(format!("invalid web_mercator zoom {zoom}").into());
             }
-            WebMercatorProjection::new(zoom as u32).map(|projection| Arc::new(projection) as SharedProjection).map_err(str::to_owned)
+            shared(Arc::new(WebMercatorProjection::new(zoom as u32).map_err(Problem::from)?))
         }
-        other => Err(format!("unsupported dataset projection `{other}`")),
+        "scale" => shared(Arc::new(ScaleTransform::new(delegate()?, required_number(settings, "x")?, required_number(settings, "y")?).map_err(Problem::from)?)),
+        "offset" => shared(Arc::new(OffsetTransform::new(delegate()?, required_number(settings, "dx")?, required_number(settings, "dy")?).map_err(Problem::from)?)),
+        "flip_horizontal" => shared(Arc::new(FlipHorizontalTransform::new(delegate()?))),
+        "flip_vertical" => shared(Arc::new(FlipVerticalTransform::new(delegate()?))),
+        "swap_axes" => shared(Arc::new(SwapAxesTransform::new(delegate()?))),
+        "centered_mercator" | "transverse_mercator" | "equirectangular" | "sinusoidal" | "equal_earth" | "bte_conformal_dymaxion" | "dymaxion"
+        | "conformal_dymaxion" | "lambert_azimuthal" | "azimuthal_equidistant" | "stereographic" | "clamp" | "rotate" => {
+            Err(Problem::Unsupported(format!("dataset projection `{name}` is not ported")))
+        }
+        other => Err(format!("unknown dataset projection `{other}`").into()),
     }
 }
 
@@ -170,11 +235,42 @@ mod tests {
     }
 
     #[test]
-    fn tiff_layers_are_never_silently_dropped() {
-        let config = r#"[{"dataset": {"urls": ["https://example.invalid/${x}/${z}.tiff"], "projection": {"web_mercator": {"zoom": 14}},
+    fn unported_layers_are_never_silently_dropped() {
+        let config = r#"[{"dataset": {"urls": ["https://example.invalid/${x}/${z}.png"], "projection": {"equirectangular": {}},
             "resolution": 256, "blend": "NEAR", "parse": {"parse_tiff": {}}}, "bounds": [], "zooms": {"min": 0, "max": 3}}]"#;
         assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Reject), Err(ElevationError::UnsupportedFormat(_))));
         assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
+        let typo = config.replace("equirectangular", "equirectangulr");
+        assert!(matches!(load_heights_config(&typo, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn default_tree_cover_loads_with_its_parser_chain_and_scaled_projection() {
+        let loaded = load_tree_cover_config(DEFAULT_TREE_COVER, UnsupportedLayerPolicy::Reject).unwrap();
+        let layers = loaded.dataset.layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].dataset.format, TileFormat::Divide(Box::new(TileFormat::Tiff), 100.0));
+        assert_eq!(layers[0].dataset.id, "tree-cover-layer-0");
+        assert_eq!(layers[0].priority, -100.0);
+        assert_eq!((layers[0].bounds.min_z, layers[0].bounds.max_z), (-60.0, 80.0));
+    }
+
+    #[test]
+    fn nested_parsers_and_projection_transforms_load() {
+        let config = r#"[{"dataset": {"urls": "mirror://a/${x}/${z}.tiff",
+            "projection": {"flip_vertical": {"delegate": {"offset": {"delegate": {"scale": {"delegate": {"web_mercator": {"zoom": 5}}, "x": 2, "y": 2}}, "dx": 1, "dy": 0}}}},
+            "resolution": 256, "blend": "NEAR",
+            "parse": {"add": {"delegate": {"multiply": {"delegate": {"swap_axes": {"delegate": {"flip_z": {"delegate": {"flip_x": {"delegate": {"parse_tiff_fp": {}}}}}}}}, "value": 2}}, "value": -1}}},
+            "bounds": {"minX": 0, "maxX": 1, "minZ": 0, "maxZ": 1}, "zooms": 0}]"#;
+        let loaded = load_heights_config(config, UnsupportedLayerPolicy::Reject).unwrap();
+        let format = &loaded.dataset.layers()[0].dataset.format;
+        let expected = TileFormat::Add(
+            Box::new(TileFormat::Multiply(Box::new(TileFormat::SwapAxes(Box::new(TileFormat::FlipZ(Box::new(TileFormat::FlipX(Box::new(TileFormat::Tiff))))))), 2.0)),
+            -1.0,
+        );
+        assert_eq!(format, &expected);
+        let unknown = config.replace("flip_z", "flip_y");
+        assert!(matches!(load_heights_config(&unknown, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
     }
 
     #[test]

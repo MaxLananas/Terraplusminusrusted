@@ -4,6 +4,9 @@
 // cannot fetch. To enable them, point openstreetmap.servers at a plain-HTTP mirror of
 // https://cloud.daporkchop.net/gis/osm/0/ (and list its host in plain_http_hosts), or at a local
 // copy through network.mirrors.
+// Trees are off for the same reason: their tree cover comes from
+// https://cloud.daporkchop.net/gis/treecover2000/. Point elevation.tree_cover_config at a copy of
+// the upstream tree_cover.json5 with a plain-HTTP or mirrored URL to grow them.
 {
     "world": {"min_y": -2032, "height": 4064},
     "network": {
@@ -12,4 +15,5 @@
         "cache_max_bytes": 4294967296,
     },
     "openstreetmap": {"enabled": false},
+    "generate_trees": false,
 }

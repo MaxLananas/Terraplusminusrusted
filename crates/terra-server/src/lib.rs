@@ -17,4 +17,4 @@ pub use tpll::{Authorization, LevelHeight, LinkedWorld, LinkedWorlds, LinkedWorl
 pub use stack::{OSM_MAPPING_FILE, StackError, TerraStack, extract_default_osm_mapping};
 pub use teleports::{PendingTeleports, TeleportOutcome, TeleportRefusal};
 pub use region_index::RegionIndex;
-pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, split_block_state, terrain_for_generation, write_chunk};
+pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, split_block_state, terrain_for_generation, write_chunk, write_trees, TreeTarget};

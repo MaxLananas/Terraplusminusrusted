@@ -1,6 +1,7 @@
 // Offline configuration over the repository's single terrarium fixture tile (zoom 12,
 // western Grand Canyon). Every other tile reports missing, which generates ocean there.
-// There is no offline OpenStreetMap data for this area, so OSM features are turned off.
+// There is no offline OpenStreetMap or tree cover data for this area, so OSM features and trees
+// are turned off (fixtures/treecover holds synthetic tree cover for tests only).
 {
     "terrain_offset": {"x": 0, "y": 0, "z": 0},
     "biomes": {"use_dataset": true, "biome": "minecraft:plains"},
@@ -13,4 +14,5 @@
     },
     "generation": {"queue_capacity": 4096},
     "openstreetmap": {"enabled": false},
+    "generate_trees": false,
 }

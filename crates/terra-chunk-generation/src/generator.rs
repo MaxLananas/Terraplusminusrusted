@@ -3,6 +3,7 @@
 use crate::biome::{Biome, KoppenMap};
 use crate::chunk_data::{ChunkDataBuilder, ChunkTerrain};
 use crate::java_random::LegacyRandom;
+use crate::trees::TreePopulator;
 use std::fmt;
 use std::sync::Arc;
 use terra_elevation::{ElevationError, LayeredScalarDataset, TileProvider, sample_chunk_heights};
@@ -82,6 +83,7 @@ impl Default for GeneratorSettings {
 pub enum GenerationError {
     Elevation(ElevationError),
     OpenStreetMap(OsmError),
+    TreeCover(ElevationError),
 }
 
 impl fmt::Display for GenerationError {
@@ -89,6 +91,7 @@ impl fmt::Display for GenerationError {
         match self {
             Self::Elevation(error) => write!(f, "elevation data unavailable: {error}"),
             Self::OpenStreetMap(error) => write!(f, "OpenStreetMap data unavailable: {error}"),
+            Self::TreeCover(error) => write!(f, "tree cover data unavailable: {error}"),
         }
     }
 }
@@ -120,6 +123,7 @@ pub struct TerrainGenerator {
     provider: Arc<dyn TileProvider>,
     koppen: Option<Arc<KoppenMap>>,
     osm: Option<Arc<OsmDataset>>,
+    trees: Option<(Arc<TreePopulator>, Arc<LayeredScalarDataset>)>,
     settings: GeneratorSettings,
 }
 
@@ -132,7 +136,7 @@ impl TerrainGenerator {
         koppen: Option<Arc<KoppenMap>>,
         settings: GeneratorSettings,
     ) -> Self {
-        Self { projection, heights, provider, koppen, osm: None, settings }
+        Self { projection, heights, provider, koppen, osm: None, trees: None, settings }
     }
 
     /// Draws OpenStreetMap features (water, coastlines, roads, buildings) into chunk data.
@@ -140,6 +144,18 @@ impl TerrainGenerator {
     pub fn with_openstreetmap(mut self, osm: Arc<OsmDataset>) -> Self {
         self.osm = Some(osm);
         self
+    }
+
+    /// Bakes tree cover from `tree_cover` (fractions in `[0, 1]`) and places trees with
+    /// `populator`.
+    #[must_use]
+    pub fn with_trees(mut self, populator: Arc<TreePopulator>, tree_cover: Arc<LayeredScalarDataset>) -> Self {
+        self.trees = Some((populator, tree_cover));
+        self
+    }
+
+    pub fn trees(&self) -> Option<&Arc<TreePopulator>> {
+        self.trees.as_ref().map(|(populator, _)| populator)
     }
 
     pub fn openstreetmap(&self) -> Option<&Arc<OsmDataset>> {
@@ -154,9 +170,16 @@ impl TerrainGenerator {
         &self.projection
     }
 
-    /// `ChunkDataLoader.load` with the bakers that shape terrain, in upstream order: heights,
-    /// OpenStreetMap (when enabled) and null island. Tree cover is not baked.
+    /// `ChunkDataLoader.load` with upstream's bakers in order: tree cover (only when trees are
+    /// placed; upstream fetches it regardless), heights, OpenStreetMap (when enabled) and null
+    /// island.
     pub fn chunk_terrain(&self, chunk_x: i32, chunk_z: i32) -> Result<ChunkTerrain, GenerationError> {
+        let tree_cover = match &self.trees {
+            Some((_, dataset)) => Some(
+                sample_chunk_heights(self.projection.as_ref(), dataset, self.provider.as_ref(), chunk_x, chunk_z).map_err(GenerationError::TreeCover)?,
+            ),
+            None => None,
+        };
         let heights = sample_chunk_heights(self.projection.as_ref(), &self.heights, self.provider.as_ref(), chunk_x, chunk_z)
             .map_err(GenerationError::Elevation)?;
         let elements = match &self.osm {
@@ -164,6 +187,9 @@ impl TerrainGenerator {
             None => None,
         };
         let mut builder = ChunkDataBuilder::default();
+        if let Some(cover) = &tree_cover {
+            builder.bake_tree_cover(cover.as_deref());
+        }
         builder.bake_heights(heights.as_deref());
         match elements {
             Some(ChunkElements::Elements(elements)) => apply_elements(&elements, &mut builder, chunk_x, chunk_z),
@@ -186,6 +212,33 @@ impl TerrainGenerator {
             Some(class) => Biome::from_koppen(class),
             None => self.settings.default_biome,
         }
+    }
+
+    /// The Köppen class `TreePopulator` switches on at a block column: 8 when the biome dataset is
+    /// disabled (upstream's default), 0 where the projection or the raster has no value.
+    pub fn koppen_class_at_block(&self, x: i32, z: i32) -> u8 {
+        if !self.settings.use_biome_dataset {
+            return 8;
+        }
+        let Ok(geo) = self.projection.to_geo(ProjectedCoordinate::new(f64::from(x), f64::from(z))) else {
+            return 0;
+        };
+        self.koppen.as_ref().and_then(|map| map.class_at(geo.longitude, geo.latitude)).unwrap_or(0)
+    }
+
+    /// Tree blocks for a chunk (chunk-local `x`, world `y`, chunk-local `z`), from its own
+    /// populator and its neighbours'. Empty when trees are disabled. `neighbour` supplies the
+    /// baked data of chunks within [`TreePopulator::chunk_radius`].
+    pub fn tree_blocks(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        world: WorldHeight,
+        level_seed: i64,
+        neighbour: &mut dyn FnMut(i32, i32) -> Option<Arc<ChunkTerrain>>,
+    ) -> Vec<(usize, i32, usize, Block)> {
+        let Some((populator, _)) = &self.trees else { return Vec::new() };
+        populator.blocks_in_chunk(chunk_x, chunk_z, world, level_seed, neighbour, &|x, z| self.koppen_class_at_block(x, z))
     }
 
     /// `generateNoise` followed by `generateSurface` for one chunk.

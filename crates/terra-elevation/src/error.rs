@@ -8,7 +8,7 @@ pub enum ElevationError {
     /// A projection failure inside a multi-layer merge, which upstream reports as a failed load.
     LayerOutOfProjectionBounds,
     InvalidConfiguration(String),
-    UnsupportedFormat(&'static str),
+    UnsupportedFormat(String),
     RequestTooLarge { tiles: u64 },
     Decode { url: String, error: DecodeError },
     TileDecode(DecodeError),

@@ -1,6 +1,7 @@
 heights_world.json5 contains the first two (Terrarium) layers of TerraMinusMinus
 (https://github.com/SmylerMC/terraminusminus, commit a1432a9beabd79025e62c8de0d0b1a99e7ea9943,
 src/main/resources/net/buildtheearth/terraminusminus/dataset/scalar/heights.json5), unmodified.
+tree_cover.json5 is that commit's dataset/scalar/tree_cover.json5, byte-identical.
 
 TerraMinusMinus is distributed under the MIT License:
 MIT License

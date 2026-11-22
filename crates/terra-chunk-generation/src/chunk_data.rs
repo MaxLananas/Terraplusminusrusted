@@ -16,6 +16,20 @@ fn column(x: usize, z: usize) -> usize {
     x * 16 + z
 }
 
+/// `TreeCoverBaker.FALLBACK_TREE_DENSITY`, read when no tree cover was baked: `treeChance(50.0)`.
+pub const FALLBACK_TREE_DENSITY: u8 = 255;
+
+/// `TreeCoverBaker.treeChance`: a tree-cover fraction in `[0, 1]` to a per-cell tree chance out
+/// of 256 (a tree covers 2x2 blocks; the result is raised by half and clamped).
+pub fn tree_chance(value: f64) -> u8 {
+    if value.is_nan() {
+        return 0;
+    }
+    let scaled = value * (1.0 / (2.0 * 2.0)) * 255.0 * 1.50;
+    // `(int) Math.ceil` saturates like Rust's float-to-int cast.
+    (scaled.ceil() as i32).clamp(0, 255) as u8
+}
+
 /// Surface block requested by a data baker (OSM features); `None` defers to biome rules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SurfaceBlock(pub String);
@@ -26,6 +40,7 @@ pub struct ChunkDataBuilder {
     water_depth: [i8; COLUMNS],
     surface_blocks: Vec<Option<SurfaceBlock>>,
     trees_cleared: [bool; COLUMNS],
+    tree_cover: Option<[u8; COLUMNS]>,
 }
 
 impl Default for ChunkDataBuilder {
@@ -35,6 +50,7 @@ impl Default for ChunkDataBuilder {
             water_depth: [WATER_DEPTH_DEFAULT; COLUMNS],
             surface_blocks: vec![None; COLUMNS],
             trees_cleared: [false; COLUMNS],
+            tree_cover: None,
         }
     }
 }
@@ -78,6 +94,22 @@ impl ChunkDataBuilder {
     /// The encoded water depth byte: `WATERDEPTH_TYPE_*` in the top two bits, depth + 32 below.
     pub fn water_depth(&self, x: usize, z: usize) -> i8 {
         self.water_depth[column(x, z)]
+    }
+
+    /// The baked tree chance before `no_trees` draws, if tree cover was baked.
+    pub fn tree_cover(&self, x: usize, z: usize) -> Option<u8> {
+        self.tree_cover.map(|cover| cover[column(x, z)])
+    }
+
+    /// `TreeCoverBaker.bake`: `None` (no data, or outside the projection) bakes zero chance.
+    pub fn bake_tree_cover(&mut self, cover: Option<&[f64]>) {
+        let mut chances = [0u8; COLUMNS];
+        if let Some(cover) = cover.filter(|cover| cover.len() == COLUMNS) {
+            for (chance, &value) in chances.iter_mut().zip(cover) {
+                *chance = tree_chance(value);
+            }
+        }
+        self.tree_cover = Some(chances);
     }
 
     /// Whether a `no_trees` draw zeroed this column's tree-cover chance.
@@ -166,6 +198,7 @@ impl ChunkDataBuilder {
             ground_height,
             surface_blocks: self.surface_blocks.clone(),
             trees_cleared: self.trees_cleared,
+            tree_cover: self.tree_cover,
             surface_min_cube: (min >> 4) - 1,
             surface_max_cube: (max >> 4) + 1,
         }
@@ -183,6 +216,7 @@ pub struct ChunkTerrain {
     ground_height: [i32; COLUMNS],
     surface_blocks: Vec<Option<SurfaceBlock>>,
     trees_cleared: [bool; COLUMNS],
+    tree_cover: Option<[u8; COLUMNS]>,
     surface_min_cube: i32,
     surface_max_cube: i32,
 }
@@ -209,6 +243,17 @@ impl ChunkTerrain {
         !self.trees_cleared[column(x, z)]
     }
 
+    /// The tree chance out of 256 that `TreePopulator` reads: the baked tree cover, zero where
+    /// `no_trees` was drawn or on null island, and the fallback density when nothing was baked.
+    /// Upstream only clears baked cover; cover is always baked when trees are generated.
+    pub fn tree_chance(&self, x: usize, z: usize) -> u8 {
+        match self.tree_cover {
+            Some(_) if self.trees_cleared[column(x, z)] => 0,
+            Some(cover) => cover[column(x, z)],
+            None => FALLBACK_TREE_DENSITY,
+        }
+    }
+
     pub fn above_surface(&self, cube_y: i32) -> bool {
         cube_y > self.surface_max_cube
     }
@@ -221,6 +266,38 @@ impl ChunkTerrain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_chance_matches_tree_cover_baker() {
+        assert_eq!(tree_chance(50.0), FALLBACK_TREE_DENSITY);
+        assert_eq!(tree_chance(f64::NAN), 0);
+        assert_eq!(tree_chance(0.0), 0);
+        assert_eq!(tree_chance(-0.5), 0);
+        assert_eq!(tree_chance(f64::INFINITY), 255);
+        // 0.94 * 0.25 * 255 * 1.5 = 89.8875, rounded up.
+        assert_eq!(tree_chance(0.94), 90);
+        assert_eq!(tree_chance(0.01), 1);
+        assert_eq!(tree_chance(1.0), 96);
+    }
+
+    #[test]
+    fn tree_cover_is_cleared_by_no_trees_and_null_island() {
+        let cover = [0.5; COLUMNS];
+        let mut builder = ChunkDataBuilder::default();
+        builder.bake_heights(Some(&[10.0; COLUMNS]));
+        assert_eq!(builder.build().tree_chance(0, 0), FALLBACK_TREE_DENSITY);
+        builder.bake_tree_cover(Some(&cover));
+        DrawTarget::clear_tree_cover(&mut builder, 3, 4);
+        let terrain = builder.build();
+        assert_eq!((terrain.tree_chance(0, 0), terrain.tree_chance(3, 4)), (tree_chance(0.5), 0));
+        let mut outside = ChunkDataBuilder::default();
+        outside.bake_tree_cover(None);
+        assert_eq!(outside.build().tree_chance(7, 7), 0);
+        let mut island = ChunkDataBuilder::default();
+        island.bake_tree_cover(Some(&cover));
+        island.bake_null_island(1, -2);
+        assert_eq!(island.build().tree_chance(9, 9), 0);
+    }
 
     #[test]
     fn missing_heights_become_shallow_ocean() {

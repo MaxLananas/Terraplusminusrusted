@@ -1,6 +1,7 @@
 koppen_map.gz is copied unmodified from TerraPlusMinus
 (https://github.com/BTE-Germany/TerraPlusMinus, commit 5af87efafb0930c454da1ee49f098531018acca9,
-src/main/resources/koppen_map.gz). The generator in this crate ports TerraPlusMinus and
+src/main/resources/koppen_map.gz). customTrees.json is that commit's
+src/main/resources/assets/terraplusminus/data/customTrees.json, byte-identical. The generator in this crate ports TerraPlusMinus and
 TerraMinusMinus Java sources.
 
 TerraPlusMinus is distributed under the MIT License:

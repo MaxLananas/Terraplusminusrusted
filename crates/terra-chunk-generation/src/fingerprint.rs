@@ -48,6 +48,15 @@ impl GenerationFingerprint {
         Self { fields }
     }
 
+    /// Records that trees are placed: the tree schematics, the tree-cover dataset config and the
+    /// algorithm revision of the placement.
+    #[must_use]
+    pub fn with_trees(mut self, schematics: &[u8], tree_cover_config: &[u8]) -> Self {
+        self.fields.push(("trees".to_owned(), format!("1;{:016x}:{}", fnv1a64(schematics), schematics.len())));
+        self.fields.push(("tree_cover_config".to_owned(), format!("{:016x}:{}", fnv1a64(tree_cover_config), tree_cover_config.len())));
+        self
+    }
+
     /// Records that OpenStreetMap features are drawn: `mapping` is the exact `osm.json5` text and
     /// `servers` the data sources, in order.
     #[must_use]
@@ -72,6 +81,11 @@ impl GenerationFingerprint {
         }
         let fields = lines.map(|line| line.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect::<Option<Vec<_>>>()?;
         Some(Self { fields })
+    }
+
+    /// The recorded value of a field, if present.
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.fields.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str())
     }
 
     /// Fields whose values differ: (name, stored, current).

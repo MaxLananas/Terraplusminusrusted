@@ -18,7 +18,7 @@ use terra_chunk_generation::WorldHeight;
 use terra_server::{
     Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, LevelHeight, PendingTeleports, RegionIndex,
     ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, extract_default_osm_mapping, messages, messages::{ChatMessage, legacy_spans}, parse_server_config,
-    split_block_state, terrain_for_generation, write_chunk,
+    split_block_state, terrain_for_generation, write_chunk, write_trees, TreeTarget,
 };
 
 const MOD_ID: &str = "terraplusminus";
@@ -114,7 +114,11 @@ impl ChunkGenerator for EarthGenerator {
             .collect();
         let Some(&(_, stone)) = resolved.first() else { return };
         let mut palette = BlockPalette::new(move |name: &str| resolved.iter().find(|(known, _)| known == name).map_or(stone, |(_, state)| *state));
-        write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut AccessWriter(chunk));
+        let level_seed = chunk.seed();
+        write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut AccessWriter(&mut *chunk));
+        // Trees come after the terrain and may overwrite it, as upstream's populator does.
+        let target = TreeTarget { chunk_x: position.x, chunk_z: position.z, world, level_seed };
+        write_trees(&shared.stack, &shared.counters, &terrain, target, &mut palette, &mut AccessWriter(chunk), &mut |message| log(&message));
         shared.counters.chunks_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

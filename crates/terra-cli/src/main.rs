@@ -43,6 +43,12 @@ fn column(path: &str, latitude: f64, longitude: f64) -> Result<(), String> {
     println!("block x={x} z={z} chunk=({}, {})", x >> 4, z >> 4);
     println!("surface_y={} ground_y={}", terrain.surface_height(local_x, local_z) + y_offset, terrain.ground_height(local_x, local_z) + y_offset);
     println!("biome={}", stack.generator().biome_at_block(x, z).resource_name());
+    if stack.generator().trees().is_some() {
+        // TreePopulator compares every draw against the chunk's first column.
+        println!("tree_chance={}/255 (chunk)", terrain.tree_chance(0, 0));
+    } else {
+        println!("trees=disabled");
+    }
     Ok(())
 }
 

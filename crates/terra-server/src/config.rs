@@ -65,6 +65,8 @@ pub struct ServerConfig {
     pub team_bounds: TeamBounds,
     pub linked_worlds: LinkedWorlds,
     pub heights_config: Option<PathBuf>,
+    /// Tree-cover dataset config (`tree_cover.json5` schema); the upstream default when unset.
+    pub tree_cover_config: Option<PathBuf>,
     pub unsupported_layers: UnsupportedLayerPolicy,
     pub network: NetworkConfig,
     pub openstreetmap: OpenStreetMapConfig,
@@ -86,6 +88,7 @@ impl Default for ServerConfig {
             team_bounds: TeamBounds { min_latitude: 0.0, max_latitude: 0.0, min_longitude: 0.0, max_longitude: 0.0 },
             linked_worlds: LinkedWorlds { enabled: false, method: LinkedWorldsMethod::Levels, worlds: Vec::new() },
             heights_config: None,
+            tree_cover_config: None,
             unsupported_layers: UnsupportedLayerPolicy::Reject,
             network: NetworkConfig {
                 mirrors: Vec::new(),
@@ -271,8 +274,9 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         }
         config.world = WorldHeight { min_y, max_y: min_y + height };
     }
-    if let Some(elevation) = root.section("elevation", &["heights_config", "unsupported_layers"])? {
+    if let Some(elevation) = root.section("elevation", &["heights_config", "tree_cover_config", "unsupported_layers"])? {
         config.heights_config = elevation.string("heights_config")?.map(PathBuf::from);
+        config.tree_cover_config = elevation.string("tree_cover_config")?.map(PathBuf::from);
         config.unsupported_layers = match elevation.string("unsupported_layers")? {
             None | Some("reject") => UnsupportedLayerPolicy::Reject,
             Some("skip") => UnsupportedLayerPolicy::Skip,

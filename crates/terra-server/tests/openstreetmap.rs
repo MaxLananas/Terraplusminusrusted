@@ -125,9 +125,9 @@ fn a_missing_tile_fails_the_chunk_instead_of_dropping_features() {
 fn an_edited_mapping_beside_the_config_is_used() {
     let directory = common::scratch("osm-mapping");
     std::fs::write(directory.join("osm.json5"), r#"{"line": {"nothing": {}}, "polygon": {"nothing": {}}}"#).unwrap();
-    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}}"#).unwrap();
+    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}, "generate_trees": false}"#).unwrap();
     let stack = TerraStack::build(config, &directory).unwrap();
-    assert!(stack.surface_block_names().is_empty());
+    assert!(stack.surface_block_names().is_empty(), "no OSM blocks and no tree blocks");
     std::fs::write(directory.join("osm.json5"), r#"{"line": {"nothing": {}}}"#).unwrap();
     let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}}"#).unwrap();
     let error = TerraStack::build(config, &directory).err().expect("an invalid mapping refuses to start");

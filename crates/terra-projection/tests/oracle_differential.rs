@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use terra_projection::{
-    ConformalDymaxionProjection, DymaxionProjection, GeoCoordinate, GeographicProjection, ProjectedCoordinate,
-    SharedProjection, WebMercatorProjection, bte_world_projection, terraplusminus_projection,
+    AzimuthalEquidistantProjection, CenteredMercatorProjection, ClampTransform, ConformalDymaxionProjection, DymaxionProjection, EqualEarthProjection,
+    EquirectangularProjection, GeoCoordinate, GeographicProjection, LambertAzimuthalProjection, ProjectedCoordinate, RotateTransform, SharedProjection,
+    SinusoidalProjection, StereographicProjection, TransverseMercatorProjection, WebMercatorProjection, bte_world_projection, terraplusminus_projection,
 };
 
 /// Agreement is measured physically rather than per value in ulps: outputs near zero arise from
@@ -17,6 +18,10 @@ use terra_projection::{
 /// the poles.
 const INVERSE_TOLERANCE_METERS: f64 = 1e-6;
 const EARTH_RADIUS_METERS: f64 = 40_075_017.0 / std::f64::consts::TAU;
+/// See `compare`: identical NaN latitudes, longitudes within rounding.
+const DEGENERATE_RELATIVE_TOLERANCE: f64 = 1e-12;
+/// See `compare`: `asin` at ±1, with 4 ulp of argument (sqrt(8 * 2^-52) rad on the ground).
+const POLE_TOLERANCE_METERS: f64 = 0.27;
 
 enum Direction {
     FromGeo,
@@ -83,6 +88,17 @@ fn compare(name: &str, projection: &dyn GeographicProjection, direction: Directi
                 let (error, tolerance) = match direction {
                     Direction::FromGeo => {
                         ((expected.0 - actual.0).abs().max((expected.1 - actual.1).abs()), forward_tolerance)
+                    }
+                    // Both sides degenerate the same way (upstream's formulas give NaN latitude
+                    // outside the projection's outline): the finite component is compared
+                    // relatively instead of as a distance.
+                    Direction::ToGeo if expected.1.is_nan() && actual.1.is_nan() => {
+                        ((expected.0 - actual.0).abs() / expected.0.abs().max(1.0), DEGENERATE_RELATIVE_TOLERANCE)
+                    }
+                    // At a pole `asin` is evaluated at ±1, where one ulp of its argument moves the
+                    // result by sqrt(2 ulp) ~ 2e-8 rad (12 cm); longitude means nothing there.
+                    Direction::ToGeo if expected.1.abs() == 90.0 || actual.1.abs() == 90.0 => {
+                        ((expected.1 - actual.1).abs().to_radians() * EARTH_RADIUS_METERS, POLE_TOLERANCE_METERS)
                     }
                     Direction::ToGeo => (great_circle_meters(expected, actual), INVERSE_TOLERANCE_METERS),
                 };
@@ -205,4 +221,37 @@ fn bte_tissot_matches_upstream() {
     }
     assert_eq!(compared, 400);
     eprintln!("tissot: {compared} points, worst relative error {worst:e}, worst angle error {worst_angle:e} rad");
+}
+
+/// The rest of terraminusminus's projection registry, each in both directions, with the
+/// parameters `ProjectionGoldenDump.writeBoth` used. Forward results must agree within a
+/// micrometre on the ground (`1e-6 / meters_per_unit` projected units), inverse results within a
+/// micrometre of great-circle distance, and every out-of-bounds verdict must match.
+#[test]
+fn every_other_registered_projection_matches_upstream() {
+    let projections: Vec<(&str, SharedProjection)> = vec![
+        ("centered_mercator", Arc::new(CenteredMercatorProjection)),
+        ("transverse_mercator", Arc::new(TransverseMercatorProjection)),
+        ("equirectangular", Arc::new(EquirectangularProjection)),
+        ("sinusoidal", Arc::new(SinusoidalProjection)),
+        ("equal_earth", Arc::new(EqualEarthProjection)),
+        ("lambert_azimuthal", Arc::new(LambertAzimuthalProjection::new(Some(12.5), Some(48.0)).unwrap())),
+        ("azimuthal_equidistant", Arc::new(AzimuthalEquidistantProjection::new(Some(-61.5), Some(16.25)).unwrap())),
+        ("azimuthal_equidistant_north", Arc::new(AzimuthalEquidistantProjection::new(Some(0.0), Some(90.0)).unwrap())),
+        ("stereographic", Arc::new(StereographicProjection::new(Some(10.0), Some(20.0), Some(60.0)).unwrap())),
+        ("clamp", Arc::new(ClampTransform::new(Arc::new(EquirectangularProjection), -10.0, 20.0, -5.0, 50.0).unwrap())),
+        ("rotate", Arc::new(RotateTransform::new(Arc::new(EqualEarthProjection), 33.0).unwrap())),
+    ];
+    let mut failures = Vec::new();
+    for (name, projection) in &projections {
+        let tolerance = 1e-6 / projection.meters_per_unit();
+        for (file, direction) in [(format!("{name}_from_geo.tsv.gz"), Direction::FromGeo), (format!("{name}_to_geo.tsv.gz"), Direction::ToGeo)] {
+            let report = compare(&file, projection.as_ref(), direction, tolerance);
+            if report.samples == 0 || !report.status_mismatches.is_empty() || !report.value_mismatches.is_empty() {
+                let shown: Vec<_> = report.status_mismatches.iter().chain(&report.value_mismatches).take(5).cloned().collect();
+                failures.push(format!("{file}: {} status, {} value mismatches: {shown:#?}", report.status_mismatches.len(), report.value_mismatches.len()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

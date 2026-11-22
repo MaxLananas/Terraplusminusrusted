@@ -11,6 +11,7 @@
 mod dymaxion;
 mod java_math;
 mod mercator;
+mod others;
 mod transform;
 
 use std::fmt;
@@ -18,6 +19,10 @@ use std::sync::Arc;
 
 pub use dymaxion::{BteDymaxionProjection, ConformalDymaxionProjection, DymaxionProjection, VectorFieldError};
 pub use mercator::WebMercatorProjection;
+pub use others::{
+    AzimuthalEquidistantProjection, CenteredMercatorProjection, ClampTransform, EqualEarthProjection, EquirectangularProjection, LambertAzimuthalProjection,
+    RotateTransform, SinusoidalProjection, StereographicProjection, TransverseMercatorProjection,
+};
 pub use transform::{
     FlipHorizontalTransform, FlipVerticalTransform, OffsetTransform, ScaleTransform, SwapAxesTransform,
 };

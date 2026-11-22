@@ -8,7 +8,11 @@ use crate::error::ElevationError;
 use crate::layered::{LayeredScalarDataset, ScalarLayer};
 use std::sync::Arc;
 use terra_codec::{JsonValue, parse_relaxed_json};
-use terra_projection::{FlipHorizontalTransform, FlipVerticalTransform, OffsetTransform, ScaleTransform, SharedProjection, SwapAxesTransform, WebMercatorProjection};
+use terra_projection::{
+    AzimuthalEquidistantProjection, BteDymaxionProjection, CenteredMercatorProjection, ClampTransform, ConformalDymaxionProjection, DymaxionProjection, EqualEarthProjection,
+    EquirectangularProjection, FlipHorizontalTransform, FlipVerticalTransform, LambertAzimuthalProjection, OffsetTransform, RotateTransform, ScaleTransform, SharedProjection,
+    SinusoidalProjection, StereographicProjection, SwapAxesTransform, TransverseMercatorProjection, WebMercatorProjection,
+};
 
 /// What to do with layers whose parser or projection this implementation does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +122,14 @@ fn required_number(value: &JsonValue, key: &str) -> Result<f64, String> {
     value.get(key).and_then(JsonValue::as_f64).ok_or_else(|| format!("missing numeric `{key}`"))
 }
 
+/// A nullable `Double` creator property: absent or `null` gives `None`, as Jackson.
+fn optional_number(value: &JsonValue, key: &str) -> Result<Option<f64>, String> {
+    match value.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(member) => member.as_f64().map(Some).ok_or_else(|| format!("`{key}` must be a number")),
+    }
+}
+
 /// A Jackson polymorphic wrapper: an object with exactly one member naming the type.
 fn single_member(value: &JsonValue) -> Result<(&str, &JsonValue), String> {
     match value.as_object() {
@@ -157,7 +169,7 @@ fn parse_format(value: &JsonValue, depth: usize) -> Result<TileFormat, Problem> 
     })
 }
 
-/// The dataset projections the bundled configs use, and the transforms that wrap them.
+/// Every projection and transform of `GlobalParseRegistries.PROJECTIONS`.
 fn parse_projection(value: &JsonValue, depth: usize) -> Result<SharedProjection, Problem> {
     if depth > MAX_NESTING {
         return Err("projection nesting too deep".into());
@@ -180,10 +192,35 @@ fn parse_projection(value: &JsonValue, depth: usize) -> Result<SharedProjection,
         "flip_horizontal" => shared(Arc::new(FlipHorizontalTransform::new(delegate()?))),
         "flip_vertical" => shared(Arc::new(FlipVerticalTransform::new(delegate()?))),
         "swap_axes" => shared(Arc::new(SwapAxesTransform::new(delegate()?))),
-        "centered_mercator" | "transverse_mercator" | "equirectangular" | "sinusoidal" | "equal_earth" | "bte_conformal_dymaxion" | "dymaxion"
-        | "conformal_dymaxion" | "lambert_azimuthal" | "azimuthal_equidistant" | "stereographic" | "clamp" | "rotate" => {
-            Err(Problem::Unsupported(format!("dataset projection `{name}` is not ported")))
+        "centered_mercator" => shared(Arc::new(CenteredMercatorProjection)),
+        "transverse_mercator" => shared(Arc::new(TransverseMercatorProjection)),
+        "equirectangular" => shared(Arc::new(EquirectangularProjection)),
+        "sinusoidal" => shared(Arc::new(SinusoidalProjection)),
+        "equal_earth" => shared(Arc::new(EqualEarthProjection)),
+        "dymaxion" => shared(Arc::new(DymaxionProjection::default())),
+        "conformal_dymaxion" => shared(Arc::new(ConformalDymaxionProjection::new().map_err(|error| format!("conformal_dymaxion: {error}"))?)),
+        "bte_conformal_dymaxion" => shared(Arc::new(BteDymaxionProjection::new().map_err(|error| format!("bte_conformal_dymaxion: {error}"))?)),
+        "lambert_azimuthal" => {
+            shared(Arc::new(LambertAzimuthalProjection::new(optional_number(settings, "centerX")?, optional_number(settings, "centerY")?).map_err(Problem::from)?))
         }
+        "azimuthal_equidistant" => shared(Arc::new(
+            AzimuthalEquidistantProjection::new(optional_number(settings, "centerX")?, optional_number(settings, "centerY")?).map_err(Problem::from)?,
+        )),
+        "stereographic" => shared(Arc::new(
+            StereographicProjection::new(optional_number(settings, "centerX")?, optional_number(settings, "centerY")?, optional_number(settings, "radius")?)
+                .map_err(Problem::from)?,
+        )),
+        "clamp" => shared(Arc::new(
+            ClampTransform::new(
+                delegate()?,
+                required_number(settings, "minX")?,
+                required_number(settings, "maxX")?,
+                required_number(settings, "minY")?,
+                required_number(settings, "maxY")?,
+            )
+            .map_err(Problem::from)?,
+        )),
+        "rotate" => shared(Arc::new(RotateTransform::new(delegate()?, required_number(settings, "by")?).map_err(Problem::from)?)),
         other => Err(format!("unknown dataset projection `{other}`").into()),
     }
 }
@@ -237,11 +274,42 @@ mod tests {
     #[test]
     fn unported_layers_are_never_silently_dropped() {
         let config = r#"[{"dataset": {"urls": ["https://example.invalid/${x}/${z}.png"], "projection": {"equirectangular": {}},
-            "resolution": 256, "blend": "NEAR", "parse": {"parse_tiff": {}}}, "bounds": [], "zooms": {"min": 0, "max": 3}}]"#;
+            "resolution": 256, "blend": "NEAR", "parse": {"from_int": {"delegate": {"parse_png": {}}}}}, "bounds": [], "zooms": {"min": 0, "max": 3}}]"#;
         assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Reject), Err(ElevationError::UnsupportedFormat(_))));
         assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
-        let typo = config.replace("equirectangular", "equirectangulr");
+        let typo = config.replace("from_int", "from_intt");
         assert!(matches!(load_heights_config(&typo, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn every_registered_projection_loads() {
+        let layer = |projection: &str| {
+            format!(
+                r#"[{{"dataset": {{"urls": ["https://example.invalid/${{x}}/${{z}}.png"], "projection": {projection},
+                "resolution": 256, "blend": "NEAR", "parse": {{"parse_tiff": {{}}}}}}, "bounds": [{{"minX": -1, "maxX": 1, "minZ": -1, "maxZ": 1}}], "zooms": {{"min": 0, "max": 3}}}}]"#
+            )
+        };
+        for projection in [
+            r#"{"centered_mercator": {}}"#,
+            r#"{"transverse_mercator": {}}"#,
+            r#"{"equirectangular": {}}"#,
+            r#"{"sinusoidal": {}}"#,
+            r#"{"equal_earth": {}}"#,
+            r#"{"dymaxion": {}}"#,
+            r#"{"conformal_dymaxion": {}}"#,
+            r#"{"bte_conformal_dymaxion": {}}"#,
+            r#"{"lambert_azimuthal": {"centerX": 12.5, "centerY": null}}"#,
+            r#"{"azimuthal_equidistant": {}}"#,
+            r#"{"stereographic": {"radius": 45}}"#,
+            r#"{"clamp": {"delegate": {"equirectangular": {}}, "minX": -10, "maxX": 10, "minY": -5, "maxY": 5}}"#,
+            r#"{"rotate": {"delegate": {"equal_earth": {}}, "by": 30}}"#,
+        ] {
+            let loaded = load_heights_config(&layer(projection), UnsupportedLayerPolicy::Reject);
+            assert!(loaded.is_ok(), "{projection}: {:?}", loaded.err());
+        }
+        for invalid in [r#"{"stereographic": {"radius": 180}}"#, r#"{"lambert_azimuthal": {"centerX": "east"}}"#, r#"{"clamp": {"delegate": {"equirectangular": {}}, "minX": 0}}"#, r#"{"rotate": {"by": 3}}"#] {
+            assert!(matches!(load_heights_config(&layer(invalid), UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))), "{invalid}");
+        }
     }
 
     #[test]

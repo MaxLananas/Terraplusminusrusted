@@ -1,13 +1,23 @@
 package terraplusminus.oracle;
 
+import net.buildtheearth.terraminusminus.projection.AzimuthalEquidistantProjection;
+import net.buildtheearth.terraminusminus.projection.EqualEarthProjection;
+import net.buildtheearth.terraminusminus.projection.EquirectangularProjection;
 import net.buildtheearth.terraminusminus.projection.GeographicProjection;
+import net.buildtheearth.terraminusminus.projection.LambertAzimuthalProjection;
+import net.buildtheearth.terraminusminus.projection.SinusoidalProjection;
+import net.buildtheearth.terraminusminus.projection.StereographicProjection;
 import net.buildtheearth.terraminusminus.projection.OutOfProjectionBoundsException;
 import net.buildtheearth.terraminusminus.projection.dymaxion.BTEDymaxionProjection;
 import net.buildtheearth.terraminusminus.projection.dymaxion.ConformalDynmaxionProjection;
 import net.buildtheearth.terraminusminus.projection.dymaxion.DymaxionProjection;
+import net.buildtheearth.terraminusminus.projection.mercator.CenteredMercatorProjection;
+import net.buildtheearth.terraminusminus.projection.mercator.TransverseMercatorProjection;
 import net.buildtheearth.terraminusminus.projection.mercator.WebMercatorProjection;
+import net.buildtheearth.terraminusminus.projection.transform.ClampProjectionTransform;
 import net.buildtheearth.terraminusminus.projection.transform.FlipVerticalProjectionTransform;
 import net.buildtheearth.terraminusminus.projection.transform.OffsetProjectionTransform;
+import net.buildtheearth.terraminusminus.projection.transform.RotateProjectionTransform;
 import net.buildtheearth.terraminusminus.projection.transform.ScaleProjectionTransform;
 
 import java.io.BufferedWriter;
@@ -51,6 +61,40 @@ public final class ProjectionGoldenDump {
         writeInverse(output.resolve("bte_to_geo.tsv"), bte, blockInputs(bte, geoInputs));
         writeInverse(output.resolve("bte_offset_to_geo.tsv"), bteWithOffset, blockInputs(bteWithOffset, geoInputs));
         writeInverse(output.resolve("web_mercator_z13_to_geo.tsv"), new WebMercatorProjection(13), pixelInputs());
+
+        // The rest of the dataset projection registry (GlobalParseRegistries.PROJECTIONS).
+        writeBoth(output, "centered_mercator", new CenteredMercatorProjection(), geoInputs);
+        writeBoth(output, "transverse_mercator", new TransverseMercatorProjection(), geoInputs);
+        writeBoth(output, "equirectangular", new EquirectangularProjection(), geoInputs);
+        writeBoth(output, "sinusoidal", new SinusoidalProjection(), geoInputs);
+        writeBoth(output, "equal_earth", new EqualEarthProjection(), geoInputs);
+        writeBoth(output, "lambert_azimuthal", new LambertAzimuthalProjection(12.5, 48.0), geoInputs);
+        writeBoth(output, "azimuthal_equidistant", new AzimuthalEquidistantProjection(-61.5, 16.25), geoInputs);
+        writeBoth(output, "azimuthal_equidistant_north", new AzimuthalEquidistantProjection(0.0, 90.0), geoInputs);
+        writeBoth(output, "stereographic", new StereographicProjection(10.0, 20.0, 60.0), geoInputs);
+        writeBoth(output, "clamp", new ClampProjectionTransform(new EquirectangularProjection(), -10.0, 20.0, -5.0, 50.0), geoInputs);
+        writeBoth(output, "rotate", new RotateProjectionTransform(new EqualEarthProjection(), 33.0), geoInputs);
+    }
+
+    /** Forward samples, then inverse samples at their images and across the bounds widened by a quarter. */
+    private static void writeBoth(Path output, String name, GeographicProjection projection, List<double[]> geoInputs) throws IOException {
+        writeForward(output.resolve(name + "_from_geo.tsv"), projection, geoInputs);
+        List<double[]> inputs = new ArrayList<>();
+        for (double[] geo : geoInputs) {
+            try {
+                inputs.add(projection.fromGeo(geo[0], geo[1]));
+            } catch (OutOfProjectionBoundsException ignored) {
+                // Nothing to invert.
+            }
+        }
+        double[] bounds = projection.bounds();
+        double padX = (bounds[2] - bounds[0]) / 4;
+        double padY = (bounds[3] - bounds[1]) / 4;
+        SplittableRandom random = new SplittableRandom(SEED ^ name.hashCode());
+        for (int i = 0; i < 2000; i++) {
+            inputs.add(new double[]{ random.nextDouble(bounds[0] - padX, bounds[2] + padX), random.nextDouble(bounds[1] - padY, bounds[3] + padY) });
+        }
+        writeInverse(output.resolve(name + "_to_geo.tsv"), projection, inputs);
     }
 
     private static List<double[]> geographicInputs() {

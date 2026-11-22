@@ -44,6 +44,21 @@ pub(crate) fn asin(value: f64) -> f64 {
 }
 
 #[inline]
+pub(crate) fn acos(value: f64) -> f64 {
+    value.acos()
+}
+
+#[inline]
+pub(crate) fn sinh(value: f64) -> f64 {
+    value.sinh()
+}
+
+#[inline]
+pub(crate) fn cosh(value: f64) -> f64 {
+    value.cosh()
+}
+
+#[inline]
 pub(crate) fn atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }

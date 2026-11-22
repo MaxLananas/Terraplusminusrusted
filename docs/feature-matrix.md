@@ -1,0 +1,116 @@
+# Feature matrix
+
+Upstream revisions are listed in [upstream-pins.md](upstream-pins.md). "TPM" is TerraPlusMinus,
+"TMM" is terraminusminus. Paths without a crate prefix are under `crates/`.
+
+## Status values
+
+| Status | Meaning |
+|---|---|
+| Verified | Ported, with a differential test against the Java oracle or a test of the upstream contract. |
+| Implemented | Ported and unit or integration tested, but without an oracle comparison. |
+| Horizon: stub-checked | The Horizon adapter type-checks against the API stub (`tools/horizon-api-stub`), but has never run inside Horizon. |
+| Not ported | Absent. Listed on purpose so that nothing is silently missing. |
+
+None of the Horizon rows has run in a real Horizon server, because Horizon cannot be built in
+this environment. See [Limits](#limits).
+
+## Projection
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TMM `DymaxionProjection` | Icosahedral Dymaxion forward and inverse | `terra-projection/src/dymaxion.rs` | Used through `TerraStack` | `terra-projection/tests/oracle_differential.rs::dymaxion_from_geo_matches_upstream` | Verified |
+| TMM `ConformalDymaxionProjection` | Conformal variant driven by `conformal.gz`, with Newton inverse | `dymaxion.rs`, `resources/conformal.gz` | Same | `conformal_dymaxion_from_geo_matches_upstream` | Verified |
+| TMM `BTEDymaxionProjection` | BTE projection: Alaska and Iceland adjustments | `dymaxion.rs::BteDymaxionProjection` | Same | `bte_from_geo_matches_upstream`, `bte_to_geo_matches_upstream` (max 7.45e-9 blocks) | Verified |
+| TMM `ScaleProjectionTransform`, `FlipVerticalProjectionTransform`, `OffsetProjectionTransform` | Scale (7318261.522857145), flip, offset | `transform.rs` | Same | `offset_bte_matches_upstream`, `tests.rs::offset_shifts_projected_coordinates_exactly` | Verified |
+| TMM `WebMercatorProjection` | Tile maths for raster datasets | `mercator.rs` | Same | `web_mercator_matches_upstream` | Verified; zoom above 22 rejected |
+| TMM `GeographicProjection.bounds`, `.vector`, `.tissot` | Bounds, displacement, Tissot indicatrix | `lib.rs::GeographicProjection` | `/distortion` | `bte_tissot_matches_upstream` (400 points, relative error at most 3.1e-7) | Verified |
+| TMM `OutOfProjectionBoundsException` | Out-of-domain inputs fail | `ProjectionResult` errors | Refusals in `/tpll` and `/where` | `tests.rs::rejects_out_of_range_geographic_input` | Verified |
+
+## Elevation and interpolation
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TMM `heights.json5`, `DoubleTiledDataset` layers | Layered provider configuration, conditions and bounds | `terra-elevation/src/config.rs`, `condition.rs`, `bounds.rs`, `layered.rs` | Loaded from `elevation.heights_config` | `config.rs::default_world_layers_load`, `nested_conditions_and_multiple_bounds` | Implemented |
+| TMM terrarium PNG decoding | `(r*256 + g + b/256) - 32768` | `terrarium.rs`, `terra-codec/src/png.rs` | Same | `terrarium_decode_is_bit_exact` | Verified |
+| TMM `BlendMode` (NEAR, LINEAR, CUBIC, SMOOTH) | Sub-tile interpolation | `blend.rs` | Same | `blend_modes_are_bit_exact` (0 of 18000 differ) | Verified |
+| TMM `HeightsBaker` and chunk sampling | Per-chunk 16x16 heights, including offsets | `chunk.rs` | `EarthGenerator::build_terrain` | `chunk_heights_match_upstream`, `offset_chunk_heights_match_upstream` (625 chunks, 0 mismatches) | Verified |
+| TMM GeoTIFF datasets | TIFF elevation layers | Not implemented: those layers are listed as skipped, never dropped silently | `/terraplusminus status` lists them | `config.rs::tiff_layers_are_never_silently_dropped` | Not ported (1964 of the 1966 default-config URLs are TIFF) |
+| TMM `zooms` key | Multi-zoom selection | Parsed, unused | n/a | n/a | Not ported |
+
+## Provider acquisition and caching
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TMM `Http` | Bounded concurrent fetching with retries | `terra-acquisition/src/http.rs`, `policy.rs` | Worker threads only, never on the tick | `loopback_http.rs::fetches_through_retries_and_reports_missing`, `stalled_server_times_out`, `policy.rs::*` | Implemented |
+| Rate limits (429, `Retry-After`) | Back off per host | `policy.rs` | Same | `rate_limit_cooldown_applies_to_the_host` | Implemented |
+| HTTPS | TLS fetching | Refused, never downgraded. `plain_http_hosts` or a mirror is required. | Same | `https_is_refused_not_downgraded` | Not ported (no TLS without crates.io) |
+| TMM `Disk` cache | On-disk tile cache | `disk_cache.rs`: atomic publication, versioned keys, LRU byte budget | `<world>/horizon-mod-data/terraplusminus` and the configured cache directory | `round_trips_and_survives_reopen`, `detects_corruption_and_discards_partial_writes`, `evicts_least_recently_used_beyond_budget` | Implemented |
+| TPM chunk cache (expire after 5 min access) | RAM cache of baked chunks | `terra-chunk-generation/src/loader.rs`: bounded queue, dedup, cancellation | Same | `loader_concurrency.rs::*` (5 tests) | Implemented |
+| Decompression bombs and path traversal | Defensive input handling | `terra-codec` output limits; `routing.rs` | Same | `deflate.rs::output_limit_is_enforced`, `png.rs::rejects_corruption_and_limits`, `routing.rs::routes_mirrors_rewrites_listed_hosts_and_refuses_others` | Implemented |
+
+## Terrain generation
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TPM `RealWorldGenerator.generateNoise` and `generateSurface` | Stone column, surface block, water to sea level | `generator.rs`, `chunk_data.rs` | `EarthGenerator::build_terrain` writes through `ChunkAccess::set_block` (no post-generation edits) | `offline_area.rs::generates_real_terrain_with_continuous_seams`, `block_columns_are_stone_capped_by_surface`, `engine_bridge.rs::writes_real_columns_up_to_the_surface` | Implemented; Horizon: stub-checked |
+| Missing and NaN heights | TMM defaults (shallow ocean, sea-level column) | `chunk_data.rs` | Same | `missing_heights_become_shallow_ocean`, `nan_heights_are_sea_level_columns` | Implemented |
+| Negative coordinates, chunk borders | Floor division everywhere | Typed coordinates in `terra-projection`, `chunk_data.rs` | Same | `negative_heights_floor_toward_negative_infinity`, `null_island_spans_six_chunks_per_axis`, `region_index.rs::reads_saved_chunks_including_negative_coordinates` | Implemented |
+| TPM `BlockMapper` and `surface_material` | Configurable surface block | `generator.rs` | Block keys resolved at registration | `upstream_keys_and_extensions_parse` | Implemented |
+| Paper `buildSurface` RNG | `LegacyRandomSource(0)` seeded per column | `java_random.rs` | Same | `matches_java_util_random_sequences` | Implemented |
+| Deterministic output | Independent of scheduling | Pure function of configuration and chunk position | Same | `generation_is_independent_of_order_and_threads`, `output_does_not_depend_on_worker_count_or_request_order` | Implemented |
+| Generation fingerprint | Refuse reuse with incompatible settings | `fingerprint.rs`, `engine_bridge.rs::GenerationGate` | Checked in `server_started`; generation stays closed on mismatch | `records_then_matches_then_refuses_changes`, `gate_follows_fingerprint_outcomes` | Implemented |
+| Never overwrite player builds | Generation touches only new chunks | Horizon calls `build_terrain` only for chunks without saved data | Same | Engine contract (`world/chunk_generator.rs`) | Horizon: stub-checked |
+| Lighting, heightmaps, generation states, persistence | Engine-owned | Not reimplemented | Horizon runs these after `build_terrain` | Needs a real Horizon run | Horizon: stub-checked |
+
+## Biomes and vegetation
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TPM `CustomBiomeProvider` and `koppen_map.gz` | Köppen climate to biome | `biome.rs`; `koppen_map.gz` byte-identical to upstream | `EarthBiomes::noise_biome` through `register_biome_source` | `koppen_biomes_cover_the_offline_area`, `biome_lookup_matches_the_generator_and_ignores_height` | Implemented; surface biome is quart-aligned |
+| `biomes.use_dataset = false` | One configured biome everywhere | `biome.rs` | Same | `upstream_keys_and_extensions_parse` | Implemented |
+| TPM `TreePopulator` and TMM `TreeCoverBaker` | Tree-cover density, custom tree schematics by biome | Not implemented. `generate_trees` is parsed. | n/a | n/a | Not ported |
+| TMM OSM pipeline and `osm.json5` | Roads, buildings, water polygons from OpenStreetMap | Not implemented | n/a | n/a | Not ported |
+| Oceans, lakes, rivers, coastlines | Upstream water comes only from the OSM baker (water polygons) and from NaN or missing heights; the generator fills water up to `waterHeight` | NaN and missing heights handled in `chunk_data.rs`. Without OSM, negative elevations generate dry ground below sea level, as TPM would with OSM disabled. | Same | `missing_heights_become_shallow_ocean`, `nan_heights_are_sea_level_columns`, `inland_water_lowers_ground_only` | Not ported (depends on the OSM pipeline); no coastline test yet |
+
+## LiDAR, offsets, bounds and heights
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| LiDAR datasets | High-resolution layers in `heights.json5` | Supported only when they are terrarium PNG layers. TIFF LiDAR is skipped (see elevation). | Same | `config.rs::tiff_layers_are_never_silently_dropped` | Partially ported |
+| `terrain_offset.x/y/z` | Shift world against projection and height | `config.rs`, `OffsetProjectionTransform` | Dimension `sea_level = 63 + y` | `offset_chunk_heights_match_upstream`, `offset_bte_matches_upstream` | Verified |
+| `min/max_latitude`, `min/max_longitude` | Team bounds for `/tpll` | `tpll.rs` | `/tpll` | `tpll_flow.rs::enforces_authorization_and_bounds` | Implemented |
+| Extended heights (`world-height-datapack.zip`) | Build height up to 2032 | `world.min_y`, `world.height` → `DimensionSettings` | `register_dimension` | `config.rs::rejects_unknown_keys_and_invalid_values` (range checks) | Implemented; Horizon: stub-checked |
+
+## Linked worlds
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| `linked_worlds` with method MULTIVERSE | Stacked levels with Y offsets; `/tpll` routes above max or at/below min | `tpll.rs::linked_world`, config method `Levels` | Levels by dimension id | `tpll_flow.rs::explicit_heights_route_through_linked_worlds` | Implemented |
+| Method SERVER (proxy plugin message) | Cross-server routing | Refused by the config parser | n/a | `rejects_unknown_keys_and_invalid_values` | Not ported |
+| `PlayerMoveEvent` auto-teleport between linked worlds | Move players across level boundaries while walking | Not implemented | n/a | n/a | Not ported |
+
+## Commands, permissions and teleportation
+
+| Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
+|---|---|---|---|---|---|
+| TPM `TpllCommand` coordinate parsing | Decimal, DMS and suffix formats; height | `coordinates.rs`, `java_text.rs`, `tpll.rs` | `/tpll <coordinates:text>` and alias `/tpc` | `coordinate_oracle.rs::matches_upstream_on_every_recorded_input` (245 of 245) | Verified |
+| TPM `TpllCommand` flow | Height lookup, ungenerated-chunk permission, linked worlds, messages | `tpll.rs`, `teleports.rs`, `messages.rs` | Off-tick surface loading; `entity.teleport_to_level` | `tpll_flow.rs::*` (4 tests), `messages.rs::teleport_lines_follow_upstream_number_formatting` | Implemented; Horizon: stub-checked |
+| `/tpll -p <player>` (`forcetpll`) | Teleport other players | Not implemented | n/a | n/a | Not ported |
+| TPM `WhereCommand` | Geographic position plus a Google Maps link | `messages.rs::where_message` | `/where`, click and hover style | `where_links_the_reported_coordinates`, `command_text_oracle.rs::matches_java_double_text` | Implemented; Horizon: stub-checked |
+| TPM `OffsetCommand` | Offsets, or Y per linked level | `messages.rs::offset_lines` | `/offset` | `offsets_list_linked_levels_instead_of_y` | Implemented; Horizon: stub-checked |
+| TPM `DistortionCommand` | Tissot-based scale and angle report | `messages.rs::distortion_message` | `/distortion` | `bte_tissot_matches_upstream`, `matches_java_double_text` (`%.6f`, `%.4f`) | Implemented; Horizon: stub-checked |
+| TPM `Permission` nodes | `t+-.tpll`, `.tpll.otherWorld`, `.tpll.ungenerated-chunks`, `.admin`, `.where`, `.offset`, `.distortion` | `config.rs::PermissionLevels` maps nodes to vanilla operator levels | `Command::op(usage, level)` plus checks in the handlers | `enforces_authorization_and_bounds` | Implemented (operator levels replace permission plugins) |
+| `t+-.autoteleport`, `t+-.notify.update` | Auto-teleport, update notices | Not implemented | n/a | n/a | Not ported |
+| Teleport readiness | Never teleport into ungenerated or unloaded terrain | `teleports.rs`: bounded pending table, timeout, replaceable | Polled at `ServerTickPhase::ServerTickStart` | `pending_teleports_are_bounded_and_replaceable` | Implemented |
+| Diagnostics | Queue, cache and fingerprint state | `TerraStack::diagnostics_report` | `/terraplusminus status` (diagnostics level) | Exercised by `terra-cli benchmark` | Implemented |
+| `PlayerJoinEvent`, `PlayerCommandPreprocessEvent`, `PluginMessageEvent` | Join handling, command rewriting, proxy messages | Not implemented | n/a | n/a | Not ported |
+
+## Limits
+
+- Horizon is not compiled or run here: it needs Rust 1.95 and crates.io, and neither is reachable.
+  The adapter is only type-checked against a hand-written stub whose signatures cite the SDK
+  sources (`tools/horizon-api-stub/README.md`).
+- So no bot join, lighting or collision check, save/restart, or in-engine teleport has been run.
+- Live provider tests are opt-in (`scripts/verify.sh --live`) and were not run, because provider
+  hosts are unreachable from this environment.

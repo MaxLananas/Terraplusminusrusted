@@ -74,6 +74,10 @@ impl std::fmt::Display for TransportError {
     }
 }
 
+/// Sent when no user agent is configured, in upstream's `createHttpUserAgent` shape
+/// (`<plugin>/<version> (<library>/<version>; +<website>)`).
+pub const DEFAULT_USER_AGENT: &str = concat!("Terraplusminus/", env!("CARGO_PKG_VERSION"), " (Terra--/rust; +https://github.com/MaxLananas/Terraplusminusrusted)");
+
 pub trait HttpTransport: Send + Sync {
     fn get(&self, url: &str, limits: &TransportLimits) -> Result<HttpResponse, TransportError>;
 }
@@ -194,7 +198,7 @@ impl HttpTransport for PlainHttpTransport {
             }
         }
         let mut stream = DeadlineStream { inner: stream.ok_or(last_error)?, deadline, io_timeout: limits.io_timeout };
-        let agent = if self.user_agent.is_empty() { "terraplusminus-rust" } else { &self.user_agent };
+        let agent = if self.user_agent.is_empty() { DEFAULT_USER_AGENT } else { &self.user_agent };
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
             parsed.path,

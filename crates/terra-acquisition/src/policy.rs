@@ -41,10 +41,29 @@ struct HostState {
     cooldown_until: Option<Instant>,
 }
 
+/// TerraMinusMinus' `TerraConfig.http.maxConcurrentRequests`, in its own `"<n>: <url>"` form.
+pub const DEFAULT_HOST_LIMITS: [&str; 5] =
+    ["8: https://cloud.daporkchop.net/", "8: https://s3.amazonaws.com/", "1: http://gis-treecover.wri.org/", "1: https://overpass.kumi.systems/", "1: https://lz4.overpass-api.de/"];
+
+/// One `maxConcurrentRequests` entry, `"<n>: <url>"` (`^(\d+): (.+)$`), as (host, n). Only the
+/// URL's authority counts: an `https://` host fetched over plain HTTP keeps its limit.
+pub fn parse_host_limit(entry: &str) -> Option<(String, usize)> {
+    let (count, url) = entry.split_once(": ")?;
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let count: usize = count.parse().ok().filter(|count| *count > 0)?;
+    let (_, rest) = url.split_once("://")?;
+    let host = rest.split('/').next().filter(|host| !host.is_empty())?;
+    Some((host.to_ascii_lowercase(), count))
+}
+
 pub struct HttpTileFetcher<T> {
     transport: T,
     limits: TransportLimits,
     policy: RetryPolicy,
+    /// Per-host overrides of `policy.max_per_host`, by lower-case authority.
+    host_limits: HashMap<String, usize>,
     hosts: Mutex<HashMap<String, HostState>>,
     host_released: Condvar,
 }
@@ -65,7 +84,17 @@ fn retry_after(response: &HttpResponse) -> Option<Duration> {
 
 impl<T: HttpTransport> HttpTileFetcher<T> {
     pub fn new(transport: T, limits: TransportLimits, policy: RetryPolicy) -> Self {
-        Self { transport, limits, policy, hosts: Mutex::new(HashMap::new()), host_released: Condvar::new() }
+        Self { transport, limits, policy, host_limits: HashMap::new(), hosts: Mutex::new(HashMap::new()), host_released: Condvar::new() }
+    }
+
+    /// Requests in flight allowed for each listed host, instead of `max_per_host`.
+    pub fn with_host_limits(mut self, limits: impl IntoIterator<Item = (String, usize)>) -> Self {
+        self.host_limits = limits.into_iter().map(|(host, limit)| (host.to_ascii_lowercase(), limit.max(1))).collect();
+        self
+    }
+
+    fn host_limit(&self, host: &str) -> usize {
+        self.host_limits.get(&host.to_ascii_lowercase()).copied().unwrap_or(self.policy.max_per_host).max(1)
     }
 
     /// Takes a slot for `host`, or returns false when the deadline passes first.
@@ -81,7 +110,7 @@ impl<T: HttpTransport> HttpTileFetcher<T> {
                 Some(until) if until > now => {
                     hosts = self.host_released.wait_timeout(hosts, until.min(deadline) - now).unwrap_or_else(PoisonError::into_inner).0;
                 }
-                _ if state.in_flight >= self.policy.max_per_host.max(1) => {
+                _ if state.in_flight >= self.host_limit(host) => {
                     hosts = self.host_released.wait_timeout(hosts, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
                 }
                 _ => {
@@ -230,5 +259,21 @@ mod tests {
         let started = Instant::now();
         fetcher.fetch("http://h/t").unwrap();
         assert!(started.elapsed() >= Duration::from_millis(990));
+    }
+
+    #[test]
+    fn host_limits_follow_terraminusminus() {
+        assert_eq!(parse_host_limit("8: https://cloud.daporkchop.net/"), Some(("cloud.daporkchop.net".into(), 8)));
+        assert_eq!(parse_host_limit("1: http://gis-treecover.wri.org/"), Some(("gis-treecover.wri.org".into(), 1)));
+        assert_eq!(parse_host_limit("3: https://Example.org:8443/x"), Some(("example.org:8443".into(), 3)));
+        for bad in ["8 https://a/", "x: https://a/", "0: https://a/", ": https://a/", "8: a/", "8: https:///", "-1: https://a/"] {
+            assert_eq!(parse_host_limit(bad), None, "{bad}");
+        }
+        assert!(DEFAULT_HOST_LIMITS.iter().all(|entry| parse_host_limit(entry).is_some()));
+        let fetcher = HttpTileFetcher::new(crate::PlainHttpTransport::default(), TransportLimits::default(), RetryPolicy { max_per_host: 4, ..RetryPolicy::default() })
+            .with_host_limits(DEFAULT_HOST_LIMITS.iter().filter_map(|entry| parse_host_limit(entry)));
+        assert_eq!(fetcher.host_limit("overpass.kumi.systems"), 1);
+        assert_eq!(fetcher.host_limit("CLOUD.daporkchop.net"), 8);
+        assert_eq!(fetcher.host_limit("elsewhere.example"), 4);
     }
 }

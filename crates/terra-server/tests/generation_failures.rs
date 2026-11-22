@@ -136,15 +136,22 @@ fn build(directory: &Path, text: &str) -> Result<TerraStack, StackError> {
 fn https_only_sources_are_refused_before_anything_starts() {
     let directory = common::scratch("unreachable");
     // The defaults: AWS elevation, OpenStreetMap and tree cover, all HTTPS.
-    let Err(StackError::Unreachable(reason)) = build(&directory, "{}") else { panic!("the default HTTPS sources must be refused") };
-    for expected in ["elevation layer", "OpenStreetMap", "tree cover layer", "needs TLS", "network.mirrors", "network.plain_http_hosts"] {
-        assert!(reason.contains(expected), "{expected:?} missing from {reason}");
+    // Without an HTTPS program (turned off, or missing): the HTTPS defaults are refused.
+    for network in [r#""https_command": "off""#, r#""https_command": "/nonexistent/curl-for-tests""#] {
+        let Err(StackError::Unreachable(reason)) = build(&directory, &format!("{{\"network\": {{{network}}}}}")) else { panic!("the default HTTPS sources must be refused") };
+        for expected in ["elevation layer", "OpenStreetMap", "tree cover layer", "needs TLS", "network.mirrors", "network.plain_http_hosts", "curl"] {
+            assert!(reason.contains(expected), "{expected:?} missing from {reason}");
+        }
     }
     // Elevation over plain HTTP, but OpenStreetMap and trees still on: still refused, naming them.
-    let Err(StackError::Unreachable(reason)) = build(&directory, r#"{"network": {"plain_http_hosts": ["s3.amazonaws.com"]}}"#) else { panic!() };
+    let Err(StackError::Unreachable(reason)) = build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"]}}"#) else { panic!() };
     assert!(reason.contains("OpenStreetMap") && reason.contains("tree cover layer") && !reason.contains("elevation layer"), "{reason}");
     // Every source reachable (plain HTTP, mirrors) or explicitly off: accepted, no network used.
     std::fs::create_dir_all(directory.join("osm")).unwrap();
-    build(&directory, r#"{"network": {"plain_http_hosts": ["s3.amazonaws.com"], "mirrors": {"https://cloud.daporkchop.net/gis/": "osm"}}}"#).unwrap();
-    build(&directory, r#"{"network": {"plain_http_hosts": ["s3.amazonaws.com"]}, "generate_trees": false, "openstreetmap": {"enabled": false}}"#).unwrap();
+    build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"], "mirrors": {"https://cloud.daporkchop.net/gis/": "osm"}}}"#).unwrap();
+    build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"]}, "generate_trees": false, "openstreetmap": {"enabled": false}}"#).unwrap();
+    // With the system curl, the defaults work as upstream's do (nothing is fetched here).
+    if terra_acquisition::CurlTransport::probe("curl", "test").is_some() {
+        build(&directory, "{}").unwrap();
+    }
 }

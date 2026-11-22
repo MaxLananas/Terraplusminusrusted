@@ -130,9 +130,82 @@ impl CommandSource {
     }
 }
 impl PermissionLevel {
+    pub fn from_level(level: i32) -> Self {
+        match level {
+            i32::MIN..=0 => Self::All,
+            1 => Self::Moderators,
+            2 => Self::Gamemasters,
+            3 => Self::Admins,
+            _ => Self::Owners,
+        }
+    }
     pub fn level(self) -> u8 {
         self as u8
     }
+}
+
+/// `entity/types.rs`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PlayerAbilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub may_fly: bool,
+    pub instabuild: bool,
+    pub may_build: bool,
+    pub fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+/// `payload.rs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadBytes(pub Vec<u8>);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PayloadId(pub String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadAccepted {
+    Queued,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadSendError {
+    UnknownPayload(PayloadId),
+    UnsupportedPeer(PayloadId),
+    WrongDirection(PayloadId),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadHandleError {
+    Failed(String),
+    Busy { payload: PayloadBytes },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadContextError {
+    NoPlayer,
+    WrongSide,
+    WrongThread,
+    Disconnected,
+    Backpressure,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadWorkStatus {
+    Complete,
+    Queued,
+}
+pub trait IPayloadHandler: Send + Sync + 'static {
+    fn handle(&self, payload: PayloadBytes, context: &mut dyn IPayloadContext) -> Result<(), PayloadHandleError>;
+}
+pub trait PayloadWork: Send + Sync + 'static {
+    fn run(&self, context: &mut dyn IPayloadContext) -> Result<(), String>;
+}
+/// The subset of `IPayloadContext` the mod calls.
+pub trait IPayloadContext {
+    fn player(&self) -> Result<PlayerRef, PayloadContextError>;
+    fn server_host(&mut self) -> Result<&mut dyn ServerHost, PayloadContextError>;
+    fn enqueue_work(&mut self, work: Arc<dyn PayloadWork>) -> Result<PayloadWorkStatus, PayloadContextError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -302,6 +375,8 @@ pub trait BiomeSource: Send + Sync + 'static {
 
 pub trait Registrar {
     fn block_key(&mut self, id: &str) -> BlockKey;
+    /// `parts/payloads.rs` (`PayloadsRegistrar`).
+    fn add_raw_payload(&mut self, id: PayloadId, server: Option<Arc<dyn IPayloadHandler>>);
     fn add_dimension(&mut self, name: &str, settings: DimensionSettings);
     fn add_chunk_generator(&mut self, name: &str, generator: Arc<dyn ChunkGenerator>);
     fn add_biome_source(&mut self, name: &str, source: Arc<dyn BiomeSource>);
@@ -316,6 +391,27 @@ impl dyn Registrar + '_ {
     pub fn register_biome_source<T: BiomeSource>(&mut self, name: &str, source: T) {
         self.add_biome_source(name, Arc::new(source));
     }
+    /// `payload/registrar.rs`.
+    pub fn payload_handlers(&mut self) -> RegisterPayloadHandlersEvent<'_> {
+        RegisterPayloadHandlersEvent { registrar: self }
+    }
+}
+pub struct RegisterPayloadHandlersEvent<'a> {
+    registrar: &'a mut dyn Registrar,
+}
+impl RegisterPayloadHandlersEvent<'_> {
+    pub fn registrar(&mut self, version: &str) -> PayloadRegistrar<'_> {
+        PayloadRegistrar { registrar: &mut *self.registrar }
+    }
+}
+pub struct PayloadRegistrar<'a> {
+    registrar: &'a mut dyn Registrar,
+}
+impl PayloadRegistrar<'_> {
+    pub fn play_raw(&mut self, id: PayloadId, server: Option<Arc<dyn IPayloadHandler>>) -> &mut Self {
+        self.registrar.add_raw_payload(id, server);
+        self
+    }
 }
 
 pub trait Commands {
@@ -328,6 +424,8 @@ pub trait Host {
     fn level(&self, dimension: &str) -> Option<LevelRef>;
     fn chunk(&self, level: LevelRef, pos: [i32; 2]) -> Option<ChunkRef>;
     fn living(&self, entity: EntityRef) -> Option<LivingRef>;
+    /// `host/players.rs` (`PlayersHost`).
+    fn player(&self, uuid: u128) -> Option<PlayerRef>;
 }
 pub trait Players {
     fn server_players(&self) -> Vec<PlayerRef>;
@@ -348,6 +446,9 @@ impl LevelRef {
         None
     }
     pub fn online_players(self, host: &dyn Host) -> Option<Vec<PlayerRef>> {
+        None
+    }
+    pub fn collision_boxes(self, host: &dyn Host, aabb: [f64; 6]) -> Option<Vec<[f64; 6]>> {
         None
     }
 }
@@ -373,6 +474,21 @@ impl EntityRef {
     pub fn teleport_to_level(self, host: &mut dyn ServerHost, dimension: &str, pos: [f64; 3], rotation: Option<[f32; 2]>) -> bool {
         false
     }
+    pub fn level(self, host: &dyn Host) -> Option<LevelRef> {
+        None
+    }
+    pub fn velocity(self, host: &dyn Host) -> Option<[f64; 3]> {
+        None
+    }
+    pub fn set_velocity(self, host: &mut dyn ServerHost, velocity: [f64; 3]) -> bool {
+        false
+    }
+    pub fn uuid(self, host: &mut dyn ServerHost) -> Option<u128> {
+        None
+    }
+    pub fn run_command(self, host: &mut dyn ServerHost, line: &str, level: PermissionLevel) -> bool {
+        false
+    }
 }
 impl PlayerRef {
     pub fn tell(self, host: &mut dyn ServerHost, line: Text) -> Result<bool, TextFormError> {
@@ -384,6 +500,36 @@ impl PlayerRef {
     pub fn permission_level(self, host: &dyn Host) -> Option<u8> {
         None
     }
+    pub fn abilities(self, host: &dyn Host) -> Option<PlayerAbilities> {
+        None
+    }
+    pub fn set_abilities(self, host: &mut dyn ServerHost, abilities: PlayerAbilities) -> bool {
+        false
+    }
+    pub fn send_payload(self, host: &mut dyn ServerHost, id: &PayloadId, bytes: PayloadBytes) -> Result<PayloadAccepted, PayloadSendError> {
+        Err(PayloadSendError::UnsupportedPeer(id.clone()))
+    }
+}
+
+/// Generated from `hooks/player_move.rs`, `player_logged_in.rs`, `player_logged_out.rs`; fields
+/// as the hooks' documentation, `native_player_move_tests.rs` and the mod template use them.
+#[non_exhaustive]
+pub struct PlayerMoveEvent {
+    pub player: u128,
+    pub from: [f64; 3],
+    pub from_rotation: [f32; 2],
+    pub to: [f64; 3],
+    pub to_rotation: [f32; 2],
+}
+#[non_exhaustive]
+pub struct PlayerLoggedInEvent<'a> {
+    pub player: u128,
+    pub name: &'a str,
+}
+#[non_exhaustive]
+pub struct PlayerLoggedOutEvent<'a> {
+    pub player: u128,
+    pub name: &'a str,
 }
 
 pub trait Hooks {
@@ -396,4 +542,9 @@ pub trait Hooks {
         Flow::Continue
     }
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {}
+    fn player_move(&self, host: &mut dyn ServerHost, event: &mut PlayerMoveEvent) -> Flow {
+        Flow::Continue
+    }
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {}
+    fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {}
 }

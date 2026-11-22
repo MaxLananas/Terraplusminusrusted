@@ -21,12 +21,26 @@ pub struct DiskCacheLimits {
     pub max_bytes: u64,
     /// How long a cached "missing" (HTTP 404) answer stays valid.
     pub missing_ttl: Duration,
+    /// How long a cached tile is fresh (TerraMinusMinus' `http.cacheTTL`, 1440 minutes). A stale
+    /// tile is fetched again, and served anyway when that fetch fails. `None` keeps tiles until
+    /// evicted.
+    pub found_ttl: Option<Duration>,
 }
+
+/// TerraMinusMinus' `TerraConfig.http.cacheTTL`: 1440 minutes.
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1440 * 60);
 
 impl Default for DiskCacheLimits {
     fn default() -> Self {
-        Self { max_bytes: 2 << 30, missing_ttl: Duration::from_secs(24 * 3600) }
+        Self { max_bytes: 2 << 30, missing_ttl: DEFAULT_CACHE_TTL, found_ttl: Some(DEFAULT_CACHE_TTL) }
     }
+}
+
+/// A cache answer and whether it is still within its time to live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLookup {
+    Fresh(FetchOutcome),
+    Stale(FetchOutcome),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -177,7 +191,17 @@ impl DiskCache {
         DiskCacheStatistics { entries: index.entries.len(), bytes: index.bytes, ..index.statistics }
     }
 
+    /// The cached answer if it is fresh; a stale tile counts as absent.
     pub fn get(&self, url: &str) -> Option<FetchOutcome> {
+        match self.lookup(url)? {
+            CacheLookup::Fresh(outcome) => Some(outcome),
+            CacheLookup::Stale(_) => None,
+        }
+    }
+
+    /// The cached answer with its freshness. Expired "missing" answers are dropped; stale tiles
+    /// are kept so a failed refresh can still use them.
+    pub fn lookup(&self, url: &str) -> Option<CacheLookup> {
         let key = cache_key(url);
         let path = self.entry_path(&key);
         let known = self.index.lock().unwrap_or_else(PoisonError::into_inner).entries.contains_key(&key);
@@ -194,7 +218,9 @@ impl DiskCache {
             Some((Some(outcome), size)) => {
                 index.touch(&key, size);
                 index.statistics.hits += 1;
-                Some(outcome)
+                drop(index);
+                let stale = matches!(outcome, FetchOutcome::Found(_)) && self.limits.found_ttl.is_some_and(|ttl| Self::age(&path) > ttl);
+                Some(if stale { CacheLookup::Stale(outcome) } else { CacheLookup::Fresh(outcome) })
             }
             Some((None, _)) => {
                 index.forget(&key);
@@ -225,8 +251,13 @@ impl DiskCache {
     }
 
     fn missing_expired(&self, path: &Path) -> bool {
+        Self::age(path) > self.limits.missing_ttl
+    }
+
+    /// Time since the entry was written; unknown counts as very old.
+    fn age(path: &Path) -> Duration {
         let modified = fs::metadata(path).and_then(|metadata| metadata.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-        SystemTime::now().duration_since(modified).unwrap_or_default() > self.limits.missing_ttl
+        SystemTime::now().duration_since(modified).unwrap_or_default()
     }
 
     pub fn put(&self, url: &str, outcome: &FetchOutcome) -> std::io::Result<()> {
@@ -288,12 +319,20 @@ impl<F: TileFetcher> DiskCachedFetcher<F> {
 
 impl<F: TileFetcher> TileFetcher for DiskCachedFetcher<F> {
     fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
-        if let Some(outcome) = self.cache.get(url) {
-            return Ok(outcome);
+        let stale = match self.cache.lookup(url) {
+            Some(CacheLookup::Fresh(outcome)) => return Ok(outcome),
+            Some(CacheLookup::Stale(outcome)) => Some(outcome),
+            None => None,
+        };
+        match (self.inner.fetch(url), stale) {
+            (Ok(outcome), _) => {
+                let _ = self.cache.put(url, &outcome);
+                Ok(outcome)
+            }
+            // Stale-if-error: an outdated tile beats none while the source is unreachable.
+            (Err(_), Some(outcome)) => Ok(outcome),
+            (Err(error), None) => Err(error),
         }
-        let outcome = self.inner.fetch(url)?;
-        let _ = self.cache.put(url, &outcome);
-        Ok(outcome)
     }
 }
 
@@ -305,6 +344,46 @@ mod tests {
         let path = std::env::temp_dir().join(format!("terra-disk-cache-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    struct Scripted(Mutex<Vec<Result<FetchOutcome, ElevationError>>>);
+
+    impl TileFetcher for Scripted {
+        fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
+            self.0.lock().unwrap().pop().unwrap_or_else(|| Err(ElevationError::Unreachable { url: url.to_owned(), reason: "script empty".into() }))
+        }
+    }
+
+    fn age_entry(cache: &DiskCache, url: &str, by: Duration) {
+        let path = cache.entry_path(&cache_key(url));
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    #[test]
+    fn stale_tiles_are_refreshed_and_served_when_the_source_fails() {
+        let root = scratch("ttl");
+        let limits = DiskCacheLimits { found_ttl: Some(Duration::from_secs(60)), ..DiskCacheLimits::default() };
+        let cache = DiskCache::open(&root, limits).unwrap();
+        cache.put("http://a/1.png", &FetchOutcome::Found(vec![1])).unwrap();
+        age_entry(&cache, "http://a/1.png", Duration::from_secs(120));
+        assert_eq!(cache.get("http://a/1.png"), None, "stale");
+        assert_eq!(cache.lookup("http://a/1.png"), Some(CacheLookup::Stale(FetchOutcome::Found(vec![1]))));
+        // The refresh fails: the stale tile is used and kept.
+        let unreachable = || Err(ElevationError::Unreachable { url: "http://a/1.png".into(), reason: "down".into() });
+        let fetcher = DiskCachedFetcher::new(cache, Scripted(Mutex::new(vec![Ok(FetchOutcome::Found(vec![2])), unreachable()])));
+        assert_eq!(fetcher.fetch("http://a/1.png").unwrap(), FetchOutcome::Found(vec![1]));
+        // The next refresh succeeds and replaces it with a fresh entry.
+        assert_eq!(fetcher.fetch("http://a/1.png").unwrap(), FetchOutcome::Found(vec![2]));
+        assert_eq!(fetcher.cache().lookup("http://a/1.png"), Some(CacheLookup::Fresh(FetchOutcome::Found(vec![2]))));
+        // Without a cached tile the error goes through.
+        assert!(fetcher.fetch("http://a/2.png").is_err());
+        // No TTL: tiles stay fresh forever.
+        drop(fetcher);
+        let forever = DiskCache::open(&root, DiskCacheLimits { found_ttl: None, ..DiskCacheLimits::default() }).unwrap();
+        age_entry(&forever, "http://a/1.png", Duration::from_secs(10 * 365 * 86_400));
+        assert_eq!(forever.get("http://a/1.png"), Some(FetchOutcome::Found(vec![2])));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

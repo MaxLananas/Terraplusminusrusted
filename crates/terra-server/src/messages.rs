@@ -100,6 +100,7 @@ pub fn tpll_step_lines(step: &TpllStep, prefix: &str) -> Vec<String> {
         }
         TpllStep::Unreachable => vec![format!("{prefix}§cThese coordinates cannot be reached on this server.")],
         TpllStep::LinkedWorldUnavailable { .. } | TpllStep::NeedsSurface { .. } => vec![unavailable(prefix)],
+        TpllStep::LinkedServer { .. } => vec![format!("{prefix}§7Teleporting to linked server...")],
         TpllStep::Teleport { reported, reported_height, linked, .. } => {
             let latitude = java_double_to_string(reported.latitude);
             let longitude = java_double_to_string(reported.longitude);
@@ -161,6 +162,17 @@ pub fn distortion_message(projection: &dyn GeographicProjection, x: f64, z: f64)
     }
 }
 
+/// `PlayerCommandEvent` with `passthrough_tpll`: a typed command (without its slash) that starts
+/// with `tpll` goes to that plugin's namespace instead (`/tpll 1 2` runs `/<namespace>:tpll 1 2`).
+pub fn passthrough_command(command: &str, namespace: &str) -> Option<String> {
+    command.starts_with("tpll").then(|| format!("{namespace}:{command}"))
+}
+
+/// `PlayerMoveEvent.completeTransition`.
+pub fn linked_world_transition(prefix: &str) -> String {
+    format!("{prefix}§7Teleporting to linked world...")
+}
+
 /// `/tpll -p`: what the sender is told after the targets were handled (`executeTarget`).
 pub fn forced_tpll_summary(targets: usize, prefix: &str) -> String {
     format!("{prefix}§7Executed tpll for {targets} player(s).")
@@ -177,6 +189,19 @@ pub fn actionbar_height(y: f64, offset: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passthrough_rewrites_like_player_command_event() {
+        assert_eq!(passthrough_command("tpll 48.8 2.3", "vanillatpll").as_deref(), Some("vanillatpll:tpll 48.8 2.3"));
+        assert_eq!(passthrough_command("tpll", "vanillatpll").as_deref(), Some("vanillatpll:tpll"));
+        // Upstream tests `startsWith("/tpll")`: /tpc and other commands are left alone.
+        assert_eq!(passthrough_command("tpc 1 2", "vanillatpll"), None);
+        assert_eq!(passthrough_command("where", "vanillatpll"), None);
+        assert_eq!(passthrough_command("vanillatpll:tpll 1 2", "vanillatpll"), None, "no loop");
+        let server = TpllStep::LinkedServer { upward: true, reported: crate::coordinates::LatLng { latitude: 1.0, longitude: 2.0 } };
+        assert_eq!(tpll_step_lines(&server, "P "), vec!["P §7Teleporting to linked server...".to_owned()]);
+        assert_eq!(linked_world_transition("P "), "P §7Teleporting to linked world...");
+    }
 
     #[test]
     fn actionbar_and_forced_tpll_text_match_upstream() {

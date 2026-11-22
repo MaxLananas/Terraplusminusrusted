@@ -6,7 +6,7 @@ use crate::config::ServerConfig;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use terra_acquisition::{DiskCache, DiskCacheLimits, DiskCachedFetcher, HttpTileFetcher, PlainHttpTransport, RetryPolicy, RoutingFetcher, TransportLimits};
+use terra_acquisition::{CurlTransport, DiskCache, DiskCacheLimits, DiskCachedFetcher, DualTransport, HttpTileFetcher, PlainHttpTransport, RetryPolicy, RoutingFetcher, TransportLimits};
 use terra_chunk_generation::{
     Block, ChunkLoader, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, TerrainGenerator, TreeLibrary, TreePopulator,
     verify_or_record,
@@ -95,7 +95,7 @@ fn check_sources<T: terra_acquisition::HttpTransport>(routing: &RoutingFetcher<T
     let shown: Vec<String> = problems.into_iter().take(8).collect();
     let more = if count > shown.len() { format!(" (and {} more)", count - shown.len()) } else { String::new() };
     Err(StackError::Unreachable(format!(
-        "{count} enabled data source(s) cannot be fetched by this build, which has no TLS: {}{more}. Fix: map the URL prefixes to local copies with network.mirrors, \
+        "{count} enabled data source(s) cannot be fetched: {}{more}. Fix: install curl (network.https_command), map the URL prefixes to local copies with network.mirrors, \
          or list the hosts in network.plain_http_hosts (unencrypted, unauthenticated HTTP; only for hosts that serve the same data over HTTP), \
          or turn the feature off (openstreetmap.enabled, generate_trees, elevation.heights_config)",
         shown.join("; ")
@@ -132,7 +132,17 @@ impl TerraStack {
         let fetch_deadline = network.total_timeout.saturating_mul(network.attempts.max(1)) + base.max_backoff.saturating_mul(network.attempts.saturating_sub(1));
         let policy = RetryPolicy { max_attempts: network.attempts, max_per_host: network.max_per_host, fetch_deadline, ..base };
         let mirrors: Vec<_> = network.mirrors.iter().map(|(prefix, directory)| (prefix.clone(), base_directory.join(directory))).collect();
-        let routing = RoutingFetcher::new(&mirrors, HttpTileFetcher::new(PlainHttpTransport::default(), limits, policy), network.plain_http_hosts.clone());
+        // HTTPS through the system curl when it is there; otherwise only mirrors and plain HTTP.
+        let https = network.https_command.as_deref().and_then(|program| CurlTransport::probe(program, &network.user_agent));
+        match (&network.https_command, &https) {
+            (Some(program), None) => log(&format!("network.https_command `{program}` is unavailable or lacks HTTPS: https:// sources need network.mirrors or network.plain_http_hosts")),
+            (Some(program), Some(_)) if !config.reduced_console_messages => log(&format!("fetching https:// sources through {program}")),
+            _ => {}
+        }
+        let transport = DualTransport { plain: PlainHttpTransport { user_agent: network.user_agent.clone() }, https };
+        let supports_https = transport.supports_https();
+        let http = HttpTileFetcher::new(transport, limits, policy).with_host_limits(network.host_limits.clone());
+        let routing = RoutingFetcher::new(&mirrors, http, network.plain_http_hosts.clone()).with_https(supports_https);
         // Every enabled source must be fetchable before anything is registered: generation would
         // otherwise wait on data that can never arrive.
         let mut sources: Vec<(String, Vec<String>)> = layers.dataset.layers().iter().map(|layer| (format!("elevation layer {}", layer.dataset.id), layer.dataset.url_templates.clone())).collect();
@@ -157,7 +167,7 @@ impl TerraStack {
         let fetcher: Arc<dyn TileFetcher> = match &network.cache_directory {
             Some(directory) => {
                 let directory = base_directory.join(directory);
-                let cache = DiskCache::open(&directory, DiskCacheLimits { max_bytes: network.cache_max_bytes, ..DiskCacheLimits::default() })
+                let cache = DiskCache::open(&directory, DiskCacheLimits { max_bytes: network.cache_max_bytes, missing_ttl: network.cache_ttl.unwrap_or(terra_acquisition::DEFAULT_CACHE_TTL), found_ttl: network.cache_ttl })
                     .map_err(|error| StackError::Io(format!("opening tile cache {}: {error}", directory.display())))?;
                 Arc::new(DiskCachedFetcher::new(cache, routing))
             }

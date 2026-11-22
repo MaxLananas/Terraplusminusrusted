@@ -16,11 +16,14 @@
 //! is turned into an empty chunk, so neither is used.
 #![deny(unsafe_code)]
 
+mod linked;
+
 use mod_api::{
     BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, EquipmentSlot, Flow, Host, Hooks,
-    InstanceDirectory, LevelLoadEvent, PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StateConstraint, Text, TextClick, TextHover, TextStyle,
+    InstanceDirectory, LevelLoadEvent, PayloadId, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerMoveEvent, PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext,
+    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StateConstraint, Text, TextClick, TextHover, TextStyle,
 };
+use terra_server::updates::UpdateChecker;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -292,6 +295,11 @@ pub struct TerraPlusMinus {
     pending: Mutex<Option<PendingTeleports<PlayerRef>>>,
     ticks: AtomicU64,
     actionbar: Mutex<ActionBarState>,
+    /// Linked-worlds method SERVER; shared with the payload handlers.
+    proxy: Arc<linked::ProxyBridge>,
+    /// Linked-worlds method MULTIVERSE: boundary crossings (`t+-.autoteleport`).
+    transitions: Mutex<linked::LevelTransitions>,
+    updates: OnceLock<Arc<UpdateChecker>>,
 }
 
 /// The level of this mod `player` is in, by asking each level for its players.
@@ -300,6 +308,10 @@ fn player_level(host: &dyn Host, levels: &[LevelPlan], player: PlayerRef) -> Opt
         .iter()
         .find(|level| host.level(&level.id).and_then(|handle| handle.online_players(host)).is_some_and(|players| players.contains(&player)))
         .map(|level| level.id.clone())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn holds_debug_stick(host: &dyn Host, player: PlayerRef) -> bool {
@@ -319,10 +331,15 @@ impl TerraPlusMinus {
         let _ = player.tell(host, chat_text(&ChatMessage::from(line.to_owned())));
     }
 
-    fn finish(host: &mut dyn ServerHost, player: PlayerRef, step: TpllStep, prefix: &str, reply: &mut dyn FnMut(&mut dyn ServerHost, &str)) {
+    fn finish(&self, host: &mut dyn ServerHost, player: PlayerRef, step: TpllStep, prefix: &str, reply: &mut dyn FnMut(&mut dyn ServerHost, &str)) {
         let lines = messages::tpll_step_lines(&step, prefix);
         if let TpllStep::Teleport { world, x, y, z, .. } = &step
             && !player.entity().teleport_to_level(host, world, [*x, *y, *z], None)
+        {
+            return reply(host, &messages::unavailable(prefix));
+        }
+        if let TpllStep::LinkedServer { upward, reported } = &step
+            && !self.shared.get().is_some_and(|shared| linked::send_to_linked_server(host, shared, &self.proxy, player, *upward, *reported))
         {
             return reply(host, &messages::unavailable(prefix));
         }
@@ -428,7 +445,7 @@ impl TerraPlusMinus {
                     }
                 }
             }
-            _ => Self::finish(host, player, step, prefix, &mut |host, line| Self::feedback(host, line)),
+            _ => self.finish(host, player, step, prefix, &mut |host, line| Self::feedback(host, line)),
         }
     }
 
@@ -511,6 +528,15 @@ impl TerraPlusMinus {
         let Some(shared) = self.shared.get() else { return Self::feedback(host, "§cTerraPlusMinus failed to start; see the server log.") };
         let pending = self.pending.lock().ok().and_then(|table| table.as_ref().map(PendingTeleports::len)).unwrap_or(0);
         let mut lines = vec![format!("generation: {:?}", shared.control.gate.state()), shared.control.counters.summary(), format!("pending /tpll: {pending}")];
+        if linked::proxy_method(shared) {
+            lines.push(self.proxy.status_line());
+        }
+        if shared.stack.config().linked_worlds.levels_active() {
+            lines.push(lock(&self.transitions).status_line());
+        }
+        if let Some(updates) = self.updates.get() {
+            lines.push(format!("updates: {:?} (running {})", updates.status(), updates.current()));
+        }
         lines.extend(shared.stack.diagnostics_report().lines().map(str::to_owned));
         for line in lines {
             Self::feedback(host, &line);
@@ -572,6 +598,18 @@ impl Hooks for TerraPlusMinus {
                 log(&format!("registered the linked level {} at Y offset {}", level.id, level.y_offset));
             }
         }
+        let config = shared.stack.config();
+        if linked::proxy_method(&shared) {
+            // Raw plugin channels, as Paper's: TerraPlusMinusProxyBridge on the proxy, and the
+            // proxy's own channel for the server name.
+            self.proxy.configure(config.linked_server_name.clone());
+            let mut payloads = registrar.payload_handlers();
+            let mut channels = payloads.registrar("1");
+            channels.play_raw(PayloadId(terra_server::bridge::TELEPORT_BRIDGE_CHANNEL.into()), Some(Arc::new(linked::TeleportBridgeHandler(Arc::clone(&self.proxy)))));
+            channels.play_raw(PayloadId(terra_server::bridge::BUNGEECORD_CHANNEL.into()), Some(Arc::new(linked::BungeeCordHandler(Arc::clone(&self.proxy)))));
+            log("Linked server initialization successful");
+        }
+        let _ = self.updates.set(Arc::new(UpdateChecker::new(config.updates.clone(), env!("CARGO_PKG_VERSION"))));
         let _ = self.shared.set(shared);
     }
 
@@ -586,6 +624,44 @@ impl Hooks for TerraPlusMinus {
 
     fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
         self.check_fingerprint(host);
+        if let (Some(updates), Some(shared)) = (self.updates.get(), self.shared.get()) {
+            linked::check_for_updates(updates, &shared.stack.config().network.user_agent);
+        }
+    }
+
+    fn player_move(&self, host: &mut dyn ServerHost, event: &mut PlayerMoveEvent) -> Flow {
+        if let Some(shared) = self.shared.get()
+            && shared.stack.config().linked_worlds.levels_active()
+        {
+            lock(&self.transitions).on_move(host, shared, event.player, event.to, event.to_rotation);
+        }
+        Flow::Continue
+    }
+
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
+        let Some(shared) = self.shared.get() else { return };
+        let config = shared.stack.config();
+        if config.linked_worlds.enabled && linked::proxy_method(shared) {
+            self.proxy.joined(host, event.player, self.ticks.load(Ordering::Relaxed));
+        }
+        // `Updater`: operators with `t+-.notify.update` hear of a newer release when joining.
+        if let Some(updates) = self.updates.get()
+            && let Some(latest) = updates.available()
+            && let Some(player) = host.player(event.player)
+            && player.permission_level(&*host).unwrap_or(0) >= config.permissions.notify_update
+        {
+            let _ = player.tell(host, linked::update_notice(updates, &latest));
+        }
+    }
+
+    fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        lock(&self.transitions).forget(event.player);
+        self.proxy.left(event.player);
+        if let Some(player) = host.player(event.player)
+            && let Some(table) = lock(&self.pending).as_mut()
+        {
+            table.cancel(&player);
+        }
     }
 
     fn server_stopping(&self, _: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
@@ -636,6 +712,20 @@ impl Hooks for TerraPlusMinus {
         {
             self.update_action_bars(host, shared, tick);
         }
+        if let Some(shared) = self.shared.get() {
+            if linked::proxy_method(shared) {
+                self.proxy.tick(host, tick);
+            }
+            if let (Some(regions), Some(air)) = (self.regions.get(), self.air.get()) {
+                lock(&self.transitions).tick(host, &linked::MoveContext { shared, regions, air }, tick);
+            }
+            // A day-old release check is renewed; `claim` makes this a no-op otherwise.
+            if tick.is_multiple_of(72_000)
+                && let Some(updates) = self.updates.get()
+            {
+                linked::check_for_updates(updates, &shared.stack.config().network.user_agent);
+            }
+        }
         let (Some(shared), Some(regions), Some(air)) = (self.shared.get(), self.regions.get(), self.air.get()) else { return };
         let finished = {
             let Ok(mut pending) = self.pending.lock() else { return };
@@ -652,7 +742,7 @@ impl Hooks for TerraPlusMinus {
                     log(&format!("/tpll dropped: generation is {:?}", shared.control.gate.state()));
                     Self::tell(host, player, &messages::unavailable(prefix));
                 }
-                TeleportOutcome::Step(step) => Self::finish(host, player, step, prefix, &mut |host, line| Self::tell(host, player, line)),
+                TeleportOutcome::Step(step) => self.finish(host, player, step, prefix, &mut |host, line| Self::tell(host, player, line)),
                 TeleportOutcome::Unavailable(reason) => {
                     log(&format!("/tpll surface lookup failed: {reason}"));
                     Self::tell(host, player, &messages::unavailable(prefix));

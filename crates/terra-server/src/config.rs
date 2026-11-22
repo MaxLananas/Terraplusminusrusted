@@ -23,6 +23,16 @@ pub struct NetworkConfig {
     pub io_timeout: Duration,
     pub total_timeout: Duration,
     pub memory_cache_tiles: usize,
+    /// `network.https_command`: the program that fetches `https://` URLs (the system `curl` by
+    /// default). `None` turns HTTPS off: only mirrors, plain HTTP and `plain_http_hosts` remain.
+    pub https_command: Option<String>,
+    /// TerraMinusMinus' `http.maxConcurrentRequests` (`"<n>: <url>"`), as (host, n).
+    pub host_limits: Vec<(String, usize)>,
+    /// TerraMinusMinus' `http.cacheTTL`: how long cached tiles and 404 answers stay fresh.
+    /// `None` (0 minutes) keeps tiles until evicted.
+    pub cache_ttl: Option<Duration>,
+    /// Sent with every request; upstream's `<plugin>/<version> (<library>/<version>; +<site>)`.
+    pub user_agent: String,
 }
 
 /// Settings for TerraMinusMinus' OpenStreetMap data (water, coastlines, roads, buildings).
@@ -57,6 +67,8 @@ pub struct PermissionLevels {
     pub forcetpll: u8,
     /// `t+-.autoteleport`: moved between linked levels when crossing their boundary.
     pub autoteleport: u8,
+    /// `t+-.notify.update`: told on join when a newer release exists.
+    pub notify_update: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +100,13 @@ pub struct ServerConfig {
     /// `passthrough_tpll`: another mod that owns `/tpll`; this one then registers neither
     /// `/tpll` nor `/tpc`.
     pub passthrough_tpll: Option<String>,
+    /// Port extension, `linked_worlds.server_name`: this server's name among the linked servers
+    /// (method SERVER). Upstream only learns it from the proxy's `GetServer` answer, which the
+    /// mod still asks for; this is known from startup, so the first `/tpll` after a restart
+    /// never finds the name missing. A proxy answer that differs wins and is logged.
+    pub linked_server_name: Option<String>,
+    /// Port extension, `updates`: upstream's `Updater` (release check and join notification).
+    pub updates: crate::updates::UpdateSettings,
     /// Accepted but deprecated settings, worded as upstream's startup warnings. Callers log them.
     pub warnings: Vec<String>,
 }
@@ -115,9 +134,13 @@ impl Default for ServerConfig {
                 io_timeout: Duration::from_secs(10),
                 total_timeout: Duration::from_secs(30),
                 memory_cache_tiles: 512,
+                https_command: Some("curl".to_owned()),
+                host_limits: terra_acquisition::DEFAULT_HOST_LIMITS.iter().filter_map(|entry| terra_acquisition::parse_host_limit(entry)).collect(),
+                cache_ttl: Some(terra_acquisition::DEFAULT_CACHE_TTL),
+                user_agent: terra_acquisition::DEFAULT_USER_AGENT.to_owned(),
             },
             openstreetmap: OpenStreetMapConfig::default(),
-            permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0, forcetpll: 2, autoteleport: 2 },
+            permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0, forcetpll: 2, autoteleport: 2, notify_update: 2 },
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
             generation_retry_attempts: 8,
@@ -125,6 +148,8 @@ impl Default for ServerConfig {
             reduced_console_messages: true,
             height_in_actionbar: false,
             passthrough_tpll: None,
+            linked_server_name: None,
+            updates: crate::updates::UpdateSettings::default(),
             warnings: Vec::new(),
         }
     }
@@ -293,7 +318,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
             "terrain_offset", "min_latitude", "max_latitude", "min_longitude", "max_longitude", "linked_worlds", "generate_trees", "biomes",
             "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version", "prefix", "openstreetmap",
             "building_outlines_material", "road_material", "path_material", "reduced_console_messages", "height_datapack", "height_in_actionbar",
-            "passthrough_tpll",
+            "passthrough_tpll", "updates",
         ],
     )?;
     let mut config = ServerConfig::default();
@@ -309,7 +334,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         min_longitude: root.number("min_longitude", 0.0)?,
         max_longitude: root.number("max_longitude", 0.0)?,
     };
-    if let Some(linked) = root.section("linked_worlds", &["enabled", "method", "worlds"])? {
+    if let Some(linked) = root.section("linked_worlds", &["enabled", "method", "worlds", "server_name"])? {
         config.linked_worlds.enabled = linked.boolean("enabled", false)?;
         config.linked_worlds.method = match linked.string("method")?.map(str::to_ascii_uppercase).as_deref() {
             None | Some("MULTIVERSE") | Some("LEVELS") => LinkedWorldsMethod::Levels,
@@ -344,8 +369,18 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
                 ));
             }
         }
+        config.linked_server_name = linked.string("server_name")?.map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned);
         if config.linked_worlds.enabled && config.linked_worlds.method == LinkedWorldsMethod::Servers {
-            return Err(ConfigError("linked_worlds.method SERVER needs a proxy bridge, which Horizon does not provide".into()));
+            if let Some(name) = &config.linked_server_name
+                && config.linked_worlds.index_of(name).is_none()
+            {
+                return Err(ConfigError(format!("linked_worlds.server_name `{name}` is not one of linked_worlds.worlds")));
+            }
+            config.warnings.push(
+                "Linked worlds use the SERVER method: TerraPlusMinusProxyBridge must run on the proxy, \
+                 which moves players between servers over the terraplusminus:teleportbridge channel."
+                    .to_owned(),
+            );
         }
     }
     if let Some(prefix) = root.string("prefix")? {
@@ -429,7 +464,8 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
     }
     if let Some(network) = root.section(
         "network",
-        &["mirrors", "plain_http_hosts", "cache_directory", "cache_max_bytes", "max_per_host", "attempts", "connect_timeout_ms", "io_timeout_ms", "total_timeout_ms", "memory_cache_tiles"],
+        &["mirrors", "plain_http_hosts", "cache_directory", "cache_max_bytes", "max_per_host", "attempts", "connect_timeout_ms", "io_timeout_ms", "total_timeout_ms", "memory_cache_tiles",
+          "https_command", "max_concurrent_requests", "cache_ttl_minutes", "user_agent"],
     )? {
         let target = &mut config.network;
         if let Some(mirrors) = network.get("mirrors") {
@@ -452,9 +488,36 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         target.io_timeout = millis(network.integer("io_timeout_ms", 10_000, 100..=300_000)?);
         target.total_timeout = millis(network.integer("total_timeout_ms", 30_000, 100..=600_000)?);
         target.memory_cache_tiles = network.integer("memory_cache_tiles", target.memory_cache_tiles as i64, 1..=65_536)? as usize;
+        if let Some(command) = network.string("https_command")? {
+            let command = command.trim();
+            target.https_command = match command {
+                "" | "off" | "none" => None,
+                _ if command.chars().any(|c| c.is_control()) => return Err(ConfigError("network.https_command must be a program name or path".into())),
+                _ => Some(command.to_owned()),
+            };
+        }
+        if let Some(entries) = network.get("max_concurrent_requests") {
+            target.host_limits.clear();
+            for entry in entries.as_array_lenient() {
+                let text = entry.as_str().ok_or_else(|| ConfigError("network.max_concurrent_requests must be strings like \"8: https://host/\"".into()))?;
+                let limit = terra_acquisition::parse_host_limit(text)
+                    .filter(|(_, limit)| *limit <= 64)
+                    .ok_or_else(|| ConfigError(format!("network.max_concurrent_requests entry `{text}` must read `<1-64>: <url>`")))?;
+                target.host_limits.push(limit);
+            }
+        }
+        let ttl = network.integer("cache_ttl_minutes", 1440, 0..=525_600)?;
+        target.cache_ttl = (ttl > 0).then(|| Duration::from_secs(ttl as u64 * 60));
+        if let Some(agent) = network.string("user_agent")? {
+            let agent = agent.trim();
+            if agent.is_empty() || agent.chars().any(|c| c.is_control()) {
+                return Err(ConfigError("network.user_agent must be printable text".into()));
+            }
+            target.user_agent = agent.to_owned();
+        }
     }
     if let Some(permissions) =
-        root.section("permissions", &["tpll", "tpll_other_world", "tpll_ungenerated_chunks", "admin", "diagnostics", "info_commands", "forcetpll", "autoteleport"])?
+        root.section("permissions", &["tpll", "tpll_other_world", "tpll_ungenerated_chunks", "admin", "diagnostics", "info_commands", "forcetpll", "autoteleport", "notify_update"])?
     {
         let level = |key: &str, default: u8| permissions.integer(key, i64::from(default), 0..=4).map(|value| value as u8);
         config.permissions = PermissionLevels {
@@ -466,6 +529,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
             diagnostics: level("diagnostics", 2)?,
             forcetpll: level("forcetpll", 2)?,
             autoteleport: level("autoteleport", 2)?,
+            notify_update: level("notify_update", 2)?,
         };
     }
     if let Some(generation) = root.section("generation", &["workers", "queue_capacity", "ready_capacity", "wait_timeout_ms", "retry_attempts", "max_pending_teleports"])? {
@@ -478,6 +542,21 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         config.generation_wait = millis(generation.integer("wait_timeout_ms", 120_000, 1_000..=3_600_000)?);
         config.max_pending_teleports = generation.integer("max_pending_teleports", 64, 1..=10_000)? as usize;
         config.generation_retry_attempts = generation.integer("retry_attempts", 8, 0..=1_000_000)? as u32;
+    }
+    if let Some(updates) = root.section("updates", &["enabled", "repository", "url"])? {
+        config.updates.enabled = updates.boolean("enabled", true)?;
+        if let Some(repository) = updates.string("repository")? {
+            if !crate::updates::valid_repository(repository) {
+                return Err(ConfigError(format!("updates.repository `{repository}` must be a GitHub `owner/name`")));
+            }
+            config.updates.repository = repository.to_owned();
+        }
+        if let Some(url) = updates.string("url")? {
+            if !["http://", "https://", "file://"].iter().any(|scheme| url.starts_with(scheme)) || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(ConfigError(format!("updates.url `{url}` must be an http://, https:// or file:// URL")));
+            }
+            config.updates.url = Some(url.to_owned());
+        }
     }
     validate_linked_levels(&mut config)?;
     Ok(config)
@@ -539,6 +618,42 @@ mod tests {
     }
 
     #[test]
+    fn network_parity_keys_and_updates() {
+        let defaults = ServerConfig::default();
+        assert_eq!(defaults.network.https_command.as_deref(), Some("curl"));
+        assert_eq!(defaults.network.cache_ttl, Some(Duration::from_secs(1440 * 60)));
+        assert!(defaults.network.host_limits.contains(&("overpass.kumi.systems".to_owned(), 1)));
+        assert!(defaults.network.host_limits.contains(&("s3.amazonaws.com".to_owned(), 8)));
+        assert!(defaults.network.user_agent.starts_with("Terraplusminus/"));
+        assert_eq!(defaults.permissions.notify_update, 2);
+        assert!(defaults.updates.enabled);
+        let config = parse_server_config(
+            r#"{"network": {"https_command": "off", "max_concurrent_requests": ["2: https://Tiles.example/"], "cache_ttl_minutes": 0, "user_agent": "Mine/1"},
+                "updates": {"enabled": false, "repository": "BTE-Germany/TerraPlusMinus", "url": "file:///srv/latest.json"},
+                "permissions": {"notify_update": 4}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.network.https_command, None);
+        assert_eq!(config.network.host_limits, vec![("tiles.example".to_owned(), 2)]);
+        assert_eq!(config.network.cache_ttl, None);
+        assert_eq!(config.network.user_agent, "Mine/1");
+        assert!(!config.updates.enabled);
+        assert_eq!(config.updates.release_url(), "file:///srv/latest.json");
+        assert_eq!(config.permissions.notify_update, 4);
+        for bad in [
+            r#"{"network": {"max_concurrent_requests": ["eight: https://a/"]}}"#,
+            r#"{"network": {"max_concurrent_requests": ["65: https://a/"]}}"#,
+            r#"{"network": {"cache_ttl_minutes": -1}}"#,
+            r#"{"network": {"user_agent": ""}}"#,
+            r#"{"updates": {"repository": "not a repo"}}"#,
+            r#"{"updates": {"url": "ftp://x"}}"#,
+            r#"{"updates": {"channel": "beta"}}"#,
+        ] {
+            assert!(parse_server_config(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn rejects_unknown_keys_and_invalid_values() {
         for text in [
             r#"{"terain_offset": {}}"#,
@@ -546,7 +661,8 @@ mod tests {
             r#"{"world": {"min_y": -60}}"#,
             r#"{"world": {"min_y": 0, "height": 4064}}"#,
             r#"{"biomes": {"biome": "minecraft:the_void"}}"#,
-            r#"{"linked_worlds": {"enabled": true, "method": "SERVER"}}"#,
+            r#"{"linked_worlds": {"enabled": true, "method": "SERVER", "server_name": "nowhere", "worlds": [{"name": "a", "offset": 0}]}}"#,
+            r#"{"linked_worlds": {"enabled": true, "method": "SERVER", "server_name": 3}}"#,
             r#"{"permissions": {"tpll": 5}}"#,
             r#"{"terrain_offset": {"x": 1.5}}"#,
             r#"{"passthrough_tpll": 3}"#,
@@ -563,6 +679,15 @@ mod tests {
         assert!(defaults.reduced_console_messages, "config.yml ships reduced_console_messages: true");
         assert!(!defaults.height_in_actionbar);
         assert_eq!(defaults.passthrough_tpll, None);
+        assert_eq!(defaults.linked_server_name, None);
+        let servers = parse_server_config(
+            r#"{"linked_worlds": {"enabled": true, "method": "SERVER", "server_name": " Mid ", "worlds": [{"name": "low", "offset": 2032}, {"name": "mid", "offset": 0}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(servers.linked_server_name.as_deref(), Some("Mid"));
+        assert_eq!(servers.linked_worlds.method, LinkedWorldsMethod::Servers);
+        assert!(servers.warnings.iter().any(|warning| warning.contains("TerraPlusMinusProxyBridge")));
+        assert!(!servers.linked_worlds.levels_active());
         assert_eq!((defaults.permissions.forcetpll, defaults.permissions.autoteleport), (2, 2));
         let config = parse_server_config(
             r#"{"reduced_console_messages": false, "height_in_actionbar": true, "passthrough_tpll": " terraplusplus ", "permissions": {"forcetpll": 3, "autoteleport": 0}}"#,

@@ -1,6 +1,8 @@
 //! Engine-neutral TerraPlusMinus server behaviour: configuration, `/tpll` parsing and
 //! authorization, teleport planning across linked worlds, and assembly of the generation stack.
 
+pub mod autoteleport;
+pub mod bridge;
 pub mod config;
 pub mod coordinates;
 pub mod engine_bridge;
@@ -10,6 +12,7 @@ pub mod region_index;
 pub mod stack;
 pub mod teleports;
 pub mod tpll;
+pub mod updates;
 
 pub use coordinates::{LatLng, UpstreamParseOutcome, parse_coordinates, parse_coordinates_upstream};
 pub use config::{ConfigError, DATAPACK_WORLD, EARTH_PATH, LevelPlan, MOD_NAMESPACE, NetworkConfig, OpenStreetMapConfig, PermissionLevels, ServerConfig, parse_server_config};

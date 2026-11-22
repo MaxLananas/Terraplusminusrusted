@@ -133,6 +133,9 @@ pub enum TpllStep {
     /// `linked` teleports went through linked-world routing; upstream then prints the height as
     /// a Java double (`floor(y) - offset` with a double offset).
     Teleport { world: String, x: f64, y: f64, z: f64, reported: LatLng, reported_height: i32, linked: bool },
+    /// Linked-worlds method SERVER: the height belongs to the server above (`upward`) or below;
+    /// the host asks the proxy bridge to move the player there (`sendPluginMessageToBungeeBridge`).
+    LinkedServer { upward: bool, reported: LatLng },
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +227,9 @@ impl TpllRequest {
 
     #[allow(clippy::too_many_arguments)]
     fn linked_world(&self, upward: bool, y: f64, y_offset: f64, world_name: &str, depth: usize, linked: &LinkedWorlds, authorization: Authorization, world: &dyn TeleportWorld) -> TpllStep {
+        if linked.enabled && linked.method == LinkedWorldsMethod::Servers {
+            return TpllStep::LinkedServer { upward, reported: self.target.position };
+        }
         if !linked.enabled || linked.method != LinkedWorldsMethod::Levels || depth >= linked.worlds.len() {
             return TpllStep::Unreachable;
         }

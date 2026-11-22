@@ -11,6 +11,8 @@ pub struct RoutingFetcher<T> {
     mirrors: MirrorFetcher,
     http: HttpTileFetcher<T>,
     plain_http_hosts: Vec<String>,
+    /// The transport fetches `https://` itself (system curl), so unlisted hosts keep TLS.
+    https: bool,
 }
 
 impl<T: HttpTransport> RoutingFetcher<T> {
@@ -19,7 +21,13 @@ impl<T: HttpTransport> RoutingFetcher<T> {
         for (prefix, directory) in mirrors {
             fetcher = fetcher.with_mapping(prefix.clone(), directory.clone());
         }
-        Self { mirror_prefixes: mirrors.iter().map(|(prefix, _)| prefix.clone()).collect(), mirrors: fetcher, http, plain_http_hosts }
+        Self { mirror_prefixes: mirrors.iter().map(|(prefix, _)| prefix.clone()).collect(), mirrors: fetcher, http, plain_http_hosts, https: false }
+    }
+
+    /// Declares that the transport handles `https://` URLs (see [`crate::DualTransport`]).
+    pub fn with_https(mut self, https: bool) -> Self {
+        self.https = https;
+        self
     }
 
     /// Whether URLs from `template` (with `${x}`-style placeholders) can be fetched at all: a
@@ -40,8 +48,10 @@ impl<T: HttpTransport> RoutingFetcher<T> {
         let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
         if self.plain_http_hosts.contains(&host) {
             Ok(format!("http://{rest}"))
+        } else if self.https {
+            Ok(url.to_owned())
         } else {
-            Err(format!("{url} needs TLS, which this build lacks; list `{host}` in network.plain_http_hosts or mirror it"))
+            Err(format!("{url} needs TLS and no curl was found (network.https_command); install curl, list `{host}` in network.plain_http_hosts or mirror it"))
         }
     }
 }
@@ -70,5 +80,10 @@ mod tests {
         assert!(router.network_url("ftp://x/y").is_err());
         assert_eq!(router.fetch("https://mirror.example/definitely-absent.png").unwrap(), FetchOutcome::Missing);
         assert!(matches!(router.fetch("https://other.example/x"), Err(ElevationError::Unreachable { .. })));
+        let http = HttpTileFetcher::new(PlainHttpTransport::default(), TransportLimits::default(), RetryPolicy::default());
+        let tls = RoutingFetcher::new(&[], http, vec!["s3.amazonaws.com".into()]).with_https(true);
+        assert_eq!(tls.network_url("https://other.example/x").unwrap(), "https://other.example/x", "kept on TLS");
+        assert_eq!(tls.network_url("https://s3.amazonaws.com/a").unwrap(), "http://s3.amazonaws.com/a", "listed hosts still go plain");
+        assert!(tls.check_route("https://cloud.daporkchop.net/${z}/${x}.tiff").is_ok());
     }
 }

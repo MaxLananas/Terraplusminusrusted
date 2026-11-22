@@ -142,6 +142,12 @@ impl OsmDataset {
         Ok(ChunkElements::Elements(ordered))
     }
 
+    /// The elements of one 1/64-degree tile in the order upstream produces them: referenced
+    /// resources first, then the tile's own objects.
+    pub fn tile_elements(&self, tile_x: i32, tile_z: i32) -> Result<Vec<Arc<VectorGeometry>>, OsmError> {
+        Ok(self.resolve(&format!("tile/{tile_x}/{tile_z}.json"), &mut Vec::new())?.to_vec())
+    }
+
     fn tile(&self, (x, z): (i32, i32)) -> Result<TileIndex, OsmError> {
         self.tiles.get_or_load((x, z), || {
             let elements = self.resolve(&format!("tile/{x}/{z}.json"), &mut Vec::new())?;

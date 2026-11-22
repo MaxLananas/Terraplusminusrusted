@@ -52,11 +52,14 @@ fn load_shared(context: &RegistrationContext) -> Result<Shared, String> {
     let config = match std::fs::read_to_string(&path) {
         Ok(text) => parse_server_config(&text).map_err(|error| format!("{}: {error}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            log(&format!("no {CONFIG_FILE}; using the upstream defaults (AWS terrain tiles need network.plain_http_hosts or a mirror)"));
+            log(&format!("no {CONFIG_FILE}; using the upstream defaults (AWS terrain tiles and the OpenStreetMap server need network.plain_http_hosts or a mirror)"));
             ServerConfig::default()
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
+    for warning in &config.warnings {
+        log(warning);
+    }
     let base = path.parent().map_or(instance.clone(), PathBuf::from);
     if config.openstreetmap.enabled && config.openstreetmap.mapping.is_none() {
         // TerraPlusMinus drops the default mapping beside its config so it can be edited.

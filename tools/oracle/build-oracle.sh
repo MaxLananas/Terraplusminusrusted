@@ -36,12 +36,13 @@ prepare_toolchain() {
         python3 -m zipfile -e "$toolchain/jdk.whl" "$toolchain/jdk"
         chmod +x "$toolchain/jdk/jdk4py/java-runtime/bin/"*
     fi
-    if [[ ! -f "$toolchain/jars/ecj.jar" ]]; then
+    if [[ ! -f "$toolchain/jars/ecj.jar" || ! -f "$toolchain/jars/gson.jar" ]]; then
         rm -rf "$toolchain/jars" "$toolchain/extract"
         mkdir -p "$toolchain/jars" "$toolchain/extract"
-        tar -xzf "$toolchain/jls.tgz" -C "$toolchain/extract" "$ECJ_ENTRY" "$GUAVA_ENTRY" "$FAILUREACCESS_ENTRY"
+        tar -xzf "$toolchain/jls.tgz" -C "$toolchain/extract" "$ECJ_ENTRY" "$GUAVA_ENTRY" "$FAILUREACCESS_ENTRY" "$GSON_ENTRY"
         mv "$toolchain/extract/$GUAVA_ENTRY" "$toolchain/jars/guava.jar"
         mv "$toolchain/extract/$FAILUREACCESS_ENTRY" "$toolchain/jars/failureaccess.jar"
+        mv "$toolchain/extract/$GSON_ENTRY" "$toolchain/jars/gson.jar"
         mv "$toolchain/extract/$ECJ_ENTRY" "$toolchain/jars/ecj.jar"
         rm -rf "$toolchain/extract"
     fi
@@ -49,7 +50,7 @@ prepare_toolchain() {
 
 prepare_toolchain
 java="$toolchain/jdk/jdk4py/java-runtime/bin/java"
-classpath="$toolchain/jars/guava.jar:$toolchain/jars/failureaccess.jar"
+classpath="$toolchain/jars/guava.jar:$toolchain/jars/failureaccess.jar:$toolchain/jars/gson.jar"
 
 "$root/scripts/fetch-upstream.sh" terraminusminus
 upstream="$root/.upstream/terraminusminus/src/main"
@@ -59,12 +60,19 @@ generated="$build/generated/net/buildtheearth/terraminusminus"
 rm -rf "$build/generated" "$build/classes"
 mkdir -p "$generated" "$build/classes"
 
-# TerraConstants drags in Jackson and Gson configuration; only its numeric constants are needed.
+# TerraConstants drags in Jackson configuration; only its numeric constants, the empty array and the
+# Gson instance (with the block state adapter the OpenStreetMap parsers rely on) are needed.
 {
     echo "package net.buildtheearth.terraminusminus;"
+    echo "import com.google.gson.Gson;"
+    echo "import com.google.gson.GsonBuilder;"
+    echo "import net.buildtheearth.terraminusminus.dataset.osm.BlockStateParser;"
+    echo "import net.buildtheearth.terraminusminus.substitutes.BlockState;"
     echo "public final class TerraConstants {"
     echo "    private TerraConstants() {}"
     grep -E "public static final double (EARTH_CIRCUMFERENCE|EARTH_POLAR_CIRCUMFERENCE) = " "$package_root/TerraConstants.java"
+    grep -E "public static final double\[\] EMPTY_DOUBLE_ARRAY = " "$package_root/TerraConstants.java"
+    sed -n '/public static final Gson GSON = /,/\.create();/p' "$package_root/TerraConstants.java"
     echo "    public static final UnsupportedJsonMapper JSON_MAPPER = new UnsupportedJsonMapper();"
     echo "    public static final class UnsupportedJsonMapper {"
     echo "        public <T> T readValue(String content, Class<T> type) {"
@@ -73,8 +81,10 @@ mkdir -p "$generated" "$build/classes"
     echo "    }"
     echo "}"
 } > "$generated/TerraConstants.java"
-if [[ "$(grep -c "EARTH_" "$generated/TerraConstants.java")" -ne 2 ]]; then
-    echo "error: failed to extract TerraConstants numeric constants" >&2
+if [[ "$(grep -c "EARTH_" "$generated/TerraConstants.java")" -ne 2 ]] \
+    || ! grep -q "EMPTY_DOUBLE_ARRAY" "$generated/TerraConstants.java" \
+    || ! grep -q "registerTypeAdapter(BlockState.class, BlockStateParser.INSTANCE)" "$generated/TerraConstants.java"; then
+    echo "error: failed to extract TerraConstants members" >&2
     exit 1
 fi
 
@@ -94,6 +104,35 @@ upstream_sources=(
     dataset/BlendMode.java
     config/scalarparse/d/DoubleScalarParser.java
     config/scalarparse/d/ParseTerrariumPngDSP.java
+    # OpenStreetMap: GeoJSON model and parsers, the osm.json5 mapper, vector geometries and draw
+    # functions, and the spatial indexes. Delomboked by patches/delombok-osm.patch (see delombok-osm.py).
+    dataset/geojson/AbstractGeoJsonDeserializer.java
+    dataset/geojson/GeoJson.java
+    dataset/geojson/GeoJsonObject.java
+    dataset/geojson/Geometry.java
+    dataset/geojson/GeometryDeserializer.java
+    dataset/geojson/ObjectDeserializer.java
+    dataset/geojson/geometry
+    dataset/geojson/object
+    dataset/osm/BlockStateParser.java
+    dataset/osm/JsonParser.java
+    dataset/osm/OSMMapper.java
+    dataset/osm/Root.java
+    dataset/osm/dvalue
+    dataset/osm/mapper
+    dataset/osm/match
+    dataset/vector/draw
+    dataset/vector/geometry
+    util/bvh/BVH.java
+    util/bvh/EmptyBVH.java
+    util/bvh/QuadtreeBVH.java
+    util/bvh/SingletonBVH.java
+    util/interval
+    substitutes/BlockState.java
+    substitutes/BlockStateBuilder.java
+    substitutes/BlockPropertyValue.java
+    substitutes/Identifier.java
+    substitutes/exceptions
 )
 patched="$build/patched-src"
 rm -rf "$patched"
@@ -128,6 +167,7 @@ record_provenance() {
         echo "jdk_wheel_sha256=$JDK_WHEEL_SHA256"
         echo "ecj_jar_sha256=$(sha256sum "$toolchain/jars/ecj.jar" | cut -d' ' -f1)"
         echo "guava_jar_sha256=$(sha256sum "$toolchain/jars/guava.jar" | cut -d' ' -f1)"
+        echo "gson_jar_sha256=$(sha256sum "$toolchain/jars/gson.jar" | cut -d' ' -f1)"
         echo "conformal_gz_sha256=$(sha256sum "$resource_dir/conformal.gz" | cut -d' ' -f1)"
         echo "harness_sha256=$(cat "$oracle/harness/src/terraplusminus/oracle/"*.java | sha256sum | cut -d' ' -f1)"
         echo "stubs_sha256=$(find "$oracle/stubs/src" -name '*.java' -print0 | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
@@ -157,4 +197,11 @@ mkdir -p "$command_fixtures"
 rm -f "$command_fixtures"/*.tsv.gz
 run_harness terraplusminus.oracle.CommandTextGoldenDump "$command_fixtures"
 record_provenance "$command_fixtures"
-echo "fixtures written to $fixtures, $elevation_fixtures, $coordinate_fixtures and $command_fixtures"
+osm_fixtures="$root/fixtures/osm/golden"
+mkdir -p "$osm_fixtures"
+rm -f "$osm_fixtures"/*.tsv.gz
+osm_mapping="$upstream/resources/net/buildtheearth/terraminusminus/dataset/osm/osm.json5"
+run_harness terraplusminus.oracle.OsmGoldenDump "$osm_mapping" "$root/fixtures/osm" "$osm_fixtures"
+record_provenance "$osm_fixtures"
+echo "osm_json5_sha256=$(sha256sum "$osm_mapping" | cut -d' ' -f1)" >> "$osm_fixtures/PROVENANCE"
+echo "fixtures written to $fixtures, $elevation_fixtures, $coordinate_fixtures, $command_fixtures and $osm_fixtures"

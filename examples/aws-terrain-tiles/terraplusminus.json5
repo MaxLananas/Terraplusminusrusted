@@ -1,5 +1,9 @@
 // Live AWS Terrain Tiles (the upstream default world layers) fetched over plain HTTP, since
 // this build has no TLS transport. Tiles are cached on disk under ./tile-cache.
+// OpenStreetMap features are off because the default OSM server URL is HTTPS, which this build
+// cannot fetch. To enable them, point openstreetmap.servers at a plain-HTTP mirror of
+// https://cloud.daporkchop.net/gis/osm/0/ (and list its host in plain_http_hosts), or at a local
+// copy through network.mirrors.
 {
     "world": {"min_y": -2032, "height": 4064},
     "network": {
@@ -7,4 +11,5 @@
         "cache_directory": "tile-cache",
         "cache_max_bytes": 4294967296,
     },
+    "openstreetmap": {"enabled": false},
 }

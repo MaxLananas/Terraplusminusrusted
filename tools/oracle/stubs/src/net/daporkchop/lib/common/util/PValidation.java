@@ -11,6 +11,16 @@ public final class PValidation {
         if (!condition) throw new IllegalArgumentException(String.format(format, arguments));
     }
 
+    public static int positive(int value) {
+        checkArg(value > 0, "argument must be positive (given: %d)", value);
+        return value;
+    }
+
+    public static int positive(int value, Object name) {
+        checkArg(value > 0, "%2$s must be positive (given: %1$d)", value, name);
+        return value;
+    }
+
     public static int notNegative(int value, String name) {
         if (value < 0) throw new IllegalArgumentException(name + " cannot be negative! (" + value + ')');
         return value;

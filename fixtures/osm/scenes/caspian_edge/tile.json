@@ -1,0 +1,3 @@
+{"type":"Reference","location":"shared/caspian-coast.json"}
+{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[45.6366,39.9999],[45.63695,39.99988],[45.63694,39.9996],[45.63662,39.99962],[45.6366,39.9999]]]},"properties":{"natural":"coastline"},"id":"way/200"}
+{"type":"Feature","geometry":{"type":"LineString","coordinates":[[45.63652,40.0004],[45.6373,40.0002]]},"properties":{"waterway":"canal"},"id":"way/201"}

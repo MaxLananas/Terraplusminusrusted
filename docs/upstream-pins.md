@@ -31,6 +31,7 @@ under `tools/oracle`.
 | OpenJDK (PyPI `jdk4py` wheel) | 25.0.5.1 | sha256 `b989b35d24f704cb40b402a82003d131056bf2b9794c33acb84bf42b5ebffd34` |
 | ECJ (from npm `@vscjava/java-language-server` 0.1.2) | 3.45.0 | npm integrity `sha512-5PrYFqYmqFbPuhXqFIiyIQWvyFisZ7KUZV0B4F0DaDvlxDSrwP2nTbNE2pmsjSApT5S3BX0VrMkeKKzX5SMAfA==` |
 | Guava | 33.5.0 | jar sha256 recorded in each fixture `PROVENANCE` |
+| Gson (from the same npm package as ECJ; terraminusminus pins 2.13.1) | 2.13.2 | jar sha256 recorded in `fixtures/osm/golden/PROVENANCE` |
 
 Each `fixtures/**/PROVENANCE` records the upstream commit, the JDK and the jar digests, and
 digests of the harness, stubs and patches that produced the goldens.

@@ -17,6 +17,9 @@ use terra_server::{ServerConfig, TerraStack, parse_server_config, parse_tpll_arg
 fn load(path: &str) -> Result<(ServerConfig, PathBuf), String> {
     let text = std::fs::read_to_string(path).map_err(|error| format!("reading {path}: {error}"))?;
     let config = parse_server_config(&text).map_err(|error| error.to_string())?;
+    for warning in &config.warnings {
+        eprintln!("warning: {warning}");
+    }
     let base = Path::new(path).parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     Ok((config, base))
 }

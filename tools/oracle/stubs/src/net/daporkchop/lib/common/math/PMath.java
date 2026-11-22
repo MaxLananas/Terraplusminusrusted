@@ -15,4 +15,12 @@ public final class PMath {
     public static double lerp(double a, double b, double t) {
         return a + (b - a) * t;
     }
+
+    public static int clamp(int val, int min, int max) {
+        return Math.min(Math.max(val, min), max);
+    }
+
+    public static double clamp(double val, double min, double max) {
+        return Math.min(Math.max(val, min), max);
+    }
 }

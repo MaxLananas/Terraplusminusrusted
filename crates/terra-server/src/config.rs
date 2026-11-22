@@ -72,6 +72,8 @@ pub struct ServerConfig {
     pub loader: LoaderLimits,
     pub generation_wait: Duration,
     pub max_pending_teleports: usize,
+    /// Accepted but deprecated settings, worded as upstream's startup warnings. Callers log them.
+    pub warnings: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -102,6 +104,7 @@ impl Default for ServerConfig {
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
             max_pending_teleports: 64,
+            warnings: Vec::new(),
         }
     }
 }
@@ -232,6 +235,12 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
     }
     for (key, block) in [("building_outlines_material", "minecraft:bricks"), ("road_material", "minecraft:gray_concrete"), ("path_material", "minecraft:dirt_path")] {
         if let Some(material) = root.string(key)? {
+            // `BlockMapper.withConfiguredMapping`: honored, with a deprecation warning.
+            config.warnings.push(format!(
+                "Configuration entry {key} is set to {material}, but is deprecated and may be removed in future versions. \
+                 Consider removing it from your configuration and editing {} instead.",
+                crate::stack::OSM_MAPPING_FILE
+            ));
             config.generator.surface_replacements.push((block.to_owned(), Block::from_material_name(material)));
         }
     }
@@ -358,6 +367,9 @@ mod tests {
         assert_eq!(config.openstreetmap.servers, vec!["http://osm.example/data/".to_owned()]);
         assert_eq!(config.openstreetmap.mapping, Some(PathBuf::from("osm-custom.json5")));
         assert_eq!(config.generator.surface_replacements, vec![("minecraft:gray_concrete".to_owned(), Block::Stone)]);
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].starts_with("Configuration entry road_material is set to STONE, but is deprecated"), "{:?}", config.warnings);
+        assert!(parse_server_config("{}").unwrap().warnings.is_empty());
         for text in [r#"{"openstreetmap": {"servers": []}}"#, r#"{"openstreetmap": {"servers": ["ftp://x/"]}}"#, r#"{"openstreetmap": {"server": []}}"#] {
             assert!(parse_server_config(text).is_err(), "{text}");
         }

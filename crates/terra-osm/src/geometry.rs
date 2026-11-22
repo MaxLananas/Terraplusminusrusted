@@ -124,6 +124,18 @@ impl VectorGeometry {
         &self.id
     }
 
+    /// The upstream class this element corresponds to (`NarrowLine`, `SharpLine`, `WideLine`,
+    /// `FillPolygon` or `DistancePolygon`).
+    pub fn kind_name(&self) -> &'static str {
+        match self.shape {
+            Shape::Narrow(_) => "NarrowLine",
+            Shape::Sharp(_) => "SharpLine",
+            Shape::Wide { .. } => "WideLine",
+            Shape::Fill(_) => "FillPolygon",
+            Shape::Distance { .. } => "DistancePolygon",
+        }
+    }
+
     pub fn layer(&self) -> f64 {
         self.layer
     }

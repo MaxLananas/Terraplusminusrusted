@@ -20,6 +20,9 @@ What works and is tested here:
 - Chunk terrain, Köppen biomes and the generation fingerprint.
 - Provider acquisition with retries, rate limiting and a bounded disk cache.
 - `/tpll` coordinate parsing and flow, and the chat text of all four commands.
+- The OpenStreetMap pipeline: GeoJSON tiles, the `osm.json5` mapping language and the drawing of
+  roads, buildings, water, coastlines and tree clearing. Its mapped elements and every drawn
+  column match the Java oracle on four recorded scenes, one of which exercises a custom mapping.
 
 What is not done:
 
@@ -29,11 +32,10 @@ What is not done:
   signature. The checks a real server run would cover (joining, lighting, collision,
   save/restart) are still open.
 - **Not ported:**
-  - the OpenStreetMap pipeline, so there are no OSM water polygons, coastlines, roads or
-    buildings;
-  - trees and tree cover;
+  - trees and tree cover (OSM tree clearing is computed but nothing places trees yet);
   - GeoTIFF elevation layers;
-  - HTTPS (use a plain-HTTP mirror);
+  - HTTPS (use a plain-HTTP mirror). The default OSM server is HTTPS-only, so OSM needs a
+    mirror (see [OpenStreetMap](#openstreetmap));
   - the SERVER linked-worlds method;
   - auto-teleport on movement;
   - `/tpll -p`.
@@ -48,6 +50,7 @@ The per-feature status is in [docs/feature-matrix.md](docs/feature-matrix.md).
 | `crates/terra-projection` | Geographic projections and their Java-compatible numerics |
 | `crates/terra-elevation` | Elevation dataset configuration, tiles, blending, per-chunk sampling |
 | `crates/terra-acquisition` | HTTP fetching, retry and rate-limit policy, mirrors, disk cache |
+| `crates/terra-osm` | OpenStreetMap GeoJSON tiles, `osm.json5` mapper, geometry drawing |
 | `crates/terra-chunk-generation` | Chunk terrain, block columns, biomes, chunk loader, fingerprint |
 | `crates/terra-server` | Configuration, `/tpll`, command messages, teleports, the engine bridge |
 | `crates/terra-cli` | `terraplusminus`, an operator tool: config checks, column queries, benchmarks |
@@ -69,7 +72,7 @@ this was built.
   build from an npm mirror after checking each archive's pinned sha512.
 - `python3`, `git`, `gzip` and `sha256sum` for the scripts.
 - For the oracle only: network access to PyPI, npm and GitHub. `tools/oracle/build-oracle.sh`
-  fetches a pinned JDK, ECJ and Guava into `tools/oracle/build/`.
+  fetches a pinned JDK, ECJ, Guava and Gson into `tools/oracle/build/`.
 - For the Horizon mod: the Horizon launcher and `cargo horizon-mod`, which bring their own pinned
   toolchain (Rust 1.95) and SDK.
 
@@ -151,8 +154,37 @@ closed to generation, and the server log says why.
 ## Configuration
 
 The format is upstream's `config.yml` expressed as JSON5, plus sections for this port: `world`,
-`elevation`, `network`, `permissions`, `generation` and `prefix`. Unknown keys are errors. See
-`examples/` and `crates/terra-server/src/config.rs`.
+`elevation`, `network`, `permissions`, `generation`, `prefix` and `openstreetmap`. Unknown keys
+are errors. See `examples/` and `crates/terra-server/src/config.rs`.
+
+### OpenStreetMap
+
+OSM features are on by default, as upstream. They draw roads (gray concrete), paths (dirt path),
+building outlines (bricks), rivers, lakes and coastlines, and they clear trees under buildings and
+water. The section accepts:
+
+```json5
+"openstreetmap": {
+    "enabled": true,
+    // URL prefixes tried in order; each must end in `/`. Default: upstream's server.
+    "servers": ["https://cloud.daporkchop.net/gis/osm/0/"],
+    // Mapping file, relative to the config directory. Default: osm.json5, extracted next to
+    // the config on first start (byte-identical to upstream's) so it can be edited.
+    "mapping": "osm.json5",
+    "memory_cache_tiles": 512,
+}
+```
+
+This build has no TLS, so the default HTTPS server cannot be reached. Either serve a copy of the
+tiles over plain HTTP and list its host in `network.plain_http_hosts`, or map the server prefix to
+a local directory with `network.mirrors`, or set `enabled` to `false`. A chunk whose OSM tile
+cannot be fetched waits and retries, like elevation data. An invalid mapping file stops the server
+from starting rather than generating without features.
+
+Upstream's deprecated `building_outlines_material`, `road_material` and `path_material` keys
+still work as they do upstream: each replaces the block that `osm.json5` draws for building
+outlines (`minecraft:bricks`), roads (`minecraft:gray_concrete`) or paths (`minecraft:dirt_path`),
+and startup logs upstream's deprecation warning. Editing `osm.json5` is the better way.
 
 ## Attribution and license
 

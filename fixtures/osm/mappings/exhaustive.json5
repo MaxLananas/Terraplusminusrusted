@@ -1,0 +1,95 @@
+/*
+ * An osm.json5 using every construct the default mapping does not: fill polygons, the any
+ * mapper, id and intersects matches, the -, /, min and max values, weight_clamp and
+ * weight_less_than, ocean on lines, blocks with properties and without a namespace, and weights
+ * large enough to saturate the water depth encoding in both directions.
+ */
+{
+    "line": {
+        "first": {
+            "condition": {
+                "match": { "id": "way/400" },
+                "emit": { "narrow": { "draw": { "ocean": {} }, "layer": { "constant": 0 } } }
+            },
+            "condition": {
+                "match": { "id": [ "way/401", "way/402" ] },
+                "emit": {
+                    "any": {
+                        "wide": {
+                            "draw": { "weight_clamp": { "delegate": { "water": {} }, "min": -40, "max": 40 } },
+                            "layer": { "-": { "constant": 1, "tag": { "key": "layer", "fallback": 0 } } },
+                            "radius": { "min": { "tag": { "key": "width", "fallback": 3 }, "constant": 60 } }
+                        },
+                        "condition": {
+                            "match": { "tag": { "never": null } },
+                            "emit": { "narrow": { "draw": { "ocean": {} }, "layer": { "constant": 9 } } }
+                        },
+                        "sharp": {
+                            "draw": { "block": { "id": "minecraft:oak_slab", "properties": { "type": "top", "waterlogged": false } } },
+                            "layer": { "constant": 5 }
+                        }
+                    }
+                }
+            },
+            // all yields nothing when one child does; first then moves on to the next condition
+            "condition": {
+                "match": { "id": "way/403" },
+                "emit": {
+                    "all": {
+                        "condition": { "match": { "tag": { "never": null } }, "emit": { "nothing": {} } },
+                        "narrow": { "draw": { "ocean": {} }, "layer": { "constant": 0 } }
+                    }
+                }
+            },
+            "condition": {
+                "match": {
+                    "and": {
+                        "tag": { "kind": [ "deep", "shallow" ] },
+                        "not": { "intersects": { "minX": 10.0, "maxX": 10.0001, "minZ": 0.0499, "maxZ": 0.05 } }
+                    }
+                },
+                "emit": {
+                    "wide": {
+                        "draw": { "weight_less_than": { "delegate": { "weight_add": { "delegate": { "water": {} }, "value": -50 } }, "value": 4 } },
+                        "layer": { "/": { "constant": 3, "constant": 2 } },
+                        "radius": { "tag": { "key": "width", "fallback": 5 } }
+                    }
+                }
+            }
+        }
+    },
+    "polygon": {
+        "any": {
+            "condition": {
+                "match": { "tag": { "landuse": "basin" } },
+                "emit": { "fill": { "draw": { "all": { "water": {}, "no_trees": {} } }, "layer": { "constant": -2 } } }
+            },
+            "condition": {
+                "match": { "or": { "id": "way/410", "tag": { "natural": "bay" } } },
+                "emit": {
+                    "all": {
+                        "distance": {
+                            "draw": { "weight_add": { "delegate": { "ocean": {} }, "value": 30 } },
+                            "layer": { "max": { "constant": 1, "tag": { "key": "layer", "fallback": 0 } } },
+                            "maxDist": 40
+                        },
+                        "convert": { "line": { "narrow": { "draw": { "block": { "id": "stone_bricks" } }, "layer": { "constant": 2 } } } }
+                    }
+                }
+            },
+            "condition": {
+                "match": { "tag": { "place": null } },
+                "emit": {
+                    "distance": {
+                        "draw": { "weight_greater_than": { "delegate": { "block": { "id": "minecraft:farmland", "properties": { "moisture": 7 } } }, "value": 0 } },
+                        "layer": { "floor_div": { "tag": { "key": "level", "fallback": 7 }, "constant": 2 } }
+                    }
+                }
+            },
+            "condition": {
+                "match": { "intersects": { "minX": 10.0003, "maxX": 10.0004, "minZ": 0.0503, "maxZ": 0.0504 } },
+                "emit": { "fill": { "draw": { "block": { "id": "minecraft:sand" } }, "layer": { "constant": 0 } } }
+            }
+        }
+    }
+}

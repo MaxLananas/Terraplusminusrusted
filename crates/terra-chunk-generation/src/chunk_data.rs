@@ -71,6 +71,20 @@ impl ChunkDataBuilder {
         self.surface_blocks[column(x, z)] = block;
     }
 
+    pub fn surface_block(&self, x: usize, z: usize) -> Option<&SurfaceBlock> {
+        self.surface_blocks[column(x, z)].as_ref()
+    }
+
+    /// The encoded water depth byte: `WATERDEPTH_TYPE_*` in the top two bits, depth + 32 below.
+    pub fn water_depth(&self, x: usize, z: usize) -> i8 {
+        self.water_depth[column(x, z)]
+    }
+
+    /// Whether a `no_trees` draw zeroed this column's tree-cover chance.
+    pub fn trees_cleared(&self, x: usize, z: usize) -> bool {
+        self.trees_cleared[column(x, z)]
+    }
+
     pub fn update_water_depth(&mut self, x: usize, z: usize, depth: i32) {
         self.update_depth(column(x, z), depth, TYPE_WATER);
     }

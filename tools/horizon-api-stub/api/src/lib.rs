@@ -32,10 +32,51 @@ pub struct ChunkPos {
     pub z: i32,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct Text(String);
+#[non_exhaustive]
+pub struct Text {
+    pub content: String,
+    pub style: TextStyle,
+    pub children: Vec<Text>,
+}
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
+pub struct TextStyle {
+    pub color: Option<String>,
+    pub shadow_color: Option<u32>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underlined: Option<bool>,
+    pub strikethrough: Option<bool>,
+    pub obfuscated: Option<bool>,
+    pub click: Option<TextClick>,
+    pub hover: Option<TextHover>,
+    pub insertion: Option<String>,
+    pub font: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextClick {
+    OpenUrl(String),
+    ChangePage(i32),
+    SuggestCommand(String),
+    RunCommand(String),
+    CopyToClipboard(String),
+}
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum TextHover {
+    Text(Box<Text>),
+}
 impl Text {
     pub fn literal(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self { content: value.into(), style: TextStyle::default(), children: Vec::new() }
+    }
+    pub fn append(mut self, child: Text) -> Self {
+        self.children.push(child);
+        self
+    }
+    pub fn with_style(mut self, style: TextStyle) -> Self {
+        self.style = style;
+        self
     }
 }
 #[derive(Debug)]
@@ -49,6 +90,13 @@ pub enum PermissionLevel {
     Gamemasters,
     Admins,
     Owners,
+}
+impl CommandSource {
+    pub fn permission(&self) -> PermissionLevel {
+        match self {
+            Self::Player { permission, .. } | Self::Console { permission } => *permission,
+        }
+    }
 }
 impl PermissionLevel {
     pub fn level(self) -> u8 {
@@ -109,9 +157,8 @@ pub enum Flow {
 
 #[non_exhaustive]
 pub struct RunModCommandEvent<'a> {
-    pub source: CommandSource,
-    pub command: CommandInvocation,
-    marker: std::marker::PhantomData<&'a ()>,
+    pub source: &'a CommandSource,
+    pub command: &'a CommandInvocation,
 }
 #[non_exhaustive]
 pub struct RegisterCommandsEvent<'a> {
@@ -119,7 +166,14 @@ pub struct RegisterCommandsEvent<'a> {
 }
 #[non_exhaustive]
 pub struct ServerTickEvent<'a> {
+    pub phase: ServerTickPhase,
     marker: std::marker::PhantomData<&'a ()>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerTickPhase {
+    ServerTickStart { world_running: bool },
+    ServerTickEnd { world_running: bool },
 }
 #[non_exhaustive]
 pub struct ServerStartedEvent;
@@ -195,17 +249,42 @@ pub trait Commands {
     fn feedback(&mut self, line: Text) -> Result<(), TextFormError>;
 }
 
-pub trait ServerHost {
-    fn commands(&mut self) -> &mut dyn Commands;
+/// The public host areas (`host/*.rs`, `*Host` traits); `*Backend` methods are reached only
+/// through the handle methods below, as horizon-mod-api-gen's `handle_method` generates them.
+pub trait Host {
     fn level(&self, dimension: &str) -> Option<LevelRef>;
     fn chunk(&self, level: LevelRef, pos: [i32; 2]) -> Option<ChunkRef>;
-    fn level_height(&self, level: LevelRef) -> Option<(i32, i32)>;
-    fn level_block(&self, level: LevelRef, pos: [i32; 3]) -> Option<BlockKey>;
-    fn dimension_key_id(&self, key: DimensionKey) -> Option<String>;
+}
+pub trait ServerHost: Host {
+    fn commands(&mut self) -> &mut dyn Commands;
     fn world_dir(&self) -> Option<PathBuf>;
-    fn entity_position(&self, entity: EntityRef) -> Option<[f64; 3]>;
-    fn player_tell(&mut self, player: PlayerRef, line: Text) -> Result<bool, TextFormError>;
-    fn entity_teleport_to_level(&mut self, entity: EntityRef, dimension: &str, pos: [f64; 3], rotation: Option<[f32; 2]>) -> bool;
+}
+
+impl LevelRef {
+    pub fn height(self, host: &dyn Host) -> Option<(i32, i32)> {
+        None
+    }
+    pub fn block(self, host: &dyn Host, pos: [i32; 3]) -> Option<BlockKey> {
+        None
+    }
+}
+impl DimensionKey {
+    pub fn id(self, host: &dyn Host) -> Option<String> {
+        None
+    }
+}
+impl EntityRef {
+    pub fn position(self, host: &dyn Host) -> Option<[f64; 3]> {
+        None
+    }
+    pub fn teleport_to_level(self, host: &mut dyn ServerHost, dimension: &str, pos: [f64; 3], rotation: Option<[f32; 2]>) -> bool {
+        false
+    }
+}
+impl PlayerRef {
+    pub fn tell(self, host: &mut dyn ServerHost, line: Text) -> Result<bool, TextFormError> {
+        Ok(false)
+    }
 }
 
 pub trait Hooks {

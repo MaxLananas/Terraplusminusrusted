@@ -7,12 +7,9 @@
 //! server starts, and generation stays closed if it does not match.
 #![deny(unsafe_code)]
 
-// The glob brings the host-area and registrar traits whose methods are called below into scope.
-#[allow(unused_imports)]
-use mod_api::*;
 use mod_api::{
-    BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, Flow, Hooks, InstanceDirectory,
-    PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, Text,
+    BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, Flow, Host, Hooks, InstanceDirectory,
+    PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, ServerTickPhase, Text, TextClick, TextHover, TextStyle,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,7 +17,7 @@ use std::time::Duration;
 use terra_chunk_generation::WorldHeight;
 use terra_server::{
     Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, LevelHeight, PendingTeleports, RegionIndex,
-    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, messages, parse_server_config, terrain_for_generation, write_chunk,
+    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, messages, messages::{ChatMessage, legacy_spans}, parse_server_config, terrain_for_generation, write_chunk,
 };
 
 const MOD_ID: &str = "terraplusminus";
@@ -112,7 +109,7 @@ impl BiomeSource for EarthBiomes {
 }
 
 struct HostWorld<'a> {
-    host: &'a dyn ServerHost,
+    host: &'a dyn Host,
     regions: &'a RegionIndex,
     air: &'a [BlockKey],
 }
@@ -120,7 +117,7 @@ struct HostWorld<'a> {
 impl TeleportWorld for HostWorld<'_> {
     fn level_height(&self, world: &str) -> Option<LevelHeight> {
         let level = self.host.level(world)?;
-        let (min_y, height) = self.host.level_height(level)?;
+        let (min_y, height) = level.height(self.host)?;
         Some(LevelHeight { min_y, max_y: min_y + height })
     }
 
@@ -132,8 +129,38 @@ impl TeleportWorld for HostWorld<'_> {
     fn highest_block_y(&self, world: &str, x: i32, z: i32) -> Option<i32> {
         let level = self.host.level(world)?;
         self.host.chunk(level, [x >> 4, z >> 4])?;
-        let (min_y, height) = self.host.level_height(level)?;
-        (min_y..min_y + height).rev().find(|y| self.host.level_block(level, [x, *y, z]).is_some_and(|block| !self.air.contains(&block)))
+        let (min_y, height) = level.height(self.host)?;
+        (min_y..min_y + height).rev().find(|y| level.block(self.host, [x, *y, z]).is_some_and(|block| !self.air.contains(&block)))
+    }
+}
+
+/// Chat text from legacy `§` codes: Horizon's literal components do not interpret them.
+fn chat_text(message: &ChatMessage) -> Text {
+    let span_text = |text: &str| {
+        legacy_spans(text).into_iter().fold(Text::literal(""), |parent, span| {
+            let mut style = TextStyle::default();
+            style.color = span.color.map(str::to_owned);
+            for (field, enabled) in [
+                (&mut style.bold, span.bold),
+                (&mut style.italic, span.italic),
+                (&mut style.underlined, span.underlined),
+                (&mut style.strikethrough, span.strikethrough),
+                (&mut style.obfuscated, span.obfuscated),
+            ] {
+                *field = enabled.then_some(true);
+            }
+            parent.append(Text::literal(span.text).with_style(style))
+        })
+    };
+    let text = span_text(&message.text);
+    match &message.link {
+        Some(link) => {
+            let mut style = TextStyle::default();
+            style.click = Some(TextClick::OpenUrl(link.url.clone()));
+            style.hover = Some(TextHover::Text(Box::new(span_text(&link.hover))));
+            text.with_style(style)
+        }
+        None => text,
     }
 }
 
@@ -147,17 +174,21 @@ pub struct TerraPlusMinus {
 
 impl TerraPlusMinus {
     fn feedback(host: &mut dyn ServerHost, line: &str) {
-        let _ = host.commands().feedback(Text::literal(line));
+        Self::feedback_message(host, &ChatMessage::from(line.to_owned()));
+    }
+
+    fn feedback_message(host: &mut dyn ServerHost, message: &ChatMessage) {
+        let _ = host.commands().feedback(chat_text(message));
     }
 
     fn tell(host: &mut dyn ServerHost, player: PlayerRef, line: &str) {
-        let _ = host.player_tell(player, Text::literal(line));
+        let _ = player.tell(host, chat_text(&ChatMessage::from(line.to_owned())));
     }
 
     fn finish(host: &mut dyn ServerHost, player: PlayerRef, step: TpllStep, prefix: &str, reply: &mut dyn FnMut(&mut dyn ServerHost, &str)) {
         let lines = messages::tpll_step_lines(&step, prefix);
         if let TpllStep::Teleport { world, x, y, z, .. } = &step
-            && !host.entity_teleport_to_level(player.entity(), world, [*x, *y, *z], None)
+            && !player.entity().teleport_to_level(host, world, [*x, *y, *z], None)
         {
             return reply(host, &messages::unavailable(prefix));
         }
@@ -168,7 +199,7 @@ impl TerraPlusMinus {
 
     fn player_position(host: &dyn ServerHost, event: &RunModCommandEvent<'_>) -> Option<(PlayerRef, [f64; 3])> {
         let CommandSource::Player { player, .. } = event.source.clone() else { return None };
-        Some((player, host.entity_position(player.entity())?))
+        Some((player, player.entity().position(host)?))
     }
 
     fn info_command(&self, host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>, command: &str) {
@@ -176,13 +207,13 @@ impl TerraPlusMinus {
         let Some((_, [x, _, z])) = Self::player_position(&*host, event) else { return Self::feedback(host, "§cOnly players can use this command.") };
         let config = shared.stack.config();
         let projection = shared.stack.generator().projection().as_ref();
-        let lines = match command {
-            "where" => vec![messages::where_line(projection, x, z, &config.prefix)],
-            "offset" => messages::offset_lines(config, &config.prefix),
-            _ => vec![messages::distortion_message(projection, x, z)],
+        let lines: Vec<ChatMessage> = match command {
+            "where" => vec![messages::where_message(projection, x, z, &config.prefix)],
+            "offset" => messages::offset_lines(config, &config.prefix).into_iter().map(ChatMessage::from).collect(),
+            _ => vec![messages::distortion_message(projection, x, z).into()],
         };
-        for line in lines {
-            Self::feedback(host, &line);
+        for line in &lines {
+            Self::feedback_message(host, line);
         }
     }
 
@@ -195,7 +226,7 @@ impl TerraPlusMinus {
         let Some(CommandArgumentValue::String(arguments)) = event.command.argument("coordinates").cloned() else { return Self::feedback(host, &messages::tpll_usage(prefix)) };
         let level = permission.level();
         let authorization = Authorization { sender_is_target: true, admin: level >= config.permissions.admin, may_generate_chunks: level >= config.permissions.tpll_ungenerated_chunks };
-        let current = host.dimension_key_id(event.command.dimension);
+        let current = event.command.dimension.id(&*host);
         let world_name = match current {
             Some(name) if name == LEVEL_ID || config.linked_worlds.worlds.iter().any(|linked| linked.name == name) => name,
             _ if level >= config.permissions.tpll_other_world => LEVEL_ID.to_owned(),
@@ -298,7 +329,10 @@ impl Hooks for TerraPlusMinus {
         Flow::Cancel
     }
 
-    fn server_tick(&self, host: &mut dyn ServerHost, _: &mut ServerTickEvent<'_>) {
+    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        if !matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
+            return;
+        }
         let (Some(shared), Some(regions), Some(air)) = (self.shared.get(), self.regions.get(), self.air.get()) else { return };
         let finished = {
             let Ok(mut pending) = self.pending.lock() else { return };

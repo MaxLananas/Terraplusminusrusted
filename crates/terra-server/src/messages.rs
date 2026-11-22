@@ -8,6 +8,79 @@ use terra_projection::{GeographicProjection, ProjectedCoordinate};
 
 pub const DEFAULT_PREFIX: &str = "§2§lT+- §8» ";
 
+/// A run of chat text with one style, as Bukkit's `CraftChatMessage.fromString` splits a
+/// legacy string: a colour code starts a fresh style, `k`-`o` add a decoration, `r` resets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StyledSpan {
+    pub text: String,
+    pub color: Option<&'static str>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underlined: bool,
+    pub strikethrough: bool,
+    pub obfuscated: bool,
+}
+
+const LEGACY_COLORS: [&str; 16] = [
+    "black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red",
+    "light_purple", "yellow", "white",
+];
+
+pub fn legacy_spans(text: &str) -> Vec<StyledSpan> {
+    let mut spans = Vec::new();
+    let mut current = StyledSpan::default();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        let code = if character == '§' { characters.peek().map(char::to_ascii_lowercase) } else { None };
+        let mut style = current.clone();
+        style.text.clear();
+        match code {
+            Some(digit @ ('0'..='9' | 'a'..='f')) => {
+                let index = digit.to_digit(16).unwrap_or(15) as usize;
+                style = StyledSpan { color: Some(LEGACY_COLORS[index]), ..StyledSpan::default() };
+            }
+            Some('k') => style.obfuscated = true,
+            Some('l') => style.bold = true,
+            Some('m') => style.strikethrough = true,
+            Some('n') => style.underlined = true,
+            Some('o') => style.italic = true,
+            Some('r') => style = StyledSpan::default(),
+            _ => {
+                current.text.push(character);
+                continue;
+            }
+        }
+        characters.next();
+        if !current.text.is_empty() {
+            spans.push(std::mem::take(&mut current));
+        }
+        current = style;
+    }
+    if !current.text.is_empty() {
+        spans.push(current);
+    }
+    spans
+}
+
+/// One chat message: legacy-coded text, and optionally a URL opened on click with its hover text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub text: String,
+    pub link: Option<ChatLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLink {
+    pub url: String,
+    pub hover: String,
+}
+
+impl From<String> for ChatMessage {
+    fn from(text: String) -> Self {
+        Self { text, link: None }
+    }
+}
+
 pub fn tpll_usage(prefix: &str) -> String {
     format!("{prefix}§7Invalid coordinates or command usage!\nUsage: /tpll <latitude> <longitude> [height]\n       /tpll -p <player/@selector> <latitude> <longitude> [height]")
 }
@@ -42,18 +115,22 @@ pub fn tpll_step_lines(step: &TpllStep, prefix: &str) -> Vec<String> {
     }
 }
 
-/// `/where` at block position (`x`, `z`), `projection` including the terrain offset.
-pub fn where_line(projection: &dyn GeographicProjection, x: f64, z: f64, prefix: &str) -> String {
+/// `/where` at block position (`x`, `z`), `projection` including the terrain offset. Upstream
+/// makes the whole message open the location in Google Maps.
+pub fn where_message(projection: &dyn GeographicProjection, x: f64, z: f64, prefix: &str) -> ChatMessage {
     match projection.to_geo(ProjectedCoordinate::new(x, z)) {
-        Ok(geo) => format!("{prefix}§7Your coordinates are:\n§8{}, {}§7.", java_double_to_string(geo.latitude), java_double_to_string(geo.longitude)),
-        Err(_) => format!("{prefix}§cYou are currently outside of the world's projection and your location in the Minecraft world has no equivalent on Earth."),
+        Ok(geo) => {
+            let (latitude, longitude) = (java_double_to_string(geo.latitude), java_double_to_string(geo.longitude));
+            ChatMessage {
+                text: format!("{prefix}§7Your coordinates are:\n§8{latitude}, {longitude}§7."),
+                link: Some(ChatLink {
+                    url: format!("https://maps.google.com/maps?t=k&q=loc:{latitude}+{longitude}"),
+                    hover: "§7Click here to view in Google Maps.".to_owned(),
+                }),
+            }
+        }
+        Err(_) => format!("{prefix}§cYou are currently outside of the world's projection and your location in the Minecraft world has no equivalent on Earth.").into(),
     }
-}
-
-/// The map link upstream attaches to the `/where` line as a click event.
-pub fn where_map_url(projection: &dyn GeographicProjection, x: f64, z: f64) -> Option<String> {
-    let geo = projection.to_geo(ProjectedCoordinate::new(x, z)).ok()?;
-    Some(format!("https://maps.google.com/maps?t=k&q=loc:{}+{}", java_double_to_string(geo.latitude), java_double_to_string(geo.longitude)))
 }
 
 pub fn offset_lines(config: &ServerConfig, prefix: &str) -> Vec<String> {
@@ -96,6 +173,26 @@ mod tests {
         assert_eq!(tpll_step_lines(&step, "P "), vec!["P §7Teleported to 50.0, -113.25, 3000.".to_owned()]);
         let linked = TpllStep::Teleport { world: "sky".into(), x: 0.0, y: 0.0, z: 0.0, reported, reported_height: 3000, linked: true };
         assert_eq!(tpll_step_lines(&linked, "")[1], "§7Teleported to 50.0, -113.25, 3000.0.");
+    }
+
+    #[test]
+    fn legacy_codes_become_styles_like_bukkit() {
+        let spans = legacy_spans(DEFAULT_PREFIX);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].text.as_str(), spans[0].color, spans[0].bold), ("T+- ", Some("dark_green"), true));
+        assert_eq!((spans[1].text.as_str(), spans[1].color, spans[1].bold), ("» ", Some("dark_gray"), false));
+        let spans = legacy_spans("a§Lb§rc§zd§");
+        assert_eq!(spans.iter().map(|span| (span.text.as_str(), span.bold)).collect::<Vec<_>>(), vec![("a", false), ("b", true), ("c§zd§", false)]);
+    }
+
+    #[test]
+    fn where_links_the_reported_coordinates() {
+        let projection = terra_projection::terraplusminus_projection(0, 0).unwrap();
+        let message = where_message(projection.as_ref(), 3517417.0, -5288234.0, "");
+        let link = message.link.unwrap();
+        assert!(message.text.starts_with("§7Your coordinates are:\n§8"));
+        assert!(link.url.starts_with("https://maps.google.com/maps?t=k&q=loc:"));
+        assert!(where_message(projection.as_ref(), 1e9, 1e9, "").link.is_none());
     }
 
     #[test]

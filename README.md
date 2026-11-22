@@ -65,7 +65,8 @@ this was built.
 ## Prerequisites
 
 - The Rust toolchain pinned in `rust-toolchain.toml` (nightly-2025-09-25, rustc 1.92), with
-  clippy.
+  clippy. Where rustup is unreachable, `scripts/install-npm-toolchain.sh` installs that exact
+  build from an npm mirror after checking each archive's pinned sha512.
 - `python3`, `git`, `gzip` and `sha256sum` for the scripts.
 - For the oracle only: network access to PyPI, npm and GitHub. `tools/oracle/build-oracle.sh`
   fetches a pinned JDK, ECJ and Guava into `tools/oracle/build/`.

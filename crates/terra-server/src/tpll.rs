@@ -112,7 +112,9 @@ pub enum TpllStep {
     /// The surface height of a not yet generated column is needed: load chunk data for
     /// (`chunk_x`, `chunk_z`) off-tick, then call [`TpllRequest::resume_with_surface`].
     NeedsSurface { chunk_x: i32, chunk_z: i32, local_x: usize, local_z: usize },
-    Teleport { world: String, x: f64, y: f64, z: f64, reported: LatLng, reported_height: i32 },
+    /// `linked` teleports went through linked-world routing; upstream then prints the height as
+    /// a Java double (`floor(y) - offset` with a double offset).
+    Teleport { world: String, x: f64, y: f64, z: f64, reported: LatLng, reported_height: i32, linked: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +201,7 @@ impl TpllRequest {
         if block_y <= height.min_y {
             return self.linked_world(false, y, f64::from(self.y_offset), world_name, 0, linked, authorization, world);
         }
-        TpllStep::Teleport { world: world_name.to_owned(), x: self.x, y: f64::from(block_y), z: self.z, reported: self.target.position, reported_height: block_y - self.y_offset }
+        TpllStep::Teleport { world: world_name.to_owned(), x: self.x, y: f64::from(block_y), z: self.z, reported: self.target.position, reported_height: block_y - self.y_offset, linked: false }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -228,6 +230,7 @@ impl TpllRequest {
             z: self.z,
             reported: self.target.position,
             reported_height: y.floor() as i32 - y_offset as i32,
+            linked: true,
         }
     }
 }

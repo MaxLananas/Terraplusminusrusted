@@ -28,13 +28,19 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionLevels {
     pub tpll: u8,
+    /// `t+-.tpll.otherWorld`: run /tpll from a level that is not a TerraPlusMinus level.
+    pub tpll_other_world: u8,
     pub tpll_ungenerated_chunks: u8,
     pub admin: u8,
     pub diagnostics: u8,
+    /// `/where`, `/offset` and `/distortion`.
+    pub info_commands: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
+    /// Written in front of chat messages, as upstream's `prefix`.
+    pub prefix: String,
     pub generator: GeneratorSettings,
     pub generate_trees: bool,
     pub world: WorldHeight,
@@ -52,6 +58,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            prefix: crate::messages::DEFAULT_PREFIX.to_owned(),
             generator: GeneratorSettings::default(),
             generate_trees: true,
             world: WorldHeight { min_y: -64, max_y: 320 },
@@ -71,7 +78,7 @@ impl Default for ServerConfig {
                 total_timeout: Duration::from_secs(30),
                 memory_cache_tiles: 512,
             },
-            permissions: PermissionLevels { tpll: 0, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2 },
+            permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0 },
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
             max_pending_teleports: 64,
@@ -157,7 +164,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         &document,
         &[
             "terrain_offset", "min_latitude", "max_latitude", "min_longitude", "max_longitude", "linked_worlds", "generate_trees", "biomes",
-            "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version",
+            "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version", "prefix",
         ],
     )?;
     let mut config = ServerConfig::default();
@@ -188,6 +195,9 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         if config.linked_worlds.enabled && config.linked_worlds.method == LinkedWorldsMethod::Servers {
             return Err(ConfigError("linked_worlds.method SERVER needs a proxy bridge, which Horizon does not provide".into()));
         }
+    }
+    if let Some(prefix) = root.string("prefix")? {
+        config.prefix = prefix.to_owned();
     }
     config.generate_trees = root.boolean("generate_trees", true)?;
     if let Some(biomes) = root.section("biomes", &["use_dataset", "biome"])? {
@@ -241,10 +251,12 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         target.total_timeout = millis(network.integer("total_timeout_ms", 30_000, 100..=600_000)?);
         target.memory_cache_tiles = network.integer("memory_cache_tiles", target.memory_cache_tiles as i64, 1..=65_536)? as usize;
     }
-    if let Some(permissions) = root.section("permissions", &["tpll", "tpll_ungenerated_chunks", "admin", "diagnostics"])? {
+    if let Some(permissions) = root.section("permissions", &["tpll", "tpll_other_world", "tpll_ungenerated_chunks", "admin", "diagnostics", "info_commands"])? {
         let level = |key: &str, default: u8| permissions.integer(key, i64::from(default), 0..=4).map(|value| value as u8);
         config.permissions = PermissionLevels {
             tpll: level("tpll", 0)?,
+            tpll_other_world: level("tpll_other_world", 2)?,
+            info_commands: level("info_commands", 0)?,
             tpll_ungenerated_chunks: level("tpll_ungenerated_chunks", 2)?,
             admin: level("admin", 2)?,
             diagnostics: level("diagnostics", 2)?,

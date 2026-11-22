@@ -5,6 +5,7 @@ pub mod config;
 pub mod coordinates;
 pub mod engine_bridge;
 pub mod java_text;
+pub mod messages;
 pub mod region_index;
 pub mod stack;
 pub mod teleports;

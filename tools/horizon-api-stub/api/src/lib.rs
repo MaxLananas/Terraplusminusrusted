@@ -203,6 +203,7 @@ pub trait ServerHost {
     fn level_block(&self, level: LevelRef, pos: [i32; 3]) -> Option<BlockKey>;
     fn dimension_key_id(&self, key: DimensionKey) -> Option<String>;
     fn world_dir(&self) -> Option<PathBuf>;
+    fn entity_position(&self, entity: EntityRef) -> Option<[f64; 3]>;
     fn player_tell(&mut self, player: PlayerRef, line: Text) -> Result<bool, TextFormError>;
     fn entity_teleport_to_level(&mut self, entity: EntityRef, dimension: &str, pos: [f64; 3], rotation: Option<[f32; 2]>) -> bool;
 }

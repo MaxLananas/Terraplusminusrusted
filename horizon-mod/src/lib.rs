@@ -1,5 +1,6 @@
 //! TerraPlusMinus on Horizon: a chunk generator and biome source over the terra crates, the
-//! `terraplusminus:earth` dimension, `/tpll` and `/terraplusminus status`.
+//! `terraplusminus:earth` dimension, `/tpll` (`/tpc`), `/where`, `/offset`, `/distortion` and
+//! `/terraplusminus status`.
 //!
 //! Generation runs on Horizon's worldgen workers and waits there for real elevation data; the
 //! server tick only polls finished work. The world's generation fingerprint is checked when the
@@ -19,14 +20,13 @@ use std::time::Duration;
 use terra_chunk_generation::WorldHeight;
 use terra_server::{
     Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, LevelHeight, PendingTeleports, RegionIndex,
-    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, parse_server_config, terrain_for_generation, write_chunk,
+    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, messages, parse_server_config, terrain_for_generation, write_chunk,
 };
 
 const MOD_ID: &str = "terraplusminus";
 const DIMENSION: &str = "earth";
 const LEVEL_ID: &str = "terraplusminus:earth";
 const CONFIG_FILE: &str = "config/terraplusminus/terraplusminus.json5";
-const USAGE: &str = "§cUsage: /tpll <latitude> <longitude> [height]";
 
 struct Shared {
     stack: TerraStack,
@@ -154,22 +154,35 @@ impl TerraPlusMinus {
         let _ = host.player_tell(player, Text::literal(line));
     }
 
-    fn finish(host: &mut dyn ServerHost, player: PlayerRef, step: TpllStep, reply: &mut dyn FnMut(&mut dyn ServerHost, &str)) {
-        match step {
-            TpllStep::Teleport { world, x, y, z, reported, reported_height } => {
-                if host.entity_teleport_to_level(player.entity(), &world, [x, y, z], None) {
-                    reply(host, &format!("§7Teleported to {}, {}, {reported_height}.", reported.latitude, reported.longitude));
-                } else {
-                    reply(host, "§cThis location is currently unavailable. Please try again later.");
-                }
-            }
-            TpllStep::Usage => reply(host, USAGE),
-            TpllStep::OutsideProjection => reply(host, "§cLocation is not within projection bounds."),
-            TpllStep::OutsideTeamBounds => reply(host, "§cYou cannot tpll to these coordinates, because this area is being handled by another build team."),
-            TpllStep::UngeneratedChunkDenied => reply(host, "§cYou cannot tpll to chunks that have not been generated yet."),
-            TpllStep::Unreachable => reply(host, "§cThis height cannot be reached."),
-            TpllStep::LinkedWorldUnavailable { world } => reply(host, &format!("§cThe linked world {world} is not loaded.")),
-            TpllStep::NeedsSurface { .. } => reply(host, "§cThis location is currently unavailable. Please try again later."),
+    fn finish(host: &mut dyn ServerHost, player: PlayerRef, step: TpllStep, prefix: &str, reply: &mut dyn FnMut(&mut dyn ServerHost, &str)) {
+        let lines = messages::tpll_step_lines(&step, prefix);
+        if let TpllStep::Teleport { world, x, y, z, .. } = &step
+            && !host.entity_teleport_to_level(player.entity(), world, [*x, *y, *z], None)
+        {
+            return reply(host, &messages::unavailable(prefix));
+        }
+        for line in lines {
+            reply(host, &line);
+        }
+    }
+
+    fn player_position(host: &dyn ServerHost, event: &RunModCommandEvent<'_>) -> Option<(PlayerRef, [f64; 3])> {
+        let CommandSource::Player { player, .. } = event.source.clone() else { return None };
+        Some((player, host.entity_position(player.entity())?))
+    }
+
+    fn info_command(&self, host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>, command: &str) {
+        let Some(shared) = self.shared.get() else { return Self::feedback(host, "§cTerraPlusMinus failed to start; see the server log.") };
+        let Some((_, [x, _, z])) = Self::player_position(&*host, event) else { return Self::feedback(host, "§cOnly players can use this command.") };
+        let config = shared.stack.config();
+        let projection = shared.stack.generator().projection().as_ref();
+        let lines = match command {
+            "where" => vec![messages::where_line(projection, x, z, &config.prefix)],
+            "offset" => messages::offset_lines(config, &config.prefix),
+            _ => vec![messages::distortion_message(projection, x, z)],
+        };
+        for line in lines {
+            Self::feedback(host, &line);
         }
     }
 
@@ -177,14 +190,16 @@ impl TerraPlusMinus {
         let Some(shared) = self.shared.get() else { return Self::feedback(host, "§cTerraPlusMinus failed to start; see the server log.") };
         let (Some(regions), Some(air)) = (self.regions.get(), self.air.get()) else { return Self::feedback(host, "§cThe world is not open yet.") };
         let CommandSource::Player { player, permission } = event.source.clone() else { return Self::feedback(host, "§cOnly players can use /tpll.") };
-        let Some(CommandArgumentValue::String(arguments)) = event.command.argument("coordinates").cloned() else { return Self::feedback(host, USAGE) };
         let config = shared.stack.config();
+        let prefix = config.prefix.as_str();
+        let Some(CommandArgumentValue::String(arguments)) = event.command.argument("coordinates").cloned() else { return Self::feedback(host, &messages::tpll_usage(prefix)) };
         let level = permission.level();
         let authorization = Authorization { sender_is_target: true, admin: level >= config.permissions.admin, may_generate_chunks: level >= config.permissions.tpll_ungenerated_chunks };
         let current = host.dimension_key_id(event.command.dimension);
         let world_name = match current {
             Some(name) if name == LEVEL_ID || config.linked_worlds.worlds.iter().any(|linked| linked.name == name) => name,
-            _ => LEVEL_ID.to_owned(),
+            _ if level >= config.permissions.tpll_other_world => LEVEL_ID.to_owned(),
+            _ => return Self::feedback(host, &format!("{prefix}§cYou cannot use /tpll in this world.")),
         };
         let (request, step) = {
             let world = HostWorld { host: &*host, regions, air };
@@ -195,14 +210,14 @@ impl TerraPlusMinus {
                 let Ok(mut pending) = self.pending.lock() else { return };
                 let table = pending.get_or_insert_with(|| PendingTeleports::new(config.max_pending_teleports, config.generation_wait));
                 match table.submit(player, request, &step, authorization, shared.stack.loader()) {
-                    Ok(()) => Self::feedback(host, "§7Loading terrain for /tpll..."),
+                    Ok(()) => {}
                     Err(refusal) => {
                         log(&format!("/tpll refused: {refusal:?}"));
-                        Self::feedback(host, "§cThis location is currently unavailable. Please try again later.");
+                        Self::feedback(host, &messages::unavailable(prefix));
                     }
                 }
             }
-            _ => Self::finish(host, player, step, &mut |host, line| Self::feedback(host, line)),
+            _ => Self::finish(host, player, step, prefix, &mut |host, line| Self::feedback(host, line)),
         }
     }
 
@@ -266,12 +281,17 @@ impl Hooks for TerraPlusMinus {
         let Some(shared) = self.shared.get() else { return };
         let permissions = shared.stack.config().permissions;
         event.commands.push(Command::op("tpll <coordinates:text>", permissions.tpll));
+        event.commands.push(Command::op("tpc <coordinates:text>", permissions.tpll));
+        for info in ["where", "offset", "distortion"] {
+            event.commands.push(Command::op(info, permissions.info_commands));
+        }
         event.commands.push(Command::op("terraplusminus status", permissions.diagnostics));
     }
 
     fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
         match event.command.literals.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-            ["tpll"] => self.tpll(host, event),
+            ["tpll"] | ["tpc"] => self.tpll(host, event),
+            [info @ ("where" | "offset" | "distortion")] => self.info_command(host, event, info),
             ["terraplusminus", "status"] => self.status(host),
             _ => return Flow::Continue,
         }
@@ -286,12 +306,13 @@ impl Hooks for TerraPlusMinus {
             let world = HostWorld { host: &*host, regions, air };
             table.poll(&shared.stack.config().linked_worlds, &world)
         };
+        let prefix = shared.stack.config().prefix.as_str();
         for (player, outcome) in finished {
             match outcome {
-                TeleportOutcome::Step(step) => Self::finish(host, player, step, &mut |host, line| Self::tell(host, player, line)),
+                TeleportOutcome::Step(step) => Self::finish(host, player, step, prefix, &mut |host, line| Self::tell(host, player, line)),
                 TeleportOutcome::Unavailable(reason) => {
                     log(&format!("/tpll surface lookup failed: {reason}"));
-                    Self::tell(host, player, "§cThis location is currently unavailable. Please try again later.");
+                    Self::tell(host, player, &messages::unavailable(prefix));
                 }
             }
         }

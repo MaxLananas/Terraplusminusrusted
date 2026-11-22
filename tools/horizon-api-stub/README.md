@@ -25,8 +25,12 @@ Paths are relative to `crates/horizon-mod-vocab/src` unless noted.
 | `Host::level`, `Host::chunk` | `host/entities.rs` (`EntitiesHost`), `host/levels.rs` (`LevelsHost`) |
 | `ServerHost::commands`, `ServerHost::world_dir` | `host/services.rs`, `host/config.rs` (`ConfigServerHost`) |
 | `LevelRef::height`, `LevelRef::block`, `DimensionKey::id`, `EntityRef::position`, `EntityRef::teleport_to_level`, `PlayerRef::tell` | backend methods `level_height`, `level_block`, `dimension_key_id`, `entity_position`, `entity_teleport_to_level`, `player_tell`, exposed as handle methods by `crates/horizon-mod-api-gen/src/host.rs::handle_method` (reads take `&dyn Host`, writes `&mut dyn ServerHost`) |
+| `LevelRef::online_players`, `PlayerRef::action_bar`, `PlayerRef::permission_level`, `LivingRef::equipment`, `ItemKey::id` | backend methods `level_online_players` (`host/levels.rs`, `LevelsBackend`), `player_action_bar` (`host/players.rs`, `PlayersBackendMut`), `player_permission_level` (`host/players.rs`, `PlayersBackend`), `living_equipment` (`host/living.rs`, `LivingBackend`), `item_key_id` (`host/keys.rs`, `KeysBackend`), by the same `handle_method` rule; the receiver is the handle type's snake-case name (`LivingRef` → `living`, `ItemKey` → `item_key`), as its `block_key_id` test shows |
+| `Host::living`, `LivingRef` | `host/living.rs` (`LivingHost`), `entity/types.rs` |
+| `ServerHost::players`, `Players` (`server_players`, `player_by_name`, `acting_player`) | `host/services.rs` (`ServicesServerHost`, `Players`) |
+| `ItemStack::item`, `ItemKey`, `EquipmentSlot` | `item/item_stack.rs`, `crates/horizon-core/src/equipment_slot.rs` |
 | `Command`, `PermissionLevel` | `command/types.rs` |
-| `CommandSource`, `CommandInvocation`, `CommandArgumentValue` | `command/mod.rs` (variants beyond those used omitted; all are `non_exhaustive`) |
+| `CommandSource`, `CommandInvocation`, `CommandArgumentValue` | `command/mod.rs`: every `CommandSource` variant; `CommandArgumentValue` up to `Players` (later variants omitted; it is `non_exhaustive`); `Identifier` is opaque here |
 | `RunModCommandEvent { source: &CommandSource, command: &CommandInvocation }` | generated; field types from `crates/horizon-client/src/game/native_hooks/base.rs::native_run_mod_command` |
 | `ServerTickEvent { phase }`, `ServerTickPhase` | generated; `world/types.rs`, `crates/horizon-mod-dimension-game/src/main.rs` |
 | `Text`, `TextStyle`, `TextClick`, `TextHover` | `text/mod.rs` (`TextContent::Literal` does not interpret legacy `§` codes) |

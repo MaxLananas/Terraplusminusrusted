@@ -253,15 +253,37 @@ impl TerrainGenerator {
         level_seed: i64,
         neighbour: &mut dyn FnMut(i32, i32) -> Option<Arc<ChunkTerrain>>,
     ) -> Vec<(usize, i32, usize, Block)> {
+        self.tree_blocks_at(chunk_x, chunk_z, world, level_seed, self.settings.y_offset, neighbour)
+    }
+
+    /// [`TerrainGenerator::tree_blocks`] for a level whose terrain sits at `y_offset` (a linked
+    /// level) instead of the configured `terrain_offset.y`.
+    pub fn tree_blocks_at(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        world: WorldHeight,
+        level_seed: i64,
+        y_offset: i32,
+        neighbour: &mut dyn FnMut(i32, i32) -> Option<Arc<ChunkTerrain>>,
+    ) -> Vec<(usize, i32, usize, Block)> {
         let Some((populator, _)) = &self.trees else { return Vec::new() };
-        populator.blocks_in_chunk(chunk_x, chunk_z, world, level_seed, neighbour, &|x, z| self.koppen_class_at_block(x, z))
+        let climate = |x: i32, z: i32| self.koppen_class_at_block(x, z);
+        if y_offset == self.settings.y_offset {
+            return populator.blocks_in_chunk(chunk_x, chunk_z, world, level_seed, neighbour, &climate);
+        }
+        populator.with_y_offset(y_offset).blocks_in_chunk(chunk_x, chunk_z, world, level_seed, neighbour, &climate)
     }
 
     /// `generateNoise` followed by `generateSurface` for one chunk. Height arithmetic is Java's
     /// wrapping `int` arithmetic: saturated heights (a ±inf layer) must not panic in builds with
     /// overflow checks, and must behave as upstream does in all builds.
     pub fn fill_chunk(&self, terrain: &ChunkTerrain, chunk_x: i32, chunk_z: i32, world: WorldHeight, sink: &mut dyn ColumnSink) {
-        let y_offset = self.settings.y_offset;
+        self.fill_chunk_at(terrain, chunk_x, chunk_z, world, self.settings.y_offset, sink);
+    }
+
+    /// [`TerrainGenerator::fill_chunk`] with the terrain at `y_offset`: a linked level's offset.
+    pub fn fill_chunk_at(&self, terrain: &ChunkTerrain, chunk_x: i32, chunk_z: i32, world: WorldHeight, y_offset: i32, sink: &mut dyn ColumnSink) {
         let min_surface_cube = world.min_y.wrapping_sub(y_offset) >> 4;
         let fill_noise = !terrain.above_surface(min_surface_cube);
         let top = world.max_y - 1;

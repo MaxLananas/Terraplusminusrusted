@@ -77,6 +77,24 @@ pub struct LinkedWorlds {
     pub worlds: Vec<LinkedWorld>,
 }
 
+impl LinkedWorlds {
+    /// Linked levels on this server are in use (`enabled` with the `MULTIVERSE` method).
+    pub fn levels_active(&self) -> bool {
+        self.enabled && self.method == LinkedWorldsMethod::Levels
+    }
+
+    /// The position of `name` in the list, matched without case as upstream's
+    /// `LinkedWorldLayout.indexOf` and `ConfigurationHelper` do.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.worlds.iter().position(|candidate| candidate.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The Y offset of the linked level `name` while linked levels are active.
+    pub fn offset_of(&self, name: &str) -> Option<i32> {
+        self.levels_active().then(|| self.index_of(name).map(|index| self.worlds[index].offset)).flatten()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Authorization {
     pub sender_is_target: bool,
@@ -168,7 +186,7 @@ impl TpllRequest {
             return (Some(request), step);
         }
         if linked.method == LinkedWorldsMethod::Levels
-            && linked.worlds.iter().any(|candidate| candidate.name.eq_ignore_ascii_case(world_name))
+            && linked.index_of(world_name).is_some()
             && world.is_chunk_generated(world_name, chunk_of(x.round() as i32), chunk_of(z.round() as i32))
             && let (Some(highest), Some(height)) = (world.highest_block_y(world_name, fx, fz), world.level_height(world_name))
             && highest < height.max_y - 1
@@ -209,7 +227,7 @@ impl TpllRequest {
         if !linked.enabled || linked.method != LinkedWorldsMethod::Levels || depth >= linked.worlds.len() {
             return TpllStep::Unreachable;
         }
-        let Some(index) = linked.worlds.iter().position(|candidate| candidate.name == world_name) else { return TpllStep::Unreachable };
+        let Some(index) = linked.index_of(world_name) else { return TpllStep::Unreachable };
         let next = if upward { linked.worlds.get(index + 1) } else { index.checked_sub(1).and_then(|previous| linked.worlds.get(previous)) };
         let Some(next) = next else { return TpllStep::Unreachable };
         let Some(height) = world.level_height(&next.name) else { return TpllStep::LinkedWorldUnavailable { world: next.name.clone() } };
@@ -238,6 +256,23 @@ impl TpllRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_levels_are_found_without_case() {
+        let mut linked = LinkedWorlds {
+            enabled: true,
+            method: LinkedWorldsMethod::Levels,
+            worlds: vec![LinkedWorld { name: "terraplusminus:earth".into(), offset: 0 }, LinkedWorld { name: "terraplusminus:sky".into(), offset: -2032 }],
+        };
+        assert_eq!(linked.index_of("TerraPlusMinus:Sky"), Some(1));
+        assert_eq!(linked.offset_of("TERRAPLUSMINUS:SKY"), Some(-2032));
+        assert_eq!(linked.offset_of("minecraft:overworld"), None);
+        linked.enabled = false;
+        assert_eq!(linked.offset_of("terraplusminus:sky"), None, "only while linked levels are active");
+        linked.enabled = true;
+        linked.method = LinkedWorldsMethod::Servers;
+        assert!(!linked.levels_active());
+    }
 
     #[test]
     fn splits_like_java() {

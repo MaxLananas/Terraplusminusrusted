@@ -17,6 +17,12 @@ pub fn scratch(name: &str) -> PathBuf {
 }
 
 pub fn stack(name: &str, extra: &str) -> (TerraStack, PathBuf) {
+    let (config, directory) = config(name, extra);
+    (TerraStack::build(config, &directory).unwrap(), directory)
+}
+
+/// The configuration [`stack`] builds, and its scratch directory.
+pub fn config(name: &str, extra: &str) -> (terra_server::ServerConfig, PathBuf) {
     let directory = scratch(name);
     std::fs::create_dir_all(directory.join("osm")).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/elevation/terrarium");
@@ -46,6 +52,6 @@ pub fn stack(name: &str, extra: &str) -> (TerraStack, PathBuf) {
         tree_cover.display()
     ))
     .unwrap();
-    (TerraStack::build(config, &directory).unwrap(), directory)
+    (config, directory)
 }
 

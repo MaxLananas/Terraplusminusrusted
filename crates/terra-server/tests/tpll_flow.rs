@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use terra_server::{Authorization, LevelHeight, PendingTeleports, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep};
 
 const CANYON: &str = "35.995, -113.247";
+const EARTH: &str = "terraplusminus:earth";
+const SKY: &str = "terraplusminus:sky";
 
 #[derive(Default)]
 struct World {
@@ -38,7 +40,7 @@ fn world(levels: &[(&str, i32, i32)]) -> World {
 
 fn start(stack: &TerraStack, arguments: &str, authorization: Authorization, world: &World) -> (Option<TpllRequest>, TpllStep) {
     let config = stack.config();
-    TpllRequest::start(arguments, "earth", stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, config.generator.y_offset, world)
+    TpllRequest::start(arguments, EARTH, stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, config.generator.y_offset, world)
 }
 
 fn wait_for(pending: &mut PendingTeleports<u32>, stack: &TerraStack, world: &World) -> TeleportOutcome {
@@ -55,7 +57,7 @@ fn wait_for(pending: &mut PendingTeleports<u32>, stack: &TerraStack, world: &Wor
 #[test]
 fn teleports_onto_the_generated_surface() {
     let (stack, directory) = stack("surface", "");
-    let world = world(&[("earth", -64, 2032)]);
+    let world = world(&[(EARTH, -64, 2032)]);
     let (request, step) = start(&stack, CANYON, PLAYER, &world);
     let TpllStep::NeedsSurface { chunk_x, chunk_z, local_x, local_z } = step.clone() else { panic!("{step:?}") };
     let mut pending = PendingTeleports::new(4, Duration::from_secs(30));
@@ -63,7 +65,7 @@ fn teleports_onto_the_generated_surface() {
     let TeleportOutcome::Step(TpllStep::Teleport { world: level, y, reported_height, .. }) = wait_for(&mut pending, &stack, &world) else { panic!() };
     let terrain = stack.loader().load_blocking(chunk_x, chunk_z, Duration::from_secs(1)).unwrap();
     let surface = terrain.surface_height(local_x, local_z);
-    assert_eq!((level.as_str(), y as i32, reported_height), ("earth", surface + 1, surface + 1));
+    assert_eq!((level.as_str(), y as i32, reported_height), (EARTH, surface + 1, surface + 1));
     assert!((600..2200).contains(&surface));
     assert!(directory.join("tile-cache/v1").is_dir());
     assert_eq!(stack.verify_world(&directory.join("world")).unwrap(), terra_chunk_generation::FingerprintStatus::Created);
@@ -72,7 +74,7 @@ fn teleports_onto_the_generated_surface() {
 #[test]
 fn enforces_authorization_and_bounds() {
     let (stack, _) = stack("authorization", r#", "min_latitude": 46.9, "max_latitude": 55.3, "min_longitude": 1.9, "max_longitude": 15.6"#);
-    let world = world(&[("earth", -64, 2032)]);
+    let world = world(&[(EARTH, -64, 2032)]);
     assert_eq!(start(&stack, "not coordinates", PLAYER, &world).1, TpllStep::Usage);
     assert_eq!(start(&stack, CANYON, PLAYER, &world).1, TpllStep::OutsideTeamBounds);
     let admin = Authorization { admin: true, ..PLAYER };
@@ -87,20 +89,20 @@ fn enforces_authorization_and_bounds() {
 
 #[test]
 fn explicit_heights_route_through_linked_worlds() {
-    let linked = r#", "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "earth", "offset": 0}, {"name": "sky", "offset": -2032}]}"#;
+    let linked = r#", "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "terraplusminus:earth", "offset": 0}, {"name": "Terraplusminus:Sky", "offset": -2032}]}"#;
     let (stack, _) = stack("linked", linked);
-    let world = world(&[("earth", -64, 2032), ("sky", -64, 2032)]);
+    let world = world(&[(EARTH, -64, 2032), (SKY, -64, 2032)]);
     let TpllStep::Teleport { world: level, y, .. } = start(&stack, "35.995 -113.247 100", PLAYER, &world).1 else { panic!() };
-    assert_eq!((level.as_str(), y), ("earth", 100.0));
+    assert_eq!((level.as_str(), y), (EARTH, 100.0));
     let TpllStep::Teleport { world: level, y, reported_height, .. } = start(&stack, "35.995 -113.247 3000", PLAYER, &world).1 else { panic!() };
-    assert_eq!((level.as_str(), y, reported_height), ("sky", 3000.0 - 2032.0 + 1.0, 3000));
+    assert_eq!((level.as_str(), y, reported_height), (SKY, 3000.0 - 2032.0 + 1.0, 3000));
     assert_eq!(start(&stack, "35.995 -113.247 9000", PLAYER, &world).1, TpllStep::Unreachable);
 }
 
 #[test]
 fn pending_teleports_are_bounded_and_replaceable() {
     let (stack, _) = stack("bounded", "");
-    let world = world(&[("earth", -64, 2032)]);
+    let world = world(&[(EARTH, -64, 2032)]);
     let mut pending = PendingTeleports::new(1, Duration::from_secs(30));
     let (request, step) = start(&stack, CANYON, PLAYER, &world);
     pending.submit(1, request.clone().unwrap(), &step, PLAYER, stack.loader()).unwrap();
@@ -116,7 +118,7 @@ fn the_exclusive_top_of_the_world_is_a_valid_feet_position() {
     // `getMaxHeight()` the same way (`TpllCommand`: `mcCoords.getBlockY() > tpWorld.getMaxHeight()`).
     // Feet at max_y stand on the topmost block (max_y - 1); one higher is outside the world.
     let (stack, _) = stack("top-boundary", "");
-    let world = world(&[("earth", -64, 2032)]);
+    let world = world(&[(EARTH, -64, 2032)]);
     let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 2032", PLAYER, &world).1 else { panic!("feet at max_y must teleport") };
     assert_eq!(y, 2032.0);
     assert_eq!(start(&stack, "35.995 -113.247 2033", PLAYER, &world).1, TpllStep::Unreachable);

@@ -284,8 +284,16 @@ impl<S: Copy, W: BlockWriter<S>> ColumnSink for PaletteSink<'_, S, W> {
 }
 
 pub fn write_chunk<S: Copy, W: BlockWriter<S>>(stack: &TerraStack, terrain: &ChunkTerrain, chunk_x: i32, chunk_z: i32, world: WorldHeight, palette: &mut BlockPalette<S>, writer: &mut W) {
+    let target = TreeTarget { chunk_x, chunk_z, world, level_seed: 0, y_offset: stack.config().generator.y_offset };
+    write_chunk_at(stack, terrain, target, palette, writer);
+}
+
+/// [`write_chunk`] for the level `target` describes, at its Y offset (linked levels share one
+/// stack and differ only in their offset).
+pub fn write_chunk_at<S: Copy, W: BlockWriter<S>>(stack: &TerraStack, terrain: &ChunkTerrain, target: TreeTarget, palette: &mut BlockPalette<S>, writer: &mut W) {
+    let TreeTarget { chunk_x, chunk_z, world, y_offset, .. } = target;
     let mut sink = PaletteSink { palette, writer, base_x: chunk_x.wrapping_shl(4), base_z: chunk_z.wrapping_shl(4) };
-    stack.generator().fill_chunk(terrain, chunk_x, chunk_z, world, &mut sink);
+    stack.generator().fill_chunk_at(terrain, chunk_x, chunk_z, world, y_offset, &mut sink);
 }
 
 /// The chunk an engine asks for, with what tree placement needs to know about the world.
@@ -296,6 +304,8 @@ pub struct TreeTarget {
     pub world: WorldHeight,
     /// The world seed, which Paper feeds to every Bukkit `BlockPopulator`.
     pub level_seed: i64,
+    /// Where the level places real-world height 0: `terrain_offset.y`, or a linked level's offset.
+    pub y_offset: i32,
 }
 
 /// `TreePopulator` for a chunk whose terrain is already written: the trees of the chunk and the
@@ -315,7 +325,7 @@ pub fn write_trees<S: Copy, W: BlockWriter<S>>(
     if stack.generator().trees().is_none() {
         return Ok(0);
     }
-    let TreeTarget { chunk_x, chunk_z, world, level_seed } = target;
+    let TreeTarget { chunk_x, chunk_z, world, level_seed, y_offset } = target;
     // Neighbour data is needed in full: a tree must not be cut off because a neighbour failed.
     let mut failure = None;
     let mut neighbour = |x: i32, z: i32| -> Option<Arc<ChunkTerrain>> {
@@ -333,7 +343,7 @@ pub fn write_trees<S: Copy, W: BlockWriter<S>>(
             }
         }
     };
-    let blocks = stack.generator().tree_blocks(chunk_x, chunk_z, world, level_seed, &mut neighbour);
+    let blocks = stack.generator().tree_blocks_at(chunk_x, chunk_z, world, level_seed, y_offset, &mut neighbour);
     if let Some(failure) = failure {
         return Err(failure);
     }

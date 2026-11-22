@@ -167,13 +167,18 @@ pub struct PlacedTree {
 /// `TreePopulator` with its settings: the schematics and the world's Y offset.
 #[derive(Debug, Clone)]
 pub struct TreePopulator {
-    library: TreeLibrary,
+    library: std::sync::Arc<TreeLibrary>,
     y_offset: i32,
 }
 
 impl TreePopulator {
     pub fn new(library: TreeLibrary, y_offset: i32) -> Self {
-        Self { library, y_offset }
+        Self { library: std::sync::Arc::new(library), y_offset }
+    }
+
+    /// The same populator for a level with another Y offset (linked levels share one library).
+    pub fn with_y_offset(&self, y_offset: i32) -> Self {
+        Self { library: std::sync::Arc::clone(&self.library), y_offset }
     }
 
     pub fn library(&self) -> &TreeLibrary {

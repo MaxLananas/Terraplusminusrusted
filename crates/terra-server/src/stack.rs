@@ -54,6 +54,30 @@ impl TileFetcher for SharedFetcher {
     }
 }
 
+/// Where the stack writes operator messages (fetch logging).
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// `reduced_console_messages: false`: every fetch and its outcome is logged, as TerraMinusMinus'
+/// `Http` and `Disk` log cache hits, misses and failures.
+struct LoggingFetcher {
+    inner: Arc<dyn TileFetcher>,
+    log: LogSink,
+}
+
+impl TileFetcher for LoggingFetcher {
+    fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
+        let started = std::time::Instant::now();
+        let result = self.inner.fetch(url);
+        let elapsed = started.elapsed().as_millis();
+        match &result {
+            Ok(FetchOutcome::Found(bytes)) => (self.log)(&format!("Fetched {url}: {} bytes in {elapsed} ms", bytes.len())),
+            Ok(FetchOutcome::Missing) => (self.log)(&format!("Not found: {url} ({elapsed} ms)")),
+            Err(error) => (self.log)(&format!("Request failed: {url}: {error} ({elapsed} ms)")),
+        }
+        result
+    }
+}
+
 /// Refuses sources none of whose URLs this build can fetch, naming each with the fixes.
 fn check_sources<T: terra_acquisition::HttpTransport>(routing: &RoutingFetcher<T>, sources: &[(String, Vec<String>)]) -> Result<(), StackError> {
     let mut problems = Vec::new();
@@ -86,8 +110,13 @@ pub struct TerraStack {
 }
 
 impl TerraStack {
-    /// Relative paths in `config` resolve against `base_directory`.
+    /// Relative paths in `config` resolve against `base_directory`. Messages go to stderr.
     pub fn build(config: ServerConfig, base_directory: &Path) -> Result<Self, StackError> {
+        Self::build_logged(config, base_directory, Arc::new(|message: &str| eprintln!("[terraplusminus] {message}")))
+    }
+
+    /// As [`TerraStack::build`], with operator messages sent to `log`.
+    pub fn build_logged(config: ServerConfig, base_directory: &Path, log: LogSink) -> Result<Self, StackError> {
         let heights_text = match &config.heights_config {
             Some(path) => {
                 let path = base_directory.join(path);
@@ -134,6 +163,7 @@ impl TerraStack {
             }
             None => Arc::new(routing),
         };
+        let fetcher: Arc<dyn TileFetcher> = if config.reduced_console_messages { fetcher } else { Arc::new(LoggingFetcher { inner: fetcher, log }) };
         let provider = Arc::new(CachingTileProvider::new(SharedFetcher(Arc::clone(&fetcher)), network.memory_cache_tiles));
         let koppen = if config.generator.use_biome_dataset { Some(KoppenMap::embedded().map_err(|error| StackError::Biomes(error.to_string()))?) } else { None };
         let projection = terra_projection::terraplusminus_projection(config.generator.x_offset, config.generator.z_offset).map_err(|error| StackError::Projection(error.to_string()))?;
@@ -209,6 +239,11 @@ impl TerraStack {
     /// Records the fingerprint for a new world, or refuses a world generated differently.
     pub fn verify_world(&self, world_directory: &Path) -> Result<FingerprintStatus, FingerprintError> {
         verify_or_record(world_directory, &self.fingerprint)
+    }
+
+    /// [`TerraStack::verify_world`] for a level generated at `y_offset` (a linked level).
+    pub fn verify_level(&self, level_directory: &Path, y_offset: i32) -> Result<FingerprintStatus, FingerprintError> {
+        verify_or_record(level_directory, &self.fingerprint.clone().with_y_offset(y_offset))
     }
 
     /// Stops generation work: the loader refuses new requests and releases every waiter.

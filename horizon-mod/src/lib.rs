@@ -1,6 +1,7 @@
 //! TerraPlusMinus on Horizon: a chunk generator and biome source over the terra crates, the
-//! `terraplusminus:earth` dimension, `/tpll` (`/tpc`), `/where`, `/offset`, `/distortion` and
-//! `/terraplusminus status`.
+//! `terraplusminus:earth` dimension (and one `terraplusminus:<name>` dimension per linked level,
+//! at its offset), `/tpll` and `/tpll -p <players>` (`/tpc`), `/where`, `/offset`,
+//! `/distortion`, `/terraplusminus status` and the height in the action bar.
 //!
 //! Generation runs on Horizon's worldgen workers and waits there for real elevation data; the
 //! server tick only polls finished work. The world's generation fingerprint is checked when the
@@ -16,25 +17,28 @@
 #![deny(unsafe_code)]
 
 use mod_api::{
-    BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, Flow, Host, Hooks, InstanceDirectory,
-    LevelLoadEvent, PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, ServerTickEvent,
-    ServerTickPhase, StateConstraint, Text, TextClick, TextHover, TextStyle,
+    BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, EquipmentSlot, Flow, Host, Hooks,
+    InstanceDirectory, LevelLoadEvent, PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, StateConstraint, Text, TextClick, TextHover, TextStyle,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use terra_chunk_generation::WorldHeight;
 use terra_server::{
-    Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationFailure, LevelHeight, PendingTeleports, RegionIndex,
+    Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationFailure, LevelHeight, LevelPlan, PendingTeleports, RegionIndex,
     ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, extract_default_osm_mapping, messages, messages::{ChatMessage, legacy_spans}, parse_server_config,
-    split_block_state, terrain_for_generation, write_chunk, write_trees, TreeTarget,
+    split_block_state, terrain_for_generation, write_chunk_at, write_trees, TreeTarget,
 };
 
-const MOD_ID: &str = "terraplusminus";
-const DIMENSION: &str = "earth";
+const MOD_ID: &str = terra_server::MOD_NAMESPACE;
 const LEVEL_ID: &str = "terraplusminus:earth";
 const CONFIG_FILE: &str = "config/terraplusminus/terraplusminus.json5";
+/// `PlayerMoveEvent.startKeepActionBarAlive`: the action bar is resent every 20 ticks.
+const ACTIONBAR_PERIOD_TICKS: u64 = 20;
+const DEBUG_STICK: &str = "minecraft:debug_stick";
 
 struct Shared {
     stack: TerraStack,
@@ -85,7 +89,9 @@ fn load_shared(context: &RegistrationContext) -> Result<Shared, String> {
 struct EarthGenerator {
     shared: Arc<Shared>,
     /// Every block the generator can place, by block state string, resolved at registration.
-    blocks: Vec<RegisteredBlock>,
+    blocks: Arc<Vec<RegisteredBlock>>,
+    /// The level's Y offset: `terrain_offset.y`, or its linked offset.
+    y_offset: i32,
 }
 
 struct RegisteredBlock {
@@ -156,9 +162,9 @@ impl EarthGenerator {
         });
         let level_seed = chunk.seed();
         let mut writer = AccessWriter { chunk, refused: 0 };
-        write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut writer);
+        let target = TreeTarget { chunk_x: position.x, chunk_z: position.z, world, level_seed, y_offset: self.y_offset };
+        write_chunk_at(&shared.stack, &terrain, target, &mut palette, &mut writer);
         // Trees come after the terrain and may overwrite it, as upstream's populator does.
-        let target = TreeTarget { chunk_x: position.x, chunk_z: position.z, world, level_seed };
         write_trees(&shared.stack, &shared.control, &terrain, target, &mut palette, &mut writer, &mut |message| log(&message))?;
         let missing = missing.lock().map_err(|_| GenerationFailure::Internal("palette lock poisoned".into()))?;
         if !missing.is_empty() {
@@ -205,9 +211,12 @@ impl BiomeSource for EarthBiomes {
     }
 }
 
+/// The saved-chunk index of each level of this mod, by level id.
+type LevelRegions = Vec<(String, RegionIndex)>;
+
 struct HostWorld<'a> {
     host: &'a dyn Host,
-    regions: &'a RegionIndex,
+    regions: &'a LevelRegions,
     air: &'a [BlockKey],
 }
 
@@ -220,7 +229,7 @@ impl TeleportWorld for HostWorld<'_> {
 
     fn is_chunk_generated(&self, world: &str, chunk_x: i32, chunk_z: i32) -> bool {
         let loaded = self.host.level(world).and_then(|level| self.host.chunk(level, [chunk_x, chunk_z])).is_some();
-        loaded || (world == LEVEL_ID && self.regions.chunk_saved(chunk_x, chunk_z).unwrap_or(false))
+        loaded || self.regions.iter().any(|(level, regions)| level == world && regions.chunk_saved(chunk_x, chunk_z).unwrap_or(false))
     }
 
     fn highest_block_y(&self, world: &str, x: i32, z: i32) -> Option<i32> {
@@ -261,12 +270,40 @@ fn chat_text(message: &ChatMessage) -> Text {
     }
 }
 
+/// Who a `/tpll` teleports and what they may do.
+struct TpllTarget {
+    player: PlayerRef,
+    authorization: Authorization,
+    /// The target's level, when it is one of this mod's.
+    level: Option<String>,
+    /// `t+-.tpll.otherWorld` (of the target, as upstream checks it): from another level, go to
+    /// the earth level instead of refusing.
+    other_world: bool,
+}
+
+/// The height last shown in a player's action bar, and when.
+type ActionBarState = HashMap<PlayerRef, (String, u64)>;
+
 #[derive(Default)]
 pub struct TerraPlusMinus {
     shared: OnceLock<Arc<Shared>>,
-    regions: OnceLock<RegionIndex>,
+    regions: OnceLock<LevelRegions>,
     air: OnceLock<Vec<BlockKey>>,
     pending: Mutex<Option<PendingTeleports<PlayerRef>>>,
+    ticks: AtomicU64,
+    actionbar: Mutex<ActionBarState>,
+}
+
+/// The level of this mod `player` is in, by asking each level for its players.
+fn player_level(host: &dyn Host, levels: &[LevelPlan], player: PlayerRef) -> Option<String> {
+    levels
+        .iter()
+        .find(|level| host.level(&level.id).and_then(|handle| handle.online_players(host)).is_some_and(|players| players.contains(&player)))
+        .map(|level| level.id.clone())
+}
+
+fn holds_debug_stick(host: &dyn Host, player: PlayerRef) -> bool {
+    host.living(player.entity()).and_then(|living| living.equipment(host, EquipmentSlot::MainHand)).is_some_and(|stack| stack.item().id(host) == DEBUG_STICK)
 }
 
 impl TerraPlusMinus {
@@ -314,24 +351,64 @@ impl TerraPlusMinus {
         }
     }
 
+    /// `/tpll <coordinates>` for the player who ran it, or `/tpll -p <players> <coordinates>`
+    /// for each selected player (`t+-.forcetpll`, from any source).
     fn tpll(&self, host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) {
         let Some(shared) = self.shared.get() else { return Self::feedback(host, "§cTerraPlusMinus failed to start; see the server log.") };
-        let (Some(regions), Some(air)) = (self.regions.get(), self.air.get()) else { return Self::feedback(host, "§cThe world is not open yet.") };
-        let CommandSource::Player { player, permission } = event.source.clone() else { return Self::feedback(host, "§cOnly players can use /tpll.") };
         let config = shared.stack.config();
         let prefix = config.prefix.as_str();
         let Some(CommandArgumentValue::String(arguments)) = event.command.argument("coordinates").cloned() else { return Self::feedback(host, &messages::tpll_usage(prefix)) };
-        let level = permission.level();
-        let authorization = Authorization { sender_is_target: true, admin: level >= config.permissions.admin, may_generate_chunks: level >= config.permissions.tpll_ungenerated_chunks };
-        let current = event.command.dimension.id(&*host);
-        let world_name = match current {
-            Some(name) if name == LEVEL_ID || config.linked_worlds.worlds.iter().any(|linked| linked.name == name) => name,
-            _ if level >= config.permissions.tpll_other_world => LEVEL_ID.to_owned(),
-            _ => return Self::feedback(host, &format!("{prefix}§cYou cannot use /tpll in this world.")),
+        let sender_level = event.source.permission().level();
+        let admin = sender_level >= config.permissions.admin;
+        match event.command.argument("targets").cloned() {
+            Some(CommandArgumentValue::Players(targets)) => {
+                // The usage is registered at this level; checked again as upstream's `requires` is.
+                if sender_level < config.permissions.forcetpll {
+                    return Self::feedback(host, &messages::tpll_usage(prefix));
+                }
+                let levels = config.levels();
+                for player in &targets {
+                    let target_level = player.permission_level(&*host).unwrap_or(0);
+                    let target = TpllTarget {
+                        player: *player,
+                        authorization: Authorization { sender_is_target: false, admin, may_generate_chunks: target_level >= config.permissions.tpll_ungenerated_chunks },
+                        level: player_level(&*host, &levels, *player),
+                        other_world: target_level >= config.permissions.tpll_other_world,
+                    };
+                    self.tpll_for(host, shared, &arguments, target);
+                }
+                Self::feedback(host, &messages::forced_tpll_summary(targets.len(), prefix));
+            }
+            Some(_) => Self::feedback(host, &messages::tpll_usage(prefix)),
+            None => {
+                let CommandSource::Player { player, .. } = event.source.clone() else { return Self::feedback(host, "§cOnly players can use /tpll.") };
+                let current = event.command.dimension.id(&*host).map(|id| id.to_ascii_lowercase());
+                let level = current.filter(|id| config.levels().iter().any(|level| &level.id == id));
+                let target = TpllTarget {
+                    player,
+                    authorization: Authorization { sender_is_target: true, admin, may_generate_chunks: sender_level >= config.permissions.tpll_ungenerated_chunks },
+                    level,
+                    other_world: sender_level >= config.permissions.tpll_other_world,
+                };
+                self.tpll_for(host, shared, &arguments, target);
+            }
+        }
+    }
+
+    fn tpll_for(&self, host: &mut dyn ServerHost, shared: &Shared, arguments: &str, target: TpllTarget) {
+        let (Some(regions), Some(air)) = (self.regions.get(), self.air.get()) else { return Self::feedback(host, "§cThe world is not open yet.") };
+        let config = shared.stack.config();
+        let prefix = config.prefix.as_str();
+        let TpllTarget { player, authorization, level, other_world } = target;
+        let world_name = match level {
+            Some(name) => name,
+            None if other_world => LEVEL_ID.to_owned(),
+            None => return Self::feedback(host, &format!("{prefix}§cYou cannot use /tpll in this world.")),
         };
+        let y_offset = config.level_offset(&world_name);
         let (request, step) = {
             let world = HostWorld { host: &*host, regions, air };
-            TpllRequest::start(&arguments, &world_name, shared.stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, config.generator.y_offset, &world)
+            TpllRequest::start(arguments, &world_name, shared.stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, y_offset, &world)
         };
         match (request, &step) {
             // The target chunk is not generated yet: refuse while generation cannot produce it,
@@ -355,23 +432,78 @@ impl TerraPlusMinus {
         }
     }
 
-    /// Checks the world's generation fingerprint once and opens or refuses generation; also
-    /// opens the region index used by `/tpll`. Without a world directory generation fails rather
-    /// than waiting.
+    /// Checks the generation fingerprint of every level of this mod once and opens or refuses
+    /// generation; also opens the region indexes used by `/tpll`. The earth level keeps its
+    /// fingerprint in `horizon-mod-data/terraplusminus`, a linked level in
+    /// `horizon-mod-data/terraplusminus/levels/<name>`, each with that level's Y offset. One level
+    /// refused closes generation for all, as they share the generator. Without a world directory
+    /// generation fails rather than waiting.
     fn check_fingerprint(&self, host: &mut dyn ServerHost) {
         let Some(shared) = self.shared.get() else { return };
         let Some(world_directory) = host.world_dir() else {
             shared.control.gate.set(GateState::Failed("the world directory is unavailable, so the generation fingerprint cannot be checked".into()));
             return log("generation disabled: the world directory is unavailable");
         };
-        let _ = self.regions.set(RegionIndex::new(world_directory.join("dimensions").join(MOD_ID).join(DIMENSION).join("region"), 256, Duration::from_secs(2)));
+        let levels = shared.stack.config().levels();
+        let dimensions = world_directory.join("dimensions").join(MOD_ID);
+        let _ = self.regions.set(levels.iter().map(|level| (level.id.clone(), RegionIndex::new(dimensions.join(&level.path).join("region"), 256, Duration::from_secs(2)))).collect());
         if shared.control.gate.state() != GateState::AwaitingFingerprint {
             return;
         }
-        let status = shared.stack.verify_world(&world_directory.join("horizon-mod-data").join(MOD_ID));
+        let data = world_directory.join("horizon-mod-data").join(MOD_ID);
+        let mut status = None;
+        for level in &levels {
+            let directory = if level.id == LEVEL_ID { data.clone() } else { data.join("levels").join(&level.path) };
+            let level_status = shared.stack.verify_level(&directory, level.y_offset);
+            if level_status.is_err() {
+                log(&format!("level {}: generation fingerprint refused", level.id));
+                status = Some(level_status);
+                break;
+            }
+            if status.is_none() {
+                status = Some(level_status);
+            }
+        }
+        let Some(status) = status else { return };
         match shared.control.gate.apply_fingerprint(&status) {
             GateState::Refused(reason) => log(&format!("generation refused: {reason}")),
             state => log(&format!("generation fingerprint {status:?}: {state:?}")),
+        }
+    }
+
+    /// `height_in_actionbar`: every online player sees `<height>m` in bold, refreshed when their
+    /// block Y changes (upstream updates on each move) and every 20 ticks, except while holding
+    /// a debug stick in the main hand.
+    fn update_action_bars(&self, host: &mut dyn ServerHost, shared: &Shared, tick: u64) {
+        let config = shared.stack.config();
+        let levels = config.levels();
+        let mut level_of: HashMap<PlayerRef, String> = HashMap::new();
+        for level in &levels {
+            for player in host.level(&level.id).and_then(|handle| handle.online_players(&*host)).unwrap_or_default() {
+                level_of.insert(player, level.id.clone());
+            }
+        }
+        let players = host.players().server_players();
+        let Ok(mut shown) = self.actionbar.lock() else { return };
+        shown.retain(|player, _| players.contains(player));
+        for player in players {
+            let Some([_, y, _]) = player.entity().position(&*host) else { continue };
+            if holds_debug_stick(&*host, player) {
+                shown.remove(&player);
+                continue;
+            }
+            let height = messages::actionbar_height(y, config.actionbar_offset(level_of.get(&player).map(String::as_str)));
+            let due = match shown.get(&player) {
+                Some((last, at)) => *last != height || tick.saturating_sub(*at) >= ACTIONBAR_PERIOD_TICKS,
+                None => true,
+            };
+            if !due {
+                continue;
+            }
+            let mut style = TextStyle::default();
+            style.bold = Some(true);
+            let _ = player.action_bar(host, Text::literal(height.clone()).with_style(style));
+            shown.insert(player, (height, tick));
         }
     }
 
@@ -418,27 +550,36 @@ impl Hooks for TerraPlusMinus {
             return;
         }
         let _ = self.air.set(["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].into_iter().map(|name| registrar.block_key(name)).collect());
-        registrar.register_chunk_generator(DIMENSION, EarthGenerator { shared: Arc::clone(&shared), blocks });
-        registrar.register_biome_source(DIMENSION, EarthBiomes { shared: Arc::clone(&shared), lookup: BiomeLookup::default() });
-        registrar.register_dimension(
-            DIMENSION,
-            DimensionSettings {
-                min_y: world.min_y,
-                height: world.max_y - world.min_y,
-                logical_height: world.max_y - world.min_y,
-                generator: LEVEL_ID.into(),
-                mod_biome_source: Some(LEVEL_ID.into()),
-                sea_level: Some(63 + shared.stack.config().generator.y_offset),
-                ..Default::default()
-            },
-        );
+        let blocks = Arc::new(blocks);
+        // One dimension per level, sharing the data stack; they differ only in their Y offset,
+        // as upstream's linked worlds each run a RealWorldGenerator with their own offset.
+        for level in shared.stack.config().levels() {
+            registrar.register_chunk_generator(&level.path, EarthGenerator { shared: Arc::clone(&shared), blocks: Arc::clone(&blocks), y_offset: level.y_offset });
+            registrar.register_biome_source(&level.path, EarthBiomes { shared: Arc::clone(&shared), lookup: BiomeLookup::default() });
+            registrar.register_dimension(
+                &level.path,
+                DimensionSettings {
+                    min_y: world.min_y,
+                    height: world.max_y - world.min_y,
+                    logical_height: world.max_y - world.min_y,
+                    generator: level.id.clone(),
+                    mod_biome_source: Some(level.id.clone()),
+                    sea_level: Some(63i32.wrapping_add(level.y_offset)),
+                    ..Default::default()
+                },
+            );
+            if level.id != LEVEL_ID {
+                log(&format!("registered the linked level {} at Y offset {}", level.id, level.y_offset));
+            }
+        }
         let _ = self.shared.set(shared);
     }
 
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
         // Before any earth chunk: the world the server opens in loads before `server_started`,
         // and its chunks would otherwise wait for a check that comes after them.
-        if event.dimension == LEVEL_ID {
+        let ours = self.shared.get().is_some_and(|shared| shared.stack.config().levels().iter().any(|level| level.id == event.dimension));
+        if ours {
             self.check_fingerprint(host);
         }
     }
@@ -456,9 +597,19 @@ impl Hooks for TerraPlusMinus {
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let Some(shared) = self.shared.get() else { return };
-        let permissions = shared.stack.config().permissions;
-        event.commands.push(Command::op("tpll <coordinates:text>", permissions.tpll));
-        event.commands.push(Command::op("tpc <coordinates:text>", permissions.tpll));
+        let config = shared.stack.config();
+        let permissions = config.permissions;
+        // `passthrough_tpll`: another mod answers /tpll and /tpc (upstream rewrites them to that
+        // namespace), so this mod leaves both unregistered.
+        if config.passthrough_tpll.is_none() {
+            for name in ["tpll", "tpc"] {
+                // Bare `/tpll` shows the usage, as upstream's root node does.
+                event.commands.push(Command::op(name, permissions.tpll));
+                event.commands.push(Command::op(&format!("{name} <coordinates:text>"), permissions.tpll));
+                // A literal `-p` before the players, so coordinates are never read as a selector.
+                event.commands.push(Command::op(&format!("{name} -p <targets:players> <coordinates:text>"), permissions.forcetpll));
+            }
+        }
         for info in ["where", "offset", "distortion"] {
             event.commands.push(Command::op(info, permissions.info_commands));
         }
@@ -467,7 +618,7 @@ impl Hooks for TerraPlusMinus {
 
     fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
         match event.command.literals.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-            ["tpll"] | ["tpc"] => self.tpll(host, event),
+            ["tpll" | "tpc"] | ["tpll" | "tpc", "-p"] => self.tpll(host, event),
             [info @ ("where" | "offset" | "distortion")] => self.info_command(host, event, info),
             ["terraplusminus", "status"] => self.status(host),
             _ => return Flow::Continue,
@@ -478,6 +629,12 @@ impl Hooks for TerraPlusMinus {
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if !matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
             return;
+        }
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
+        if let Some(shared) = self.shared.get()
+            && shared.stack.config().height_in_actionbar
+        {
+            self.update_action_bars(host, shared, tick);
         }
         let (Some(shared), Some(regions), Some(air)) = (self.shared.get(), self.regions.get(), self.air.get()) else { return };
         let finished = {

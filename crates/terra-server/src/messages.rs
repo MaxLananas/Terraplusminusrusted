@@ -161,9 +161,31 @@ pub fn distortion_message(projection: &dyn GeographicProjection, x: f64, z: f64)
     }
 }
 
+/// `/tpll -p`: what the sender is told after the targets were handled (`executeTarget`).
+pub fn forced_tpll_summary(targets: usize, prefix: &str) -> String {
+    format!("{prefix}§7Executed tpll for {targets} player(s).")
+}
+
+/// `PlayerMoveEvent.setHeightInActionBar`: `getBlockY() - offset` followed by `m`, shown bold.
+/// `y` is the player's feet position; `offset` comes from [`ServerConfig::actionbar_offset`].
+pub fn actionbar_height(y: f64, offset: i32) -> String {
+    // Location.getBlockY is `floor` into an int; saturating like Java's `(int)` of a double.
+    let block_y = y.floor() as i32;
+    format!("{}m", block_y.wrapping_sub(offset))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actionbar_and_forced_tpll_text_match_upstream() {
+        assert_eq!(actionbar_height(64.9, 0), "64m");
+        assert_eq!(actionbar_height(-0.5, 0), "-1m");
+        assert_eq!(actionbar_height(100.0, -2032), "2132m");
+        assert_eq!(actionbar_height(10.0, 2032), "-2022m");
+        assert_eq!(forced_tpll_summary(3, "§2§lT+- §8» "), "§2§lT+- §8» §7Executed tpll for 3 player(s).");
+    }
     use crate::coordinates::LatLng;
 
     #[test]

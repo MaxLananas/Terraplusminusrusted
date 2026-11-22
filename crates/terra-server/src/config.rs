@@ -53,6 +53,10 @@ pub struct PermissionLevels {
     pub diagnostics: u8,
     /// `/where`, `/offset` and `/distortion`.
     pub info_commands: u8,
+    /// `t+-.forcetpll`: `/tpll -p <players> <coordinates>`.
+    pub forcetpll: u8,
+    /// `t+-.autoteleport`: moved between linked levels when crossing their boundary.
+    pub autoteleport: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +81,13 @@ pub struct ServerConfig {
     /// 0 retries until the server stops. Permanent failures never retry.
     pub generation_retry_attempts: u32,
     pub max_pending_teleports: usize,
+    /// `reduced_console_messages`: when false, every tile fetch is logged.
+    pub reduced_console_messages: bool,
+    /// `height_in_actionbar`: show players their real-world height above the hotbar.
+    pub height_in_actionbar: bool,
+    /// `passthrough_tpll`: another mod that owns `/tpll`; this one then registers neither
+    /// `/tpll` nor `/tpc`.
+    pub passthrough_tpll: Option<String>,
     /// Accepted but deprecated settings, worded as upstream's startup warnings. Callers log them.
     pub warnings: Vec<String>,
 }
@@ -106,11 +117,14 @@ impl Default for ServerConfig {
                 memory_cache_tiles: 512,
             },
             openstreetmap: OpenStreetMapConfig::default(),
-            permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0 },
+            permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0, forcetpll: 2, autoteleport: 2 },
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
             generation_retry_attempts: 8,
             max_pending_teleports: 64,
+            reduced_console_messages: true,
+            height_in_actionbar: false,
+            passthrough_tpll: None,
             warnings: Vec::new(),
         }
     }
@@ -187,6 +201,89 @@ fn millis(value: i64) -> Duration {
     Duration::from_millis(value as u64)
 }
 
+/// A level this mod generates: the earth dimension and, with linked levels, one per linked world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelPlan {
+    /// Dimension id, `terraplusminus:<path>`.
+    pub id: String,
+    /// The dimension's path, as registered by the mod.
+    pub path: String,
+    pub y_offset: i32,
+}
+
+/// The mod's namespace and the dimension it always registers.
+pub const MOD_NAMESPACE: &str = "terraplusminus";
+pub const EARTH_PATH: &str = "earth";
+
+impl ServerConfig {
+    /// Every level to register: `terraplusminus:earth`, then each other linked level
+    /// (`terraplusminus:<path>`), each at [`ServerConfig::level_offset`]. Validated by
+    /// [`parse_server_config`].
+    pub fn levels(&self) -> Vec<LevelPlan> {
+        let earth = format!("{MOD_NAMESPACE}:{EARTH_PATH}");
+        let mut levels = vec![LevelPlan { y_offset: self.level_offset(&earth), id: earth.clone(), path: EARTH_PATH.to_owned() }];
+        if self.linked_worlds.levels_active() {
+            for world in &self.linked_worlds.worlds {
+                let id = world.name.to_ascii_lowercase();
+                if id == earth {
+                    continue;
+                }
+                if let Some(path) = id.strip_prefix(MOD_NAMESPACE).and_then(|rest| rest.strip_prefix(':')) {
+                    levels.push(LevelPlan { y_offset: self.level_offset(&id), path: path.to_owned(), id });
+                }
+            }
+        }
+        levels
+    }
+
+    /// `PlayerMoveEvent`'s offset for the height in the action bar: the listed offset of the
+    /// player's level while linked levels are active (0 included), else `terrain_offset.y`.
+    pub fn actionbar_offset(&self, level: Option<&str>) -> i32 {
+        level.and_then(|level| self.linked_worlds.offset_of(level)).unwrap_or(self.generator.y_offset)
+    }
+
+    /// The Y offset a level of this mod is generated at, as upstream's `getDefaultWorldGenerator`
+    /// and `RealWorldGenerator` choose it: the linked offset while linked levels are active,
+    /// where 0 (and an unlisted level) means `terrain_offset.y`.
+    pub fn level_offset(&self, level: &str) -> i32 {
+        match self.linked_worlds.offset_of(level) {
+            Some(offset) if offset != 0 => offset,
+            _ => self.generator.y_offset,
+        }
+    }
+}
+
+/// Linked levels must be dimensions this mod generates, so their terrain lines up (upstream
+/// warns when a linked world uses another generator). Names become dimension ids, lower case.
+fn validate_linked_levels(config: &mut ServerConfig) -> Result<(), ConfigError> {
+    if !config.linked_worlds.levels_active() {
+        return Ok(());
+    }
+    let earth = format!("{MOD_NAMESPACE}:{EARTH_PATH}");
+    for world in &mut config.linked_worlds.worlds {
+        world.name.make_ascii_lowercase();
+        let id = world.name.clone();
+        if id == earth {
+            continue;
+        }
+        let path = id.strip_prefix(MOD_NAMESPACE).and_then(|rest| rest.strip_prefix(':')).unwrap_or("");
+        let valid = !path.is_empty() && path.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/'));
+        if !valid {
+            return Err(ConfigError(format!(
+                "linked world `{}` must name a level of this mod, `{MOD_NAMESPACE}:<name>` (lower case letters, digits, `_`, `-`, `.`, `/`), which is registered at its offset",
+                world.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The overworld range of upstream's `world-height-datapack.zip`.
+pub const DATAPACK_WORLD: WorldHeight = WorldHeight { min_y: -64, max_y: 2032 };
+
+/// `ConfigurationHelper.PLACEHOLDER_NAMES`: sample linked-world names, skipped.
+const LINKED_WORLD_PLACEHOLDERS: [&str; 3] = ["world/server", "another_world/server", "current_world/server"];
+
 pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
     let document = parse_relaxed_json(text).map_err(|error| ConfigError(error.to_string()))?;
     let root = Section::new(
@@ -195,7 +292,8 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         &[
             "terrain_offset", "min_latitude", "max_latitude", "min_longitude", "max_longitude", "linked_worlds", "generate_trees", "biomes",
             "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version", "prefix", "openstreetmap",
-            "building_outlines_material", "road_material", "path_material",
+            "building_outlines_material", "road_material", "path_material", "reduced_console_messages", "height_datapack", "height_in_actionbar",
+            "passthrough_tpll",
         ],
     )?;
     let mut config = ServerConfig::default();
@@ -221,7 +319,30 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         for (index, entry) in linked.get("worlds").map(JsonValue::as_array_lenient).unwrap_or_default().iter().enumerate() {
             let world = Section::new(&format!("linked_worlds.worlds[{index}]"), entry, &["name", "offset"])?;
             let name = world.string("name")?.ok_or_else(|| ConfigError(format!("linked_worlds.worlds[{index}].name is required")))?;
-            config.linked_worlds.worlds.push(LinkedWorld { name: name.to_owned(), offset: world.integer("offset", 0, -100_000..=100_000)? as i32 });
+            let offset = world.integer("offset", 0, -100_000..=100_000)? as i32;
+            // `ConfigurationHelper.convertList`: the sample entries of the default config.yml are
+            // placeholders, never worlds.
+            if LINKED_WORLD_PLACEHOLDERS.contains(&name.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            if config.linked_worlds.worlds.iter().any(|known| known.name.eq_ignore_ascii_case(name)) {
+                return Err(ConfigError(format!("linked_worlds.worlds lists `{name}` more than once")));
+            }
+            config.linked_worlds.worlds.push(LinkedWorld { name: name.to_owned(), offset });
+        }
+        if config.linked_worlds.enabled {
+            if let Some(pair) = config.linked_worlds.worlds.windows(2).find(|pair| pair[0].offset <= pair[1].offset) {
+                return Err(ConfigError(format!(
+                    "linked_worlds.worlds must go from the lowest to the highest level with strictly decreasing offsets, but `{}` (offset {}) comes before `{}` (offset {})",
+                    pair[0].name, pair[0].offset, pair[1].name, pair[1].offset
+                )));
+            }
+            if config.linked_worlds.worlds.len() < 2 {
+                config.warnings.push(format!(
+                    "Linked worlds are enabled but only {} world(s) are configured. At least two worlds are required for transitions to happen.",
+                    config.linked_worlds.worlds.len()
+                ));
+            }
         }
         if config.linked_worlds.enabled && config.linked_worlds.method == LinkedWorldsMethod::Servers {
             return Err(ConfigError("linked_worlds.method SERVER needs a proxy bridge, which Horizon does not provide".into()));
@@ -230,6 +351,9 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
     if let Some(prefix) = root.string("prefix")? {
         config.prefix = prefix.to_owned();
     }
+    config.reduced_console_messages = root.boolean("reduced_console_messages", true)?;
+    config.height_in_actionbar = root.boolean("height_in_actionbar", false)?;
+    config.passthrough_tpll = root.string("passthrough_tpll")?.map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned);
     config.generate_trees = root.boolean("generate_trees", true)?;
     if let Some(biomes) = root.section("biomes", &["use_dataset", "biome"])? {
         config.generator.use_biome_dataset = biomes.boolean("use_dataset", true)?;
@@ -272,13 +396,27 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         target.mapping = osm.string("mapping")?.map(PathBuf::from);
         target.memory_cache_tiles = osm.integer("memory_cache_tiles", target.memory_cache_tiles as i64, 1..=65_536)? as usize;
     }
+    // `height_datapack`: upstream installs `world-height-datapack.zip`, whose overworld is
+    // y -64 to 2031 (min_y -64, height 2096). Here the dimension is registered with that range.
+    let height_datapack = root.boolean("height_datapack", false)?;
+    if height_datapack {
+        config.world = DATAPACK_WORLD;
+    }
     if let Some(world) = root.section("world", &["min_y", "height"])? {
         let min_y = world.integer("min_y", -64, -2032..=2016)? as i32;
         let height = world.integer("height", 384, 16..=4064)? as i32;
         if min_y % 16 != 0 || height % 16 != 0 || min_y + height > 2032 {
             return Err(ConfigError("world.min_y and world.height must be multiples of 16 with min_y + height <= 2032".into()));
         }
-        config.world = WorldHeight { min_y, max_y: min_y + height };
+        let world = WorldHeight { min_y, max_y: min_y + height };
+        if height_datapack && world != DATAPACK_WORLD {
+            return Err(ConfigError(format!(
+                "height_datapack is true, which means min_y {} and height {}, but world sets min_y {min_y} and height {height}; remove one of them",
+                DATAPACK_WORLD.min_y,
+                DATAPACK_WORLD.max_y - DATAPACK_WORLD.min_y
+            )));
+        }
+        config.world = world;
     }
     if let Some(elevation) = root.section("elevation", &["heights_config", "tree_cover_config", "unsupported_layers"])? {
         config.heights_config = elevation.string("heights_config")?.map(PathBuf::from);
@@ -315,7 +453,9 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         target.total_timeout = millis(network.integer("total_timeout_ms", 30_000, 100..=600_000)?);
         target.memory_cache_tiles = network.integer("memory_cache_tiles", target.memory_cache_tiles as i64, 1..=65_536)? as usize;
     }
-    if let Some(permissions) = root.section("permissions", &["tpll", "tpll_other_world", "tpll_ungenerated_chunks", "admin", "diagnostics", "info_commands"])? {
+    if let Some(permissions) =
+        root.section("permissions", &["tpll", "tpll_other_world", "tpll_ungenerated_chunks", "admin", "diagnostics", "info_commands", "forcetpll", "autoteleport"])?
+    {
         let level = |key: &str, default: u8| permissions.integer(key, i64::from(default), 0..=4).map(|value| value as u8);
         config.permissions = PermissionLevels {
             tpll: level("tpll", 0)?,
@@ -324,6 +464,8 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
             tpll_ungenerated_chunks: level("tpll_ungenerated_chunks", 2)?,
             admin: level("admin", 2)?,
             diagnostics: level("diagnostics", 2)?,
+            forcetpll: level("forcetpll", 2)?,
+            autoteleport: level("autoteleport", 2)?,
         };
     }
     if let Some(generation) = root.section("generation", &["workers", "queue_capacity", "ready_capacity", "wait_timeout_ms", "retry_attempts", "max_pending_teleports"])? {
@@ -337,6 +479,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         config.max_pending_teleports = generation.integer("max_pending_teleports", 64, 1..=10_000)? as usize;
         config.generation_retry_attempts = generation.integer("retry_attempts", 8, 0..=1_000_000)? as u32;
     }
+    validate_linked_levels(&mut config)?;
     Ok(config)
 }
 
@@ -351,7 +494,7 @@ mod tests {
                 // keys from TerraPlusMinus config.yml
                 "terrain_offset": {"x": 10, "y": -5, "z": -20},
                 "min_latitude": 46.9, "max_latitude": 55.3, "min_longitude": 1.9, "max_longitude": 15.6,
-                "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "low", "offset": 0}, {"name": "high", "offset": -2032}]},
+                "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "terraplusminus:earth", "offset": -5}, {"name": "terraplusminus:high", "offset": -2037}]},
                 "biomes": {"use_dataset": false, "biome": "minecraft:desert"},
                 "surface_material": "GRASS_BLOCK",
                 "world": {"min_y": -2032, "height": 4064},
@@ -363,7 +506,7 @@ mod tests {
         assert_eq!((config.generator.x_offset, config.generator.y_offset, config.generator.z_offset), (10, -5, -20));
         assert_eq!(config.generator.default_biome, Biome::Desert);
         assert_eq!(config.world, WorldHeight { min_y: -2032, max_y: 2032 });
-        assert_eq!(config.linked_worlds.worlds[1].offset, -2032);
+        assert_eq!(config.linked_worlds.worlds[1].offset, -2037);
         assert_eq!(config.network.plain_http_hosts, vec!["s3.amazonaws.com".to_owned()]);
         assert!(config.openstreetmap.enabled);
     }
@@ -406,8 +549,105 @@ mod tests {
             r#"{"linked_worlds": {"enabled": true, "method": "SERVER"}}"#,
             r#"{"permissions": {"tpll": 5}}"#,
             r#"{"terrain_offset": {"x": 1.5}}"#,
+            r#"{"passthrough_tpll": 3}"#,
+            r#"{"height_in_actionbar": "yes"}"#,
+            r#"{"permissions": {"forcetpll": 9}}"#,
         ] {
             assert!(parse_server_config(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn upstream_switches_parse_with_upstream_defaults() {
+        let defaults = parse_server_config("{}").unwrap();
+        assert!(defaults.reduced_console_messages, "config.yml ships reduced_console_messages: true");
+        assert!(!defaults.height_in_actionbar);
+        assert_eq!(defaults.passthrough_tpll, None);
+        assert_eq!((defaults.permissions.forcetpll, defaults.permissions.autoteleport), (2, 2));
+        let config = parse_server_config(
+            r#"{"reduced_console_messages": false, "height_in_actionbar": true, "passthrough_tpll": " terraplusplus ", "permissions": {"forcetpll": 3, "autoteleport": 0}}"#,
+        )
+        .unwrap();
+        assert!(!config.reduced_console_messages && config.height_in_actionbar);
+        assert_eq!(config.passthrough_tpll.as_deref(), Some("terraplusplus"));
+        assert_eq!((config.permissions.forcetpll, config.permissions.autoteleport), (3, 0));
+        // An empty namespace is upstream's "disabled".
+        assert_eq!(parse_server_config(r#"{"passthrough_tpll": "  "}"#).unwrap().passthrough_tpll, None);
+    }
+
+    #[test]
+    fn height_datapack_selects_the_datapack_overworld() {
+        let config = parse_server_config(r#"{"height_datapack": true}"#).unwrap();
+        assert_eq!(config.world, DATAPACK_WORLD);
+        assert_eq!(DATAPACK_WORLD, WorldHeight { min_y: -64, max_y: 2032 });
+        assert_eq!(parse_server_config(r#"{"height_datapack": false}"#).unwrap().world, ServerConfig::default().world);
+        assert!(parse_server_config(r#"{"height_datapack": true, "world": {"min_y": -64, "height": 2096}}"#).is_ok());
+        let error = parse_server_config(r#"{"height_datapack": true, "world": {"min_y": -2032, "height": 4064}}"#).unwrap_err();
+        assert!(error.0.contains("height_datapack"), "{error:?}");
+    }
+
+    fn linked(worlds: &str) -> Result<ServerConfig, ConfigError> {
+        parse_server_config(&format!(r#"{{"linked_worlds": {{"enabled": true, "method": "MULTIVERSE", "worlds": [{worlds}]}}}}"#))
+    }
+
+    #[test]
+    fn linked_worlds_follow_upstream_validation() {
+        // ConfigurationHelper drops its sample entries.
+        let config = linked(r#"{"name": "world/server", "offset": 0}, {"name": "terraplusminus:earth", "offset": 0}, {"name": "Another_World/Server", "offset": -2032}, {"name": "terraplusminus:sky", "offset": -2032}"#).unwrap();
+        assert_eq!(config.linked_worlds.worlds.iter().map(|world| world.name.as_str()).collect::<Vec<_>>(), ["terraplusminus:earth", "terraplusminus:sky"]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        // LinkedWorldLayout.validate: duplicate names (without case) and offsets that do not
+        // strictly decrease are errors; fewer than two worlds is a warning.
+        for worlds in [
+            r#"{"name": "terraplusminus:earth", "offset": 0}, {"name": "TerraPlusMinus:Earth", "offset": -2032}"#,
+            r#"{"name": "terraplusminus:earth", "offset": 0}, {"name": "terraplusminus:sky", "offset": 0}"#,
+            r#"{"name": "terraplusminus:earth", "offset": 0}, {"name": "terraplusminus:sky", "offset": 2032}"#,
+        ] {
+            assert!(linked(worlds).is_err(), "{worlds}");
+        }
+        let lonely = linked(r#"{"name": "terraplusminus:earth", "offset": 0}"#).unwrap();
+        assert_eq!(lonely.warnings.len(), 1, "{:?}", lonely.warnings);
+        // A disabled list is only parsed: its order is not enforced.
+        assert!(parse_server_config(r#"{"linked_worlds": {"enabled": false, "worlds": [{"name": "a", "offset": 0}, {"name": "b", "offset": 5}]}}"#).is_ok());
+    }
+
+    #[test]
+    fn linked_levels_are_dimensions_of_this_mod() {
+        let config = linked(r#"{"name": "TerraPlusMinus:Earth", "offset": 0}, {"name": "terraplusminus:sky", "offset": -2032}, {"name": "terraplusminus:space/high", "offset": -4064}"#).unwrap();
+        let levels: Vec<(String, String, i32)> = config.levels().into_iter().map(|level| (level.id, level.path, level.y_offset)).collect();
+        assert_eq!(
+            levels,
+            [
+                ("terraplusminus:earth".to_owned(), "earth".to_owned(), 0),
+                ("terraplusminus:sky".to_owned(), "sky".to_owned(), -2032),
+                ("terraplusminus:space/high".to_owned(), "space/high".to_owned(), -4064)
+            ]
+        );
+        assert_eq!(config.level_offset("terraplusminus:SKY"), -2032);
+        assert_eq!(config.level_offset("terraplusminus:earth"), 0);
+        assert_eq!(config.level_offset("minecraft:overworld"), 0);
+        assert_eq!(parse_server_config("{}").unwrap().levels().len(), 1);
+        // RealWorldGenerator: offset 0 means terrain_offset.y; any other offset is used as is,
+        // for the earth level too.
+        let shifted = parse_server_config(
+            r#"{"terrain_offset": {"y": -5}, "linked_worlds": {"enabled": true, "worlds": [{"name": "terraplusminus:earth", "offset": 0}, {"name": "terraplusminus:sky", "offset": -2032}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(shifted.levels().iter().map(|level| level.y_offset).collect::<Vec<_>>(), [-5, -2032]);
+        let raised = parse_server_config(r#"{"linked_worlds": {"enabled": true, "worlds": [{"name": "terraplusminus:earth", "offset": 2032}, {"name": "terraplusminus:low", "offset": 0}]}}"#).unwrap();
+        assert_eq!(raised.levels().iter().map(|level| level.y_offset).collect::<Vec<_>>(), [2032, 0]);
+        assert_eq!(parse_server_config(r#"{"terrain_offset": {"y": 7}}"#).unwrap().levels()[0].y_offset, 7);
+        // The action bar uses the listed offset as is, 0 included.
+        assert_eq!(raised.actionbar_offset(Some("terraplusminus:low")), 0);
+        assert_eq!(shifted.actionbar_offset(Some("terraplusminus:earth")), 0);
+        assert_eq!(shifted.actionbar_offset(Some("minecraft:overworld")), -5);
+        assert_eq!(shifted.actionbar_offset(None), -5);
+        for worlds in [
+            r#"{"name": "minecraft:overworld", "offset": 0}, {"name": "terraplusminus:sky", "offset": -2032}"#,
+            r#"{"name": "terraplusminus:", "offset": 0}, {"name": "terraplusminus:sky", "offset": -2032}"#,
+            r#"{"name": "terraplusminus:a b", "offset": 0}, {"name": "terraplusminus:sky", "offset": -2032}"#,
+        ] {
+            assert!(linked(worlds).is_err(), "{worlds}");
         }
     }
 }

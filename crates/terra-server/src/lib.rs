@@ -12,9 +12,9 @@ pub mod teleports;
 pub mod tpll;
 
 pub use coordinates::{LatLng, UpstreamParseOutcome, parse_coordinates, parse_coordinates_upstream};
-pub use config::{ConfigError, NetworkConfig, OpenStreetMapConfig, PermissionLevels, ServerConfig, parse_server_config};
+pub use config::{ConfigError, DATAPACK_WORLD, EARTH_PATH, LevelPlan, MOD_NAMESPACE, NetworkConfig, OpenStreetMapConfig, PermissionLevels, ServerConfig, parse_server_config};
 pub use tpll::{Authorization, LevelHeight, LinkedWorld, LinkedWorlds, LinkedWorldsMethod, TeamBounds, TeleportWorld, TpllRequest, TpllStep, TpllTarget, parse_tpll_arguments};
-pub use stack::{OSM_MAPPING_FILE, StackError, TerraStack, extract_default_osm_mapping};
+pub use stack::{LogSink, OSM_MAPPING_FILE, StackError, TerraStack, extract_default_osm_mapping};
 pub use teleports::{PendingTeleports, TeleportOutcome, TeleportRefusal};
 pub use region_index::RegionIndex;
-pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationCounters, GenerationFailure, GenerationGate, split_block_state, terrain_for_generation, validate_block_state, write_chunk, write_trees, TreeTarget};
+pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationCounters, GenerationFailure, GenerationGate, split_block_state, terrain_for_generation, validate_block_state, write_chunk, write_chunk_at, write_trees, TreeTarget};

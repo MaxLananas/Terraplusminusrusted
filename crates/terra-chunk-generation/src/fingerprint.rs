@@ -96,6 +96,17 @@ impl GenerationFingerprint {
     }
 
     /// The recorded value of a field, if present.
+    /// The fingerprint of the same generation for a level whose terrain sits at `y_offset` (a
+    /// linked level): only the `y_offset` field differs.
+    pub fn with_y_offset(mut self, y_offset: i32) -> Self {
+        for (key, value) in &mut self.fields {
+            if key == "y_offset" {
+                *value = y_offset.to_string();
+            }
+        }
+        self
+    }
+
     pub fn field(&self, key: &str) -> Option<&str> {
         self.fields.iter().find(|(name, _)| name == key).map(|(_, value)| value.as_str())
     }
@@ -182,6 +193,16 @@ mod tests {
     use super::*;
 
     const WORLD: WorldHeight = WorldHeight { min_y: -2032, max_y: 2032 };
+
+    #[test]
+    fn a_linked_level_fingerprint_differs_only_in_its_offset() {
+        let settings = GeneratorSettings::default();
+        let base = GenerationFingerprint::compute(&settings, WORLD, b"heights", Some(b"koppen"));
+        let direct = GenerationFingerprint::compute(&GeneratorSettings { y_offset: -2032, ..settings.clone() }, WORLD, b"heights", Some(b"koppen"));
+        assert_eq!(base.clone().with_y_offset(-2032), direct);
+        assert_eq!(base.clone().with_y_offset(settings.y_offset), base);
+        assert_eq!(base.differences(&base.clone().with_y_offset(-2032)), vec![("y_offset".to_owned(), "0".to_owned(), "-2032".to_owned())]);
+    }
 
     #[test]
     fn records_then_matches_then_refuses_changes() {

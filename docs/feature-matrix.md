@@ -87,14 +87,17 @@ this environment. See [Limits](#limits).
 | `terrain_offset.x/y/z` | Shift world against projection and height | `config.rs`, `OffsetProjectionTransform` | Dimension `sea_level = 63 + y` | `offset_chunk_heights_match_upstream`, `offset_bte_matches_upstream` | Verified |
 | `min/max_latitude`, `min/max_longitude` | Team bounds for `/tpll` | `tpll.rs` | `/tpll` | `tpll_flow.rs::enforces_authorization_and_bounds` | Implemented |
 | Extended heights (`world-height-datapack.zip`) | Build height up to 2032 | `world.min_y`, `world.height` → `DimensionSettings` | `register_dimension` | `config.rs::rejects_unknown_keys_and_invalid_values` (range checks) | Implemented; Horizon: stub-checked |
+| `height_datapack` | Installs the datapack (overworld -64..2032) | Selects `DATAPACK_WORLD` (-64..2032) for the dimensions; a different `world` section is refused | `register_dimension` | `config.rs::height_datapack_selects_the_datapack_overworld` | Implemented (no datapack needed: the mod registers its own dimensions) |
 
 ## Linked worlds
 
 | Upstream symbol | Behavior | Rust implementation | Horizon integration | Acceptance test | Status |
 |---|---|---|---|---|---|
-| `linked_worlds` with method MULTIVERSE | Stacked levels with Y offsets; `/tpll` routes above max or at/below min | `tpll.rs::linked_world`, config method `Levels` | Levels by dimension id | `tpll_flow.rs::explicit_heights_route_through_linked_worlds` | Implemented |
+| `linked_worlds` with method MULTIVERSE | Stacked levels with Y offsets; `/tpll` routes above max or at/below min | `tpll.rs::linked_world`, config method `Levels`; names are matched without case (`LinkedWorldLayout.indexOf`) | Levels by dimension id | `tpll_flow.rs::explicit_heights_route_through_linked_worlds` | Implemented |
+| `getDefaultWorldGenerator` per linked world | Each linked world runs `RealWorldGenerator` at its offset (0 means `terrain_offset.y`) | `ServerConfig::levels`, `level_offset`; `write_chunk_at`, `tree_blocks_at` (one data stack, offset applied when writing); per-level fingerprint (`TerraStack::verify_level`) | One `terraplusminus:<name>` dimension per linked level, `sea_level = 63 + offset`; linked names must be levels of this mod | `config.rs::linked_levels_are_dimensions_of_this_mod`, `trees.rs::a_linked_level_is_the_same_terrain_and_trees_shifted_by_its_offset` | Implemented; Horizon: stub-checked |
+| `LinkedWorldLayout.validate`, `ConfigurationHelper` placeholders | Duplicates and non-decreasing offsets refused, fewer than 2 worlds warned, sample entries dropped | `config.rs` | Config load | `config.rs::linked_worlds_follow_upstream_validation` | Implemented (unloaded-world and generator warnings do not apply: the mod creates the levels) |
 | Method SERVER (proxy plugin message) | Cross-server routing | Refused by the config parser | n/a | `rejects_unknown_keys_and_invalid_values` | Not ported |
-| `PlayerMoveEvent` auto-teleport between linked worlds | Move players across level boundaries while walking | Not implemented | n/a | n/a | Not ported |
+| `PlayerMoveEvent` auto-teleport between linked worlds (`t+-.autoteleport`) | Move players across level boundaries while walking | Not implemented; `permissions.autoteleport` is parsed, unused | n/a | n/a | Not ported (Horizon has no move event; a per-tick poller with upstream's failsafe, cooldown and free-ascent rules is future work) |
 
 ## Commands, permissions and teleportation
 
@@ -102,15 +105,44 @@ this environment. See [Limits](#limits).
 |---|---|---|---|---|---|
 | TPM `TpllCommand` coordinate parsing | Decimal, DMS and suffix formats; height | `coordinates.rs`, `java_text.rs`, `tpll.rs` | `/tpll <coordinates:text>` and alias `/tpc` | `coordinate_oracle.rs::matches_upstream_on_every_recorded_input` (245 of 245) | Verified |
 | TPM `TpllCommand` flow | Height lookup, ungenerated-chunk permission, linked worlds, messages | `tpll.rs`, `teleports.rs`, `messages.rs` | Off-tick surface loading; `entity.teleport_to_level` | `tpll_flow.rs::*` (4 tests), `messages.rs::teleport_lines_follow_upstream_number_formatting` | Implemented; Horizon: stub-checked |
-| `/tpll -p <player>` (`forcetpll`) | Teleport other players | Not implemented | n/a | n/a | Not ported |
+| `/tpll -p <players>` (`t+-.forcetpll`) | Teleport other players from any source; team bounds skipped; ungenerated-chunk and other-world rights of each target; `Executed tpll for N player(s).` | `TpllTarget` in the adapter, `messages::forced_tpll_summary` | `tpll -p <targets:players> <coordinates:text>` (and `tpc`) at `permissions.forcetpll` | `messages.rs::actionbar_and_forced_tpll_text_match_upstream`, `tpll_flow.rs::enforces_authorization_and_bounds` (`sender_is_target: false`) | Implemented; Horizon: stub-checked |
+| Bare `/tpll` | Usage message | Root usage `tpll` / `tpc` | `Command::op("tpll", tpll)` | n/a | Implemented; Horizon: stub-checked |
 | TPM `WhereCommand` | Geographic position plus a Google Maps link | `messages.rs::where_message` | `/where`, click and hover style | `where_links_the_reported_coordinates`, `command_text_oracle.rs::matches_java_double_text` | Implemented; Horizon: stub-checked |
 | TPM `OffsetCommand` | Offsets, or Y per linked level | `messages.rs::offset_lines` | `/offset` | `offsets_list_linked_levels_instead_of_y` | Implemented; Horizon: stub-checked |
 | TPM `DistortionCommand` | Tissot-based scale and angle report | `messages.rs::distortion_message` | `/distortion` | `bte_tissot_matches_upstream`, `matches_java_double_text` (`%.6f`, `%.4f`) | Implemented; Horizon: stub-checked |
 | TPM `Permission` nodes | `t+-.tpll`, `.tpll.otherWorld`, `.tpll.ungenerated-chunks`, `.admin`, `.where`, `.offset`, `.distortion` | `config.rs::PermissionLevels` maps nodes to vanilla operator levels | `Command::op(usage, level)` plus checks in the handlers | `enforces_authorization_and_bounds` | Implemented (operator levels replace permission plugins) |
-| `t+-.autoteleport`, `t+-.notify.update` | Auto-teleport, update notices | Not implemented | n/a | n/a | Not ported |
+| `t+-.notify.update`, `Updater` | Update notices from GitHub releases | Not implemented | n/a | n/a | Not ported (no TLS client; releases are managed by the Horizon mod loader) |
+| `height_in_actionbar` (`PlayerMoveEvent.setHeightInActionBar`) | Bold `<blockY - offset>m` for every online player, on each move and every 20 ticks; not while holding a debug stick | `messages::actionbar_height`, `ServerConfig::actionbar_offset` | `player.action_bar`, polled at `ServerTickStart`: sent when the block Y changes and every 20 ticks | `actionbar_and_forced_tpll_text_match_upstream`, `config.rs::linked_levels_are_dimensions_of_this_mod` | Implemented; Horizon: stub-checked |
 | Teleport readiness | Never teleport into ungenerated or unloaded terrain | `teleports.rs`: bounded pending table, timeout, replaceable | Polled at `ServerTickPhase::ServerTickStart`; refused or dropped while generation is not open | `pending_teleports_are_bounded_and_replaceable`, `the_exclusive_top_of_the_world_is_a_valid_feet_position` | Implemented; Horizon: stub-checked |
 | Diagnostics | Queue, cache and fingerprint state | `TerraStack::diagnostics_report` | `/terraplusminus status` (diagnostics level) | Exercised by `terra-cli benchmark` | Implemented |
-| `PlayerJoinEvent`, `PlayerCommandPreprocessEvent`, `PluginMessageEvent` | Join handling, command rewriting, proxy messages | Not implemented | n/a | n/a | Not ported |
+| `PlayerCommandPreprocessEvent` (`passthrough_tpll`) | Hand `/tpll` and `/tpc` to another plugin's namespace | `config.rs` (`passthrough_tpll`, empty = off) | `/tpll` and `/tpc` are not registered, leaving them to the other mod | `config.rs::upstream_switches_parse_with_upstream_defaults` | Implemented (Horizon has no command rewriting; not registering is the equivalent) |
+| `PlayerJoinEvent`, `PluginMessageEvent` | Pending `/tpll` from a BungeeCord proxy, proxy messages | Not implemented | n/a | n/a | Not ported (only used by linked-worlds method SERVER) |
+
+## Configuration keys (`config.yml`)
+
+Every key of upstream's `config.yml` at the pinned revision, and where it went.
+
+| Key | Port |
+|---|---|
+| `prefix` | `prefix`, used by every message |
+| `reduced_console_messages` | Default `true` as in `config.yml`; `false` logs every data fetch (found, missing, failed, with size and time), like TMM `Http` |
+| `height_datapack` | Selects the -64..2032 world range |
+| `height_in_actionbar` | Action bar height, above |
+| `passthrough_tpll` | `/tpll` and `/tpc` left unregistered |
+| `min_latitude`, `max_latitude`, `min_longitude`, `max_longitude` | Team bounds |
+| `terrain_offset.x/y/z` | Projection and height offsets |
+| `linked_worlds.enabled`, `.method`, `.worlds[].name/offset` | Linked levels; method SERVER refused |
+| `generate_trees` | Tree populator |
+| `biomes.use_dataset`, `biomes.biome` | Köppen dataset or a fixed biome |
+| `surface_material` | Default surface block |
+| `building_outlines_material`, `road_material`, `path_material` | Deprecated upstream; mapped to surface replacements with upstream's warning |
+| `config_version` | Accepted and ignored (the port has a single format) |
+| TMM `maxConcurrentRequests` (per host list) | `network.max_per_host` (one limit for every host) |
+| TMM `cacheTTL` | Missing (404) entries expire after 24 h; found entries stay until evicted by the 2 GiB LRU (tiles are immutable) |
+
+Permission nodes become operator levels in `permissions`: `tpll`, `tpll_other_world`,
+`tpll_ungenerated_chunks`, `forcetpll`, `admin`, `autoteleport` (unused, see above) and
+`info_commands` (`where`, `offset`, `distortion`); `diagnostics` is the port's own.
 
 ## Limits
 

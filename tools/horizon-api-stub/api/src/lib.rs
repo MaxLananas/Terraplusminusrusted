@@ -27,6 +27,33 @@ impl PlayerRef {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LivingRef(EntityRef);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ItemKey(u32);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Identifier(String);
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ItemStack {
+    item: ItemKey,
+}
+impl ItemStack {
+    pub fn item(&self) -> ItemKey {
+        self.item
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EquipmentSlot {
+    MainHand,
+    OffHand,
+    Feet,
+    Legs,
+    Chest,
+    Head,
+    Body,
+    Saddle,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkPos {
     pub x: i32,
     pub z: i32,
@@ -94,7 +121,11 @@ pub enum PermissionLevel {
 impl CommandSource {
     pub fn permission(&self) -> PermissionLevel {
         match self {
-            Self::Player { permission, .. } | Self::Console { permission } => *permission,
+            Self::Player { permission, .. }
+            | Self::Console { permission }
+            | Self::CommandBlock { permission, .. }
+            | Self::CommandBlockMinecart { permission, .. }
+            | Self::Function { permission, .. } => *permission,
         }
     }
 }
@@ -109,6 +140,9 @@ impl PermissionLevel {
 pub enum CommandSource {
     Player { player: PlayerRef, permission: PermissionLevel },
     Console { permission: PermissionLevel },
+    CommandBlock { position: [i32; 3], level: DimensionKey, permission: PermissionLevel },
+    CommandBlockMinecart { entity: EntityRef, permission: PermissionLevel },
+    Function { id: Identifier, permission: PermissionLevel },
 }
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -116,6 +150,11 @@ pub enum CommandArgumentValue {
     String(String),
     Integer(i32),
     Number(f64),
+    Boolean(bool),
+    Player(PlayerRef),
+    Entity(EntityRef),
+    Entities(Vec<EntityRef>),
+    Players(Vec<PlayerRef>),
 }
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -288,10 +327,17 @@ pub trait Commands {
 pub trait Host {
     fn level(&self, dimension: &str) -> Option<LevelRef>;
     fn chunk(&self, level: LevelRef, pos: [i32; 2]) -> Option<ChunkRef>;
+    fn living(&self, entity: EntityRef) -> Option<LivingRef>;
+}
+pub trait Players {
+    fn server_players(&self) -> Vec<PlayerRef>;
+    fn player_by_name(&self, name: &str) -> Option<PlayerRef>;
+    fn acting_player(&self) -> Option<PlayerRef>;
 }
 pub trait ServerHost: Host {
     fn commands(&mut self) -> &mut dyn Commands;
     fn world_dir(&self) -> Option<PathBuf>;
+    fn players(&self) -> &dyn Players;
 }
 
 impl LevelRef {
@@ -300,6 +346,19 @@ impl LevelRef {
     }
     pub fn block(self, host: &dyn Host, pos: [i32; 3]) -> Option<BlockKey> {
         None
+    }
+    pub fn online_players(self, host: &dyn Host) -> Option<Vec<PlayerRef>> {
+        None
+    }
+}
+impl LivingRef {
+    pub fn equipment(self, host: &dyn Host, slot: EquipmentSlot) -> Option<ItemStack> {
+        None
+    }
+}
+impl ItemKey {
+    pub fn id(self, host: &dyn Host) -> String {
+        String::new()
     }
 }
 impl DimensionKey {
@@ -318,6 +377,12 @@ impl EntityRef {
 impl PlayerRef {
     pub fn tell(self, host: &mut dyn ServerHost, line: Text) -> Result<bool, TextFormError> {
         Ok(false)
+    }
+    pub fn action_bar(self, host: &mut dyn ServerHost, line: Text) -> Result<bool, TextFormError> {
+        Ok(false)
+    }
+    pub fn permission_level(self, host: &dyn Host) -> Option<u8> {
+        None
     }
 }
 

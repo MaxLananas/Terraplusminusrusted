@@ -8,7 +8,7 @@ mod common;
 use std::collections::BTreeMap;
 use terra_chunk_generation::WorldHeight;
 use terra_projection::GeoCoordinate;
-use terra_server::{BlockPalette, BlockWriter, GenerationControl, TreeTarget, terrain_for_generation, write_chunk, write_trees};
+use terra_server::{BlockPalette, BlockWriter, GenerationControl, TreeTarget, terrain_for_generation, write_chunk, write_chunk_at, write_trees};
 
 /// Inside the terrarium fixture tile (z13 tile row 3216), away from the no-data band.
 const LATITUDE: f64 = 36.0136;
@@ -72,7 +72,7 @@ fn trees_grow_on_covered_land_and_overhang_into_neighbours() {
     let control = GenerationControl::default();
     let (chunk_x, chunk_z) = chunk_at(&stack, -113.21, LATITUDE);
     let terrain = terrain_for_generation(&stack, &control, chunk_x, chunk_z, &mut |message| panic!("{message}")).unwrap();
-    let target = TreeTarget { chunk_x, chunk_z, world: WORLD, level_seed: 1234 };
+    let target = TreeTarget { chunk_x, chunk_z, world: WORLD, level_seed: 1234, y_offset: stack.config().generator.y_offset };
     let mut palette = palette();
     let mut chunk = FakeChunk::default();
     write_chunk(&stack, &terrain, chunk_x, chunk_z, WORLD, &mut palette, &mut chunk);
@@ -114,7 +114,7 @@ fn bare_ground_and_disabled_trees_place_nothing() {
     let terrain = terrain_for_generation(&stack, &control, chunk_x, chunk_z, &mut |message| panic!("{message}")).unwrap();
     assert_eq!(terrain.tree_chance(0, 0), 0, "0 % cover at the west edge");
     let mut chunk = FakeChunk::default();
-    let target = TreeTarget { chunk_x, chunk_z, world: WORLD, level_seed: 1 };
+    let target = TreeTarget { chunk_x, chunk_z, world: WORLD, level_seed: 1, y_offset: stack.config().generator.y_offset };
     // Neighbours may still reach in; the chunk's own populator places nothing.
     let own = stack.generator().trees().unwrap().populate(&terrain, chunk_x, chunk_z, WORLD, 1, &|_, _| 8);
     assert!(own.is_empty());
@@ -125,4 +125,48 @@ fn bare_ground_and_disabled_trees_place_nothing() {
     assert_eq!(disabled.fingerprint().field("trees"), None);
     let terrain = terrain_for_generation(&disabled, &control, chunk_x, chunk_z, &mut |message| panic!("{message}")).unwrap();
     assert_eq!(write_trees(&disabled, &control, &terrain, target, &mut palette(), &mut FakeChunk::default(), &mut |message| panic!("{message}")), Ok(0));
+}
+
+#[test]
+fn a_linked_level_is_the_same_terrain_and_trees_shifted_by_its_offset() {
+    // Upstream runs one RealWorldGenerator per linked world, each with its own Y offset; the port
+    // shares the data stack and applies the level's offset when writing.
+    let (stack, _) = common::stack("trees-linked-offset", r#", "generate_trees": true"#);
+    let control = GenerationControl::default();
+    let (chunk_x, chunk_z) = chunk_at(&stack, -113.21, LATITUDE);
+    let terrain = terrain_for_generation(&stack, &control, chunk_x, chunk_z, &mut |message| panic!("{message}")).unwrap();
+    let base = TreeTarget { chunk_x, chunk_z, world: WORLD, level_seed: 1234, y_offset: stack.config().generator.y_offset };
+    let shift = 100;
+    let mut palette = palette();
+    let write = |target: TreeTarget, palette: &mut BlockPalette<usize>| {
+        let mut chunk = FakeChunk::default();
+        write_chunk_at(&stack, &terrain, target, palette, &mut chunk);
+        let mut trees = FakeChunk::default();
+        write_trees(&stack, &control, &terrain, target, palette, &mut trees, &mut |message| panic!("{message}")).unwrap();
+        (chunk, trees)
+    };
+    let (low, low_trees) = write(base, &mut palette);
+    let (high, high_trees) = write(TreeTarget { y_offset: base.y_offset + shift, ..base }, &mut palette);
+    let top = |chunk: &FakeChunk| {
+        let mut columns: BTreeMap<(i32, i32), (i32, String)> = BTreeMap::new();
+        for ([x, y, z], name) in &chunk.blocks {
+            let entry = columns.entry((*x, *z)).or_insert((*y, name.clone()));
+            if *y > entry.0 {
+                *entry = (*y, name.clone());
+            }
+        }
+        columns
+    };
+    let (low_top, high_top) = (top(&low), top(&high));
+    assert_eq!(low_top.len(), 256);
+    for (column, (y, name)) in &low_top {
+        assert_eq!(high_top[column], (y + shift, name.clone()), "column {column:?}");
+    }
+    assert!(!low_trees.blocks.is_empty());
+    let shifted: BTreeMap<[i32; 3], String> = low_trees.blocks.iter().map(|([x, y, z], name)| ([*x, y + shift, *z], name.clone())).collect();
+    assert_eq!(high_trees.blocks, shifted);
+    // The default target is the configured offset.
+    let mut plain = FakeChunk::default();
+    write_chunk(&stack, &terrain, chunk_x, chunk_z, WORLD, &mut palette, &mut plain);
+    assert_eq!(plain.blocks, low.blocks);
 }

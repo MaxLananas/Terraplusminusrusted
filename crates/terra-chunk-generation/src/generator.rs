@@ -6,6 +6,7 @@ use crate::java_random::LegacyRandom;
 use std::fmt;
 use std::sync::Arc;
 use terra_elevation::{ElevationError, LayeredScalarDataset, TileProvider, sample_chunk_heights};
+use terra_osm::{ChunkElements, OsmDataset, OsmError, apply_elements};
 use terra_projection::{GeographicProjection, ProjectedCoordinate, SharedProjection};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,23 +66,29 @@ pub struct GeneratorSettings {
     pub default_biome: Biome,
     /// `surface_material`.
     pub surface_material: Block,
+    /// `building_outlines_material`, `road_material` and `path_material` (deprecated upstream in
+    /// favour of `osm.json5`): surface blocks drawn by OpenStreetMap features, by block id,
+    /// replaced with another block.
+    pub surface_replacements: Vec<(String, Block)>,
 }
 
 impl Default for GeneratorSettings {
     fn default() -> Self {
-        Self { x_offset: 0, y_offset: 0, z_offset: 0, use_biome_dataset: true, default_biome: Biome::Plains, surface_material: Block::GrassBlock }
+        Self { x_offset: 0, y_offset: 0, z_offset: 0, use_biome_dataset: true, default_biome: Biome::Plains, surface_material: Block::GrassBlock, surface_replacements: Vec::new() }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenerationError {
     Elevation(ElevationError),
+    OpenStreetMap(OsmError),
 }
 
 impl fmt::Display for GenerationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Elevation(error) => write!(f, "elevation data unavailable: {error}"),
+            Self::OpenStreetMap(error) => write!(f, "OpenStreetMap data unavailable: {error}"),
         }
     }
 }
@@ -112,6 +119,7 @@ pub struct TerrainGenerator {
     heights: Arc<LayeredScalarDataset>,
     provider: Arc<dyn TileProvider>,
     koppen: Option<Arc<KoppenMap>>,
+    osm: Option<Arc<OsmDataset>>,
     settings: GeneratorSettings,
 }
 
@@ -124,7 +132,18 @@ impl TerrainGenerator {
         koppen: Option<Arc<KoppenMap>>,
         settings: GeneratorSettings,
     ) -> Self {
-        Self { projection, heights, provider, koppen, settings }
+        Self { projection, heights, provider, koppen, osm: None, settings }
+    }
+
+    /// Draws OpenStreetMap features (water, coastlines, roads, buildings) into chunk data.
+    #[must_use]
+    pub fn with_openstreetmap(mut self, osm: Arc<OsmDataset>) -> Self {
+        self.osm = Some(osm);
+        self
+    }
+
+    pub fn openstreetmap(&self) -> Option<&Arc<OsmDataset>> {
+        self.osm.as_ref()
     }
 
     pub fn settings(&self) -> &GeneratorSettings {
@@ -135,12 +154,22 @@ impl TerrainGenerator {
         &self.projection
     }
 
-    /// `ChunkDataLoader.load` restricted to the bakers that shape terrain: heights and null island.
+    /// `ChunkDataLoader.load` with the bakers that shape terrain, in upstream order: heights,
+    /// OpenStreetMap (when enabled) and null island. Tree cover is not baked.
     pub fn chunk_terrain(&self, chunk_x: i32, chunk_z: i32) -> Result<ChunkTerrain, GenerationError> {
         let heights = sample_chunk_heights(self.projection.as_ref(), &self.heights, self.provider.as_ref(), chunk_x, chunk_z)
             .map_err(GenerationError::Elevation)?;
+        let elements = match &self.osm {
+            Some(osm) => Some(osm.chunk_elements(chunk_x, chunk_z).map_err(GenerationError::OpenStreetMap)?),
+            None => None,
+        };
         let mut builder = ChunkDataBuilder::default();
         builder.bake_heights(heights.as_deref());
+        match elements {
+            Some(ChunkElements::Elements(elements)) => apply_elements(&elements, &mut builder, chunk_x, chunk_z),
+            Some(ChunkElements::OutsideProjection) => builder.bake_outside_projection(),
+            None => {}
+        }
         builder.bake_null_island(chunk_x, chunk_z);
         Ok(builder.build())
     }
@@ -187,7 +216,7 @@ impl TerrainGenerator {
                     continue;
                 }
                 let mut surface = match terrain.surface_block(x, z) {
-                    Some(block) => Block::from_material_name(&block.0),
+                    Some(block) => self.map_surface_block(&block.0),
                     None if ground_y >= start_mountain_height => Block::Stone,
                     None => {
                         let quart_x = base_x.wrapping_add((x as i32) & !3);
@@ -201,6 +230,15 @@ impl TerrainGenerator {
                 }
                 sink.fill(x, z, ground_y, ground_y, &surface);
             }
+        }
+    }
+
+    /// `BlockMapper.map`: a configured replacement for the block id, else the block state itself.
+    fn map_surface_block(&self, state: &str) -> Block {
+        let id = state.split_once('[').map_or(state, |(id, _)| id);
+        match self.settings.surface_replacements.iter().find(|(replaced, _)| replaced == id) {
+            Some((_, replacement)) => replacement.clone(),
+            None => Block::from_material_name(state),
         }
     }
 

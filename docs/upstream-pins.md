@@ -20,6 +20,7 @@ under `tools/oracle`.
 |---|---|---|
 | `crates/terra-projection/resources/conformal.gz` | terraminusminus | `crates/terra-projection/resources/NOTICE` |
 | `crates/terra-elevation/resources/heights_world.json5` | terraminusminus `heights.json5` (first two layers) | `crates/terra-elevation/resources/NOTICE` |
+| `crates/terra-osm/resources/osm.json5` | terraminusminus `dataset/osm/osm.json5` (byte-identical) | `crates/terra-osm/resources/NOTICE` |
 | `crates/terra-chunk-generation/resources/koppen_map.gz` | TerraPlusMinus (byte-identical) | `crates/terra-chunk-generation/resources/NOTICE` |
 | `fixtures/elevation/terrarium/12/759/1608.png` | maplibre-gl-js `763245d93043f479f6bf3f653b33d6368b68a886`, sha256 `0028d855e2def76dc8b5c7f484b4842f6f22185d8040718252a1142ce22bcceb` | BSD-3-Clause (MapLibre contributors, Mapbox); terrain data attribution per tilezen/joerd `docs/attribution.md` |
 

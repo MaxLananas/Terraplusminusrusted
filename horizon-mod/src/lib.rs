@@ -17,7 +17,8 @@ use std::time::Duration;
 use terra_chunk_generation::WorldHeight;
 use terra_server::{
     Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, LevelHeight, PendingTeleports, RegionIndex,
-    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, messages, messages::{ChatMessage, legacy_spans}, parse_server_config, terrain_for_generation, write_chunk,
+    ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, extract_default_osm_mapping, messages, messages::{ChatMessage, legacy_spans}, parse_server_config,
+    split_block_state, terrain_for_generation, write_chunk,
 };
 
 const MOD_ID: &str = "terraplusminus";
@@ -57,14 +58,28 @@ fn load_shared(context: &RegistrationContext) -> Result<Shared, String> {
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     let base = path.parent().map_or(instance.clone(), PathBuf::from);
+    if config.openstreetmap.enabled && config.openstreetmap.mapping.is_none() {
+        // TerraPlusMinus drops the default mapping beside its config so it can be edited.
+        match extract_default_osm_mapping(&base) {
+            Ok(true) => log(&format!("created the default OpenStreetMap mapping at {}", base.join(terra_server::OSM_MAPPING_FILE).display())),
+            Ok(false) => {}
+            Err(error) => log(&format!("could not write the default OpenStreetMap mapping into {}: {error}", base.display())),
+        }
+    }
     let stack = TerraStack::build(config, &base).map_err(|error| error.to_string())?;
     Ok(Shared { stack, gate: GenerationGate::default(), counters: GenerationCounters::default() })
 }
 
 struct EarthGenerator {
     shared: Arc<Shared>,
-    /// Every block the generator can place, by resource name, resolved at registration.
-    blocks: Vec<(String, BlockKey)>,
+    /// Every block the generator can place, by block state string, resolved at registration.
+    blocks: Vec<RegisteredBlock>,
+}
+
+struct RegisteredBlock {
+    name: String,
+    key: BlockKey,
+    properties: Vec<(String, String)>,
 }
 
 struct AccessWriter<'a>(&'a mut dyn ChunkAccess);
@@ -85,7 +100,15 @@ impl ChunkGenerator for EarthGenerator {
         });
         let terrain = terrain_for_generation(&shared.stack, &shared.counters, position.x, position.z, &mut |message| log(&message));
         let world = WorldHeight { min_y: chunk.min_y(), max_y: chunk.min_y() + chunk.height() };
-        let resolved: Vec<(String, BlockState)> = self.blocks.iter().map(|(name, key)| (name.clone(), chunk.state(*key))).collect();
+        let resolved: Vec<(String, BlockState)> = self
+            .blocks
+            .iter()
+            .map(|block| {
+                let properties: Vec<(&str, &str)> = block.properties.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+                let state = if properties.is_empty() { chunk.state(block.key) } else { chunk.state_with(block.key, &properties) };
+                (block.name.clone(), state)
+            })
+            .collect();
         let Some(&(_, stone)) = resolved.first() else { return };
         let mut palette = BlockPalette::new(move |name: &str| resolved.iter().find(|(known, _)| known == name).map_or(stone, |(_, state)| *state));
         write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut AccessWriter(chunk));
@@ -274,12 +297,21 @@ impl Hooks for TerraPlusMinus {
             }
         };
         let world = shared.stack.config().world;
-        let mut names = vec!["minecraft:stone", "minecraft:water", "minecraft:grass_block", "minecraft:dirt", "minecraft:sand", "minecraft:snow_block"];
-        let surface = shared.stack.config().generator.surface_material.resource_name().to_owned();
-        if !names.contains(&surface.as_str()) {
-            names.push(&surface);
+        let mut names: Vec<String> = ["minecraft:stone", "minecraft:water", "minecraft:grass_block", "minecraft:dirt", "minecraft:sand", "minecraft:snow_block"].map(str::to_owned).into();
+        names.push(shared.stack.config().generator.surface_material.resource_name().to_owned());
+        names.extend(shared.stack.surface_block_names());
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
+        let mut blocks = Vec::with_capacity(names.len());
+        for name in names {
+            match split_block_state(&name) {
+                Some((id, properties)) => {
+                    let properties = properties.into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+                    blocks.push(RegisteredBlock { key: registrar.block_key(id), name, properties });
+                }
+                None => log(&format!("ignoring malformed block state `{name}`; stone is placed instead")),
+            }
         }
-        let blocks = names.iter().map(|name| ((*name).to_owned(), registrar.block_key(name))).collect();
         let _ = self.air.set(["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].into_iter().map(|name| registrar.block_key(name)).collect());
         registrar.register_chunk_generator(DIMENSION, EarthGenerator { shared: Arc::clone(&shared), blocks });
         registrar.register_biome_source(DIMENSION, EarthBiomes { shared: Arc::clone(&shared), lookup: BiomeLookup::default() });

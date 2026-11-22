@@ -1,5 +1,6 @@
 //! The offline stack shared by the integration tests: the repository's terrarium fixture tile
-//! served from a local mirror, with a disk tile cache in a scratch directory.
+//! served from a local mirror, with a disk tile cache in a scratch directory. OpenStreetMap is
+//! off unless `extra` configures it; `https://osm.fixture/` mirrors `<scratch>/osm`.
 
 #![allow(dead_code, clippy::unwrap_used)]
 
@@ -15,6 +16,7 @@ pub fn scratch(name: &str) -> PathBuf {
 
 pub fn stack(name: &str, extra: &str) -> (TerraStack, PathBuf) {
     let directory = scratch(name);
+    std::fs::create_dir_all(directory.join("osm")).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/elevation/terrarium");
     std::fs::write(
         directory.join("heights.json5"),
@@ -24,10 +26,11 @@ pub fn stack(name: &str, extra: &str) -> (TerraStack, PathBuf) {
     )
     .unwrap();
     let biomes = if extra.contains("\"biomes\"") { "" } else { r#""biomes": {"use_dataset": false},"# };
+    let osm = if extra.contains("\"openstreetmap\"") { "" } else { r#""openstreetmap": {"enabled": false},"# };
     let generation = if extra.contains("\"generation\"") { r#""config_version": 1"# } else { r#""generation": {"workers": 2}"# };
     let config = parse_server_config(&format!(
-        r#"{{"elevation": {{"heights_config": "heights.json5"}}, {biomes}
-            "network": {{"mirrors": {{"mirror://terrarium/": "{}"}}, "cache_directory": "tile-cache"}},
+        r#"{{"elevation": {{"heights_config": "heights.json5"}}, {biomes} {osm}
+            "network": {{"mirrors": {{"mirror://terrarium/": "{}", "https://osm.fixture/": "osm"}}, "cache_directory": "tile-cache"}},
             "world": {{"min_y": -64, "height": 2096}}, {generation} {extra}}}"#,
         fixtures.display()
     ))

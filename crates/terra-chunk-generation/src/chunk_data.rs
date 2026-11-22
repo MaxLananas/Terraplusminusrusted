@@ -1,6 +1,7 @@
 //! `CachedChunkData` and its builder: per-column surface and ground heights after water baking.
 
 use terra_elevation::numeric::{floor_i, lerp};
+use terra_osm::{BlockState, DrawTarget};
 
 pub const BLANK_HEIGHT: i32 = -1;
 const WATER_DEPTH_OFFSET: i32 = 1;
@@ -24,11 +25,36 @@ pub struct ChunkDataBuilder {
     surface_height: [i32; COLUMNS],
     water_depth: [i8; COLUMNS],
     surface_blocks: Vec<Option<SurfaceBlock>>,
+    trees_cleared: [bool; COLUMNS],
 }
 
 impl Default for ChunkDataBuilder {
     fn default() -> Self {
-        Self { surface_height: [BLANK_HEIGHT; COLUMNS], water_depth: [WATER_DEPTH_DEFAULT; COLUMNS], surface_blocks: vec![None; COLUMNS] }
+        Self {
+            surface_height: [BLANK_HEIGHT; COLUMNS],
+            water_depth: [WATER_DEPTH_DEFAULT; COLUMNS],
+            surface_blocks: vec![None; COLUMNS],
+            trees_cleared: [false; COLUMNS],
+        }
+    }
+}
+
+/// `OSMBaker` draws through the same builder methods as upstream's `CachedChunkData.Builder`.
+impl DrawTarget for ChunkDataBuilder {
+    fn update_water_depth(&mut self, x: usize, z: usize, depth: i32) {
+        ChunkDataBuilder::update_water_depth(self, x, z, depth);
+    }
+
+    fn update_ocean_depth(&mut self, x: usize, z: usize, depth: i32) {
+        ChunkDataBuilder::update_ocean_depth(self, x, z, depth);
+    }
+
+    fn set_surface_block(&mut self, x: usize, z: usize, block: &BlockState) {
+        ChunkDataBuilder::set_surface_block(self, x, z, Some(SurfaceBlock(block.to_string())));
+    }
+
+    fn clear_tree_cover(&mut self, x: usize, z: usize) {
+        self.trees_cleared[column(x, z)] = true;
     }
 }
 
@@ -60,6 +86,11 @@ impl ChunkDataBuilder {
         }
     }
 
+    /// `OSMBaker.bake` without data: the chunk is outside the projection, so all of it is ocean.
+    pub fn bake_outside_projection(&mut self) {
+        self.water_depth.fill((TYPE_OCEAN | !TYPE_MASK) as i8);
+    }
+
     /// `HeightsBaker.bake`.
     pub fn bake_heights(&mut self, heights: Option<&[f64]>) {
         let Some(heights) = heights.filter(|heights| heights.len() == COLUMNS) else {
@@ -82,6 +113,7 @@ impl ChunkDataBuilder {
     pub fn bake_null_island(&mut self, chunk_x: i32, chunk_z: i32) {
         if is_null_island(chunk_x, chunk_z) {
             self.surface_height.fill(-1);
+            self.trees_cleared.fill(true);
             self.water_depth.fill(WATER_DEPTH_DEFAULT);
         }
     }
@@ -119,6 +151,7 @@ impl ChunkDataBuilder {
             surface_height,
             ground_height,
             surface_blocks: self.surface_blocks.clone(),
+            trees_cleared: self.trees_cleared,
             surface_min_cube: (min >> 4) - 1,
             surface_max_cube: (max >> 4) + 1,
         }
@@ -135,6 +168,7 @@ pub struct ChunkTerrain {
     surface_height: [i32; COLUMNS],
     ground_height: [i32; COLUMNS],
     surface_blocks: Vec<Option<SurfaceBlock>>,
+    trees_cleared: [bool; COLUMNS],
     surface_min_cube: i32,
     surface_max_cube: i32,
 }
@@ -154,6 +188,11 @@ impl ChunkTerrain {
 
     pub fn surface_block(&self, x: usize, z: usize) -> Option<&SurfaceBlock> {
         self.surface_blocks[column(x, z)].as_ref()
+    }
+
+    /// False where an OpenStreetMap feature drew `no_trees` (roads, buildings, rivers).
+    pub fn trees_allowed(&self, x: usize, z: usize) -> bool {
+        !self.trees_cleared[column(x, z)]
     }
 
     pub fn above_surface(&self, cube_y: i32) -> bool {

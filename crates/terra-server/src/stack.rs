@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use terra_acquisition::{DiskCache, DiskCacheLimits, DiskCachedFetcher, HttpTileFetcher, PlainHttpTransport, RetryPolicy, RoutingFetcher, TransportLimits};
 use terra_chunk_generation::{
-    ChunkLoader, ChunkTerrain, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, LoaderError, TerrainGenerator, verify_or_record,
+    Block, ChunkLoader, ChunkTerrain, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, LoaderError, TerrainGenerator, verify_or_record,
 };
+use terra_osm::{DEFAULT_OSM_CONFIG, OsmDataset, OsmMapper, OsmSettings};
 use terra_elevation::{CachingTileProvider, DEFAULT_WORLD_HEIGHTS, ElevationError, FetchOutcome, TileFetcher, load_heights_config};
 
 #[derive(Debug)]
@@ -19,6 +20,7 @@ pub enum StackError {
     Elevation(ElevationError),
     Biomes(String),
     Projection(String),
+    OpenStreetMap(String),
 }
 
 impl std::fmt::Display for StackError {
@@ -28,15 +30,17 @@ impl std::fmt::Display for StackError {
             Self::Elevation(error) => write!(f, "elevation config: {error}"),
             Self::Biomes(reason) => write!(f, "biome raster: {reason}"),
             Self::Projection(reason) => write!(f, "projection: {reason}"),
+            Self::OpenStreetMap(reason) => write!(f, "OpenStreetMap: {reason}"),
         }
     }
 }
 
 impl std::error::Error for StackError {}
 
-struct BoxedFetcher(Box<dyn TileFetcher>);
+/// The acquisition chain (mirrors, HTTP, disk cache), shared by elevation and OpenStreetMap.
+struct SharedFetcher(Arc<dyn TileFetcher>);
 
-impl TileFetcher for BoxedFetcher {
+impl TileFetcher for SharedFetcher {
     fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
         self.0.fetch(url)
     }
@@ -65,20 +69,28 @@ impl TerraStack {
         let policy = RetryPolicy { max_attempts: network.attempts, max_per_host: network.max_per_host, ..RetryPolicy::default() };
         let mirrors: Vec<_> = network.mirrors.iter().map(|(prefix, directory)| (prefix.clone(), base_directory.join(directory))).collect();
         let routing = RoutingFetcher::new(&mirrors, HttpTileFetcher::new(PlainHttpTransport::default(), limits, policy), network.plain_http_hosts.clone());
-        let fetcher: Box<dyn TileFetcher> = match &network.cache_directory {
+        let fetcher: Arc<dyn TileFetcher> = match &network.cache_directory {
             Some(directory) => {
                 let directory = base_directory.join(directory);
                 let cache = DiskCache::open(&directory, DiskCacheLimits { max_bytes: network.cache_max_bytes, ..DiskCacheLimits::default() })
                     .map_err(|error| StackError::Io(format!("opening tile cache {}: {error}", directory.display())))?;
-                Box::new(DiskCachedFetcher::new(cache, routing))
+                Arc::new(DiskCachedFetcher::new(cache, routing))
             }
-            None => Box::new(routing),
+            None => Arc::new(routing),
         };
-        let provider = Arc::new(CachingTileProvider::new(BoxedFetcher(fetcher), network.memory_cache_tiles));
+        let provider = Arc::new(CachingTileProvider::new(SharedFetcher(Arc::clone(&fetcher)), network.memory_cache_tiles));
         let koppen = if config.generator.use_biome_dataset { Some(KoppenMap::embedded().map_err(|error| StackError::Biomes(error.to_string()))?) } else { None };
         let projection = terra_projection::terraplusminus_projection(config.generator.x_offset, config.generator.z_offset).map_err(|error| StackError::Projection(error.to_string()))?;
-        let fingerprint = GenerationFingerprint::compute(&config.generator, config.world, heights_text.as_bytes(), koppen.as_ref().map(|_| KoppenMap::embedded_bytes()));
-        let generator = TerrainGenerator::new(projection, Arc::new(layers.dataset), provider, koppen, config.generator.clone());
+        let mut fingerprint = GenerationFingerprint::compute(&config.generator, config.world, heights_text.as_bytes(), koppen.as_ref().map(|_| KoppenMap::embedded_bytes()));
+        let mut generator = TerrainGenerator::new(Arc::clone(&projection), Arc::new(layers.dataset), provider, koppen, config.generator.clone());
+        let osm_config = &config.openstreetmap;
+        if osm_config.enabled {
+            let (mapping_text, source) = read_osm_mapping(osm_config.mapping.as_deref(), base_directory)?;
+            let mapper = OsmMapper::parse(&mapping_text).map_err(|error| StackError::OpenStreetMap(format!("{source}: {error}")))?;
+            let settings = OsmSettings { servers: osm_config.servers.clone(), tile_cache_entries: osm_config.memory_cache_tiles, ..OsmSettings::default() };
+            fingerprint = fingerprint.with_openstreetmap(mapping_text.as_bytes(), &settings.servers);
+            generator = generator.with_openstreetmap(Arc::new(OsmDataset::new(Arc::new(mapper), projection, fetcher, &settings)));
+        }
         let loader = ChunkLoader::new(Arc::new(generator), config.loader).map_err(|error| StackError::Io(format!("starting chunk workers: {error}")))?;
         Ok(Self { config, loader, fingerprint, skipped_layers: layers.skipped })
     }
@@ -93,6 +105,25 @@ impl TerraStack {
 
     pub fn generator(&self) -> &TerrainGenerator {
         self.loader.generator()
+    }
+
+    /// Every block the generator can place on the surface from OpenStreetMap features, as block
+    /// state strings (`minecraft:bricks`, `minecraft:oak_slab[type=top]`), deduplicated.
+    pub fn surface_block_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let replacements = &self.config.generator.surface_replacements;
+        if let Some(osm) = self.generator().openstreetmap() {
+            for block in osm.mapper().blocks() {
+                let name = block.to_string();
+                match replacements.iter().find(|(id, _)| *id == block.id) {
+                    Some((_, replacement)) => names.push(replacement.resource_name().to_owned()),
+                    None => names.push(Block::from_material_name(&name).resource_name().to_owned()),
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
+        names
     }
 
     pub fn skipped_layers(&self) -> &[String] {
@@ -132,9 +163,51 @@ impl TerraStack {
         let mut report = String::new();
         let _ = writeln!(report, "chunk data: {} queued, {} running, {} ready; {} completed, {} failed", loader.queued, loader.running, loader.ready, loader.completed, loader.failed);
         let _ = writeln!(report, "requests: {} deduplicated, {} cancelled, {} refused (queue full)", loader.deduplicated, loader.cancelled, loader.rejected);
+        if let Some(osm) = self.generator().openstreetmap() {
+            let statistics = osm.statistics();
+            let _ = writeln!(
+                report,
+                "OpenStreetMap: {} tiles cached ({} hits, {} misses), {} resources cached",
+                statistics.tiles.entries, statistics.tiles.hits, statistics.tiles.misses, statistics.resources.entries
+            );
+        }
         if !self.skipped_layers.is_empty() {
             let _ = writeln!(report, "elevation layers skipped: {}", self.skipped_layers.len());
         }
         report
+    }
+}
+
+/// File name of the editable mapping beside the configuration, as TerraPlusMinus extracts it.
+pub const OSM_MAPPING_FILE: &str = "osm.json5";
+
+/// The `osm.json5` text and where it came from: the configured path, `osm.json5` beside the
+/// configuration, or the bundled default.
+fn read_osm_mapping(configured: Option<&Path>, base_directory: &Path) -> Result<(String, String), StackError> {
+    let read = |path: &Path| std::fs::read_to_string(path).map_err(|error| StackError::Io(format!("reading {}: {error}", path.display())));
+    if let Some(path) = configured {
+        let path = base_directory.join(path);
+        return Ok((read(&path)?, path.display().to_string()));
+    }
+    let beside = base_directory.join(OSM_MAPPING_FILE);
+    match std::fs::metadata(&beside) {
+        Ok(_) => Ok((read(&beside)?, beside.display().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((DEFAULT_OSM_CONFIG.to_owned(), "bundled osm.json5".to_owned())),
+        Err(error) => Err(StackError::Io(format!("reading {}: {error}", beside.display()))),
+    }
+}
+
+/// Writes the bundled `osm.json5` beside the configuration for editing, unless a file is
+/// already there (`Terraplusminus.extractTerraConfigFileToPluginDir`). Returns whether it wrote.
+pub fn extract_default_osm_mapping(base_directory: &Path) -> std::io::Result<bool> {
+    let path = base_directory.join(OSM_MAPPING_FILE);
+    std::fs::create_dir_all(base_directory)?;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            std::io::Write::write_all(&mut file, DEFAULT_OSM_CONFIG.as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
     }
 }

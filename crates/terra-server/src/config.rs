@@ -25,6 +25,24 @@ pub struct NetworkConfig {
     pub memory_cache_tiles: usize,
 }
 
+/// Settings for TerraMinusMinus' OpenStreetMap data (water, coastlines, roads, buildings).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenStreetMapConfig {
+    pub enabled: bool,
+    /// URL prefixes of the GeoJSON tile servers, tried in order.
+    pub servers: Vec<String>,
+    /// Mapping file; `None` uses `osm.json5` beside the configuration, else the bundled default.
+    pub mapping: Option<PathBuf>,
+    pub memory_cache_tiles: usize,
+}
+
+impl Default for OpenStreetMapConfig {
+    fn default() -> Self {
+        let settings = terra_osm::OsmSettings::default();
+        Self { enabled: true, servers: settings.servers, mapping: None, memory_cache_tiles: settings.tile_cache_entries }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionLevels {
     pub tpll: u8,
@@ -49,6 +67,7 @@ pub struct ServerConfig {
     pub heights_config: Option<PathBuf>,
     pub unsupported_layers: UnsupportedLayerPolicy,
     pub network: NetworkConfig,
+    pub openstreetmap: OpenStreetMapConfig,
     pub permissions: PermissionLevels,
     pub loader: LoaderLimits,
     pub generation_wait: Duration,
@@ -78,6 +97,7 @@ impl Default for ServerConfig {
                 total_timeout: Duration::from_secs(30),
                 memory_cache_tiles: 512,
             },
+            openstreetmap: OpenStreetMapConfig::default(),
             permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0 },
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
@@ -164,7 +184,8 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         &document,
         &[
             "terrain_offset", "min_latitude", "max_latitude", "min_longitude", "max_longitude", "linked_worlds", "generate_trees", "biomes",
-            "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version", "prefix",
+            "surface_material", "world", "elevation", "network", "permissions", "generation", "config_version", "prefix", "openstreetmap",
+            "building_outlines_material", "road_material", "path_material",
         ],
     )?;
     let mut config = ServerConfig::default();
@@ -208,6 +229,30 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
     }
     if let Some(material) = root.string("surface_material")? {
         config.generator.surface_material = Block::from_material_name(material);
+    }
+    for (key, block) in [("building_outlines_material", "minecraft:bricks"), ("road_material", "minecraft:gray_concrete"), ("path_material", "minecraft:dirt_path")] {
+        if let Some(material) = root.string(key)? {
+            config.generator.surface_replacements.push((block.to_owned(), Block::from_material_name(material)));
+        }
+    }
+    if let Some(osm) = root.section("openstreetmap", &["enabled", "servers", "mapping", "memory_cache_tiles"])? {
+        let target = &mut config.openstreetmap;
+        target.enabled = osm.boolean("enabled", true)?;
+        if let Some(servers) = osm.get("servers") {
+            target.servers.clear();
+            for server in servers.as_array_lenient() {
+                let server = server.as_str().ok_or_else(|| ConfigError("openstreetmap.servers must be URL prefixes".into()))?;
+                if !(server.starts_with("http://") || server.starts_with("https://")) || !server.ends_with('/') {
+                    return Err(ConfigError(format!("openstreetmap.servers entry `{server}` must be an http(s) URL ending in `/`")));
+                }
+                target.servers.push(server.to_owned());
+            }
+            if target.servers.is_empty() && target.enabled {
+                return Err(ConfigError("openstreetmap.servers is empty; set openstreetmap.enabled to false instead".into()));
+            }
+        }
+        target.mapping = osm.string("mapping")?.map(PathBuf::from);
+        target.memory_cache_tiles = osm.integer("memory_cache_tiles", target.memory_cache_tiles as i64, 1..=65_536)? as usize;
     }
     if let Some(world) = root.section("world", &["min_y", "height"])? {
         let min_y = world.integer("min_y", -64, -2032..=2016)? as i32;
@@ -300,6 +345,22 @@ mod tests {
         assert_eq!(config.world, WorldHeight { min_y: -2032, max_y: 2032 });
         assert_eq!(config.linked_worlds.worlds[1].offset, -2032);
         assert_eq!(config.network.plain_http_hosts, vec!["s3.amazonaws.com".to_owned()]);
+        assert!(config.openstreetmap.enabled);
+    }
+
+    #[test]
+    fn openstreetmap_settings_and_deprecated_materials() {
+        let config = parse_server_config(
+            r#"{"openstreetmap": {"enabled": false, "servers": ["http://osm.example/data/"], "mapping": "osm-custom.json5"}, "road_material": "STONE"}"#,
+        )
+        .unwrap();
+        assert!(!config.openstreetmap.enabled);
+        assert_eq!(config.openstreetmap.servers, vec!["http://osm.example/data/".to_owned()]);
+        assert_eq!(config.openstreetmap.mapping, Some(PathBuf::from("osm-custom.json5")));
+        assert_eq!(config.generator.surface_replacements, vec![("minecraft:gray_concrete".to_owned(), Block::Stone)]);
+        for text in [r#"{"openstreetmap": {"servers": []}}"#, r#"{"openstreetmap": {"servers": ["ftp://x/"]}}"#, r#"{"openstreetmap": {"server": []}}"#] {
+            assert!(parse_server_config(text).is_err(), "{text}");
+        }
     }
 
     #[test]

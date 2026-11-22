@@ -1,0 +1,27 @@
+osm.json5 is TerraMinusMinus' default OpenStreetMap mapping
+(https://github.com/SmylerMC/terraminusminus, commit a1432a9beabd79025e62c8de0d0b1a99e7ea9943,
+src/main/resources/net/buildtheearth/terraminusminus/dataset/osm/osm.json5), unmodified
+(sha256 b7b000a14b6a939cb609844a55ae5e8262455e7b1c5d1998eb487ca64ec51342).
+
+TerraMinusMinus is distributed under the MIT License:
+MIT License
+
+Copyright (c) 2020 BuildTheEarth.net
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

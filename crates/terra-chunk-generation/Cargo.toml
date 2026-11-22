@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 terra-codec = { path = "../terra-codec" }
 terra-elevation = { path = "../terra-elevation" }
+terra-osm = { path = "../terra-osm" }
 terra-projection = { path = "../terra-projection" }

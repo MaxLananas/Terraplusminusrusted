@@ -78,7 +78,18 @@ impl fmt::Display for JsonError {
 impl std::error::Error for JsonError {}
 
 pub fn parse_relaxed_json(text: &str) -> Result<JsonValue, JsonError> {
-    let mut parser = Parser { bytes: text.as_bytes(), position: 0 };
+    parse(text, false)
+}
+
+/// The same dialect read the way Gson's streaming readers consume it: objects keep every member in
+/// document order, repeated names included. TerraMinusMinus' `osm.json5` relies on this, using
+/// objects as ordered lists of typed entries.
+pub fn parse_relaxed_json_with_duplicate_keys(text: &str) -> Result<JsonValue, JsonError> {
+    parse(text, true)
+}
+
+fn parse(text: &str, allow_duplicate_keys: bool) -> Result<JsonValue, JsonError> {
+    let mut parser = Parser { bytes: text.as_bytes(), position: 0, allow_duplicate_keys };
     let value = parser.value(0)?;
     parser.skip_insignificant()?;
     if parser.position != parser.bytes.len() {
@@ -90,6 +101,7 @@ pub fn parse_relaxed_json(text: &str) -> Result<JsonValue, JsonError> {
 struct Parser<'a> {
     bytes: &'a [u8],
     position: usize,
+    allow_duplicate_keys: bool,
 }
 
 impl Parser<'_> {
@@ -176,7 +188,7 @@ impl Parser<'_> {
                 _ => return Err(self.error("expected a double-quoted member name or `}`")),
             }
             let key = self.string()?;
-            if members.iter().any(|(name, _)| *name == key) {
+            if !self.allow_duplicate_keys && members.iter().any(|(name, _)| *name == key) {
                 return Err(self.error(format!("duplicate member `{key}`")));
             }
             self.skip_insignificant()?;
@@ -344,6 +356,13 @@ mod tests {
         }
         let error = parse_relaxed_json("{\n  \"a\": x}").unwrap_err();
         assert_eq!((error.line, error.column), (2, 8));
+    }
+
+    #[test]
+    fn keeps_repeated_members_in_order_when_asked() {
+        let value = parse_relaxed_json_with_duplicate_keys(r#"{"a": 1, "b": 2, "a": 3}"#).unwrap();
+        let names: Vec<_> = value.as_object().unwrap().iter().map(|(name, value)| (name.as_str(), value.as_f64())).collect();
+        assert_eq!(names, vec![("a", Some(1.0)), ("b", Some(2.0)), ("a", Some(3.0))]);
     }
 
     #[test]

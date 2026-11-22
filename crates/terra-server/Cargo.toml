@@ -14,4 +14,5 @@ terra-acquisition = { path = "../terra-acquisition" }
 terra-chunk-generation = { path = "../terra-chunk-generation" }
 terra-codec = { path = "../terra-codec" }
 terra-elevation = { path = "../terra-elevation" }
+terra-osm = { path = "../terra-osm" }
 terra-projection = { path = "../terra-projection" }

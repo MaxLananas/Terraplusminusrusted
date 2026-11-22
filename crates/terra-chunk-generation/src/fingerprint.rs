@@ -25,7 +25,7 @@ impl GenerationFingerprint {
     /// `heights_config` and `biome_raster` are the exact bytes generation reads.
     pub fn compute(settings: &GeneratorSettings, world: WorldHeight, heights_config: &[u8], biome_raster: Option<&[u8]>) -> Self {
         let digest = |bytes: &[u8]| format!("{:016x}:{}", fnv1a64(bytes), bytes.len());
-        let fields = vec![
+        let mut fields = vec![
             ("algorithm".to_owned(), GENERATION_ALGORITHM_VERSION.to_string()),
             ("projection".to_owned(), "bte_conformal_dymaxion".to_owned()),
             ("x_offset".to_owned(), settings.x_offset.to_string()),
@@ -39,7 +39,22 @@ impl GenerationFingerprint {
             ("heights_config".to_owned(), digest(heights_config)),
             ("biome_raster".to_owned(), biome_raster.map_or_else(|| "none".to_owned(), digest)),
         ];
+        // Fields added after the first release are written only when in use, so worlds created
+        // before them keep matching while they stay unused.
+        if !settings.surface_replacements.is_empty() {
+            let rendered: Vec<String> = settings.surface_replacements.iter().map(|(id, block)| format!("{id}>{}", block.resource_name())).collect();
+            fields.push(("surface_replacements".to_owned(), rendered.join(",")));
+        }
         Self { fields }
+    }
+
+    /// Records that OpenStreetMap features are drawn: `mapping` is the exact `osm.json5` text and
+    /// `servers` the data sources, in order.
+    #[must_use]
+    pub fn with_openstreetmap(mut self, mapping: &[u8], servers: &[String]) -> Self {
+        self.fields.push(("osm_mapping".to_owned(), format!("{:016x}:{}", fnv1a64(mapping), mapping.len())));
+        self.fields.push(("osm_servers".to_owned(), servers.join(" ")));
+        self
     }
 
     fn render(&self) -> String {
@@ -158,6 +173,17 @@ mod tests {
         let edited = GenerationFingerprint::compute(&settings, WORLD, b"heights2", Some(b"koppen"));
         assert!(matches!(verify_or_record(&directory, &edited), Err(FingerprintError::Mismatch(_))));
         assert_eq!(verify_or_record(&directory, &current).unwrap(), FingerprintStatus::Matched, "stored fingerprint left untouched");
+        let with_osm = current.clone().with_openstreetmap(b"{}", &["https://osm.example/".to_owned()]);
+        match verify_or_record(&directory, &with_osm) {
+            Err(FingerprintError::Mismatch(differences)) => {
+                let keys: Vec<&str> = differences.iter().map(|(key, stored, _)| {
+                    assert_eq!(stored, "<absent>");
+                    key.as_str()
+                }).collect();
+                assert_eq!(keys, vec!["osm_mapping", "osm_servers"]);
+            }
+            other => panic!("enabling OpenStreetMap must not match a world generated without it: {other:?}"),
+        }
         fs::write(directory.join(FINGERPRINT_FILE_NAME), "garbage").unwrap();
         assert!(matches!(verify_or_record(&directory, &current), Err(FingerprintError::Corrupt(_))));
         fs::remove_dir_all(directory).unwrap();

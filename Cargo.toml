@@ -5,6 +5,7 @@ members = [
     "crates/terra-codec",
     "crates/terra-projection",
     "crates/terra-elevation",
+    "crates/terra-osm",
     "crates/terra-acquisition",
     "crates/terra-chunk-generation",
     "crates/terra-server",

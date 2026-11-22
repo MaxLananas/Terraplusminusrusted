@@ -10,7 +10,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES = ["terra-codec", "terra-projection", "terra-elevation", "terra-acquisition", "terra-chunk-generation", "terra-server"]
+CRATES = ["terra-codec", "terra-projection", "terra-elevation", "terra-osm", "terra-acquisition", "terra-chunk-generation", "terra-server"]
 
 
 def explicit_lints(workspace):

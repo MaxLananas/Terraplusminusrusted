@@ -101,7 +101,7 @@ pub fn terrain_for_generation(stack: &TerraStack, counters: &GenerationCounters,
             Ok(terrain) => return terrain,
             Err(reason) => {
                 let retries = counters.data_retries.fetch_add(1, Ordering::Relaxed) + 1;
-                log(format!("chunk ({chunk_x}, {chunk_z}) waits for elevation data: {reason} (retry {retries})"));
+                log(format!("chunk ({chunk_x}, {chunk_z}) waits for map data: {reason} (retry {retries})"));
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
@@ -202,9 +202,35 @@ impl BiomeLookup {
     }
 }
 
+/// Splits a block state string (`minecraft:oak_slab[type=top,waterlogged=false]`) into the block
+/// id and its properties, for engines that resolve the two separately. `None` when malformed.
+pub fn split_block_state(state: &str) -> Option<(&str, Vec<(&str, &str)>)> {
+    let Some((id, rest)) = state.split_once('[') else {
+        return (!state.is_empty()).then_some((state, Vec::new()));
+    };
+    let properties = rest.strip_suffix(']')?;
+    if id.is_empty() {
+        return None;
+    }
+    if properties.is_empty() {
+        return Some((id, Vec::new()));
+    }
+    let pairs = properties.split(',').map(|pair| pair.split_once('=').filter(|(key, value)| !key.is_empty() && !value.is_empty())).collect::<Option<Vec<_>>>()?;
+    Some((id, pairs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_states_split_into_id_and_properties() {
+        assert_eq!(split_block_state("minecraft:bricks"), Some(("minecraft:bricks", vec![])));
+        assert_eq!(split_block_state("minecraft:oak_slab[type=top,waterlogged=false]"), Some(("minecraft:oak_slab", vec![("type", "top"), ("waterlogged", "false")])));
+        for malformed in ["", "[a=b]", "minecraft:x[a=b", "minecraft:x[a]", "minecraft:x[=b]"] {
+            assert_eq!(split_block_state(malformed), None, "{malformed}");
+        }
+    }
 
     #[test]
     fn gate_follows_fingerprint_outcomes() {

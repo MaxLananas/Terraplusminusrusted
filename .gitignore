@@ -2,3 +2,4 @@
 /artifacts/
 /.upstream/
 /tools/oracle/build/
+__pycache__/

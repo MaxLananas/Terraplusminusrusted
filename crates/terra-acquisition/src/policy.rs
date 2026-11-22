@@ -16,6 +16,9 @@ pub struct RetryPolicy {
     pub max_retry_after: Duration,
     /// Requests in flight per host.
     pub max_per_host: usize,
+    /// Hard deadline for one fetch: queueing for the host, every attempt and every backoff.
+    /// Each attempt's transport deadline is cut to what is left.
+    pub fetch_deadline: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -26,6 +29,7 @@ impl Default for RetryPolicy {
             max_backoff: Duration::from_secs(8),
             max_retry_after: Duration::from_secs(30),
             max_per_host: 8,
+            fetch_deadline: Duration::from_secs(90),
         }
     }
 }
@@ -64,21 +68,25 @@ impl<T: HttpTransport> HttpTileFetcher<T> {
         Self { transport, limits, policy, hosts: Mutex::new(HashMap::new()), host_released: Condvar::new() }
     }
 
-    fn acquire(&self, host: &str) {
+    /// Takes a slot for `host`, or returns false when the deadline passes first.
+    fn acquire(&self, host: &str, deadline: Instant) -> bool {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             let state = hosts.entry(host.to_owned()).or_default();
             let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
             match state.cooldown_until {
                 Some(until) if until > now => {
-                    hosts = self.host_released.wait_timeout(hosts, until - now).unwrap_or_else(PoisonError::into_inner).0;
+                    hosts = self.host_released.wait_timeout(hosts, until.min(deadline) - now).unwrap_or_else(PoisonError::into_inner).0;
                 }
                 _ if state.in_flight >= self.policy.max_per_host.max(1) => {
-                    hosts = self.host_released.wait(hosts).unwrap_or_else(PoisonError::into_inner);
+                    hosts = self.host_released.wait_timeout(hosts, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
                 }
                 _ => {
                     state.in_flight += 1;
-                    return;
+                    return true;
                 }
             }
         }
@@ -96,8 +104,10 @@ impl<T: HttpTransport> HttpTileFetcher<T> {
         self.host_released.notify_all();
     }
 
-    fn attempt(&self, url: &str) -> AttemptOutcome {
-        match self.transport.get(url, &self.limits) {
+    fn attempt(&self, url: &str, deadline: Instant) -> AttemptOutcome {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let limits = TransportLimits { total_timeout: self.limits.total_timeout.min(left), ..self.limits };
+        match self.transport.get(url, &limits) {
             Ok(response) => match response.status {
                 200 => AttemptOutcome::Done(Ok(FetchOutcome::Found(response.body))),
                 404 => AttemptOutcome::Done(Ok(FetchOutcome::Missing)),
@@ -125,11 +135,15 @@ impl<T: HttpTransport> HttpTileFetcher<T> {
 impl<T: HttpTransport> TileFetcher for HttpTileFetcher<T> {
     fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
         let host = host_of(url);
+        let deadline = Instant::now() + self.policy.fetch_deadline;
         let mut backoff = self.policy.initial_backoff;
         let mut failures = Vec::new();
         for attempt in 1..=self.policy.max_attempts.max(1) {
-            self.acquire(host);
-            let outcome = self.attempt(url);
+            if !self.acquire(host, deadline) {
+                failures.push(format!("fetch deadline of {} ms reached", self.policy.fetch_deadline.as_millis()));
+                break;
+            }
+            let outcome = self.attempt(url, deadline);
             let cooldown = match &outcome {
                 AttemptOutcome::Retry { wait: Some(wait), .. } => Some(*wait),
                 _ => None,
@@ -145,6 +159,11 @@ impl<T: HttpTransport> TileFetcher for HttpTileFetcher<T> {
                 AttemptOutcome::Retry { reason, wait } => {
                     failures.push(format!("attempt {attempt}: {reason}"));
                     if attempt < self.policy.max_attempts && wait.is_none() {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left <= backoff {
+                            failures.push(format!("fetch deadline of {} ms reached", self.policy.fetch_deadline.as_millis()));
+                            break;
+                        }
                         std::thread::sleep(backoff);
                         backoff = (backoff * 2).min(self.policy.max_backoff);
                     }

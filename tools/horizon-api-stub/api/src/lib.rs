@@ -177,6 +177,12 @@ pub enum ServerTickPhase {
 }
 #[non_exhaustive]
 pub struct ServerStartedEvent;
+#[non_exhaustive]
+pub struct ServerStoppingEvent;
+#[non_exhaustive]
+pub struct LevelLoadEvent<'a> {
+    pub dimension: &'a str,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -207,6 +213,34 @@ pub struct DimensionSettings {
 }
 
 pub trait BlockMetadata {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StateConstraint {
+    pub name: String,
+    pub value: String,
+}
+impl StateConstraint {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { name: name.into(), value: value.into() }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockStateError {
+    Unavailable,
+    UnknownBlock,
+    UnknownState,
+    UnknownProperty(u32),
+    InvalidValue(u32),
+    DuplicateProperty(u32),
+    InvalidCombination,
+}
+impl BlockState {
+    pub fn of(metadata: &dyn BlockMetadata, block: BlockKey, properties: &[StateConstraint]) -> Result<Self, BlockStateError> {
+        Err(BlockStateError::Unavailable)
+    }
+}
 
 pub trait ChunkAccess {
     fn metadata(&self) -> &dyn BlockMetadata;
@@ -290,6 +324,8 @@ impl PlayerRef {
 pub trait Hooks {
     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {}
     fn server_started(&self, host: &mut dyn ServerHost, event: &mut ServerStartedEvent) {}
+    fn server_stopping(&self, host: &mut dyn ServerHost, event: &mut ServerStoppingEvent) {}
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {}
     fn register_commands(&self, host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {}
     fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
         Flow::Continue

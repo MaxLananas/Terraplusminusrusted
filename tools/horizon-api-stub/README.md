@@ -31,3 +31,6 @@ Paths are relative to `crates/horizon-mod-vocab/src` unless noted.
 | `ServerTickEvent { phase }`, `ServerTickPhase` | generated; `world/types.rs`, `crates/horizon-mod-dimension-game/src/main.rs` |
 | `Text`, `TextStyle`, `TextClick`, `TextHover` | `text/mod.rs` (`TextContent::Literal` does not interpret legacy `§` codes) |
 | `Flow` | `runtime.rs` |
+| `Hooks::server_stopping`, `ServerStoppingEvent` | `hooks/server_stopping.rs`; signature as implemented in `crates/horizon-client/src/game/world/server_lifecycle/server_lifecycle_tests.rs` |
+| `Hooks::level_load`, `LevelLoadEvent { dimension: &str }` | `hooks/level_load.rs`; signature and field as used in `crates/horizon-client/src/game/world/runtime_levels_tests.rs` |
+| `BlockState::of`, `StateConstraint`, `BlockStateError` | `block/block_state.rs`, `block/block_states.rs`, `block/block_metadata.rs` (the stub's `of` always returns `Unavailable`) |

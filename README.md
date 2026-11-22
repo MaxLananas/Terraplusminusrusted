@@ -32,14 +32,17 @@ What works and is tested here:
 
 What is not done:
 
+- **The Horizon deliverable is incomplete and not production-ready.**
 - **Horizon has never run this code.** Horizon needs Rust 1.95 and crates.io, which this
   environment cannot reach. The mod in `horizon-mod/` is type-checked against a hand-written
   stub of the API (`tools/horizon-api-stub`), whose README cites the SDK source of every
   signature. The checks a real server run would cover (joining, lighting, collision,
   save/restart) are still open.
 - **Not ported:**
-  - HTTPS (use a plain-HTTP mirror). The default OSM and tree-cover servers are HTTPS-only, so
-    both need a mirror (see [OpenStreetMap](#openstreetmap) and [Trees](#trees));
+  - HTTPS. The default elevation, OSM and tree-cover servers are HTTPS-only, so the defaults are
+    refused at startup, before the dimension registers, until every enabled source is mirrored,
+    served over plain HTTP (`network.plain_http_hosts`) or turned off (see
+    [OpenStreetMap](#openstreetmap) and [Trees](#trees));
   - the `from_int` TIFF parser and BigTIFF;
   - the SERVER linked-worlds method;
   - auto-teleport on movement;
@@ -85,9 +88,11 @@ this was built.
 
 ```sh
 scripts/fetch-upstream.sh       # pinned upstream checkouts into .upstream/ (needed for --oracle)
-scripts/verify.sh               # lockfile, clippy, tests, fixture digests, licenses, mod type-check
+scripts/verify.sh               # format (if rustfmt exists), lockfile, clippy, tests, fixture manifest
+                                # and its negative tests, licenses, staging safety, mod type-check
 scripts/verify.sh --oracle      # also rebuild the goldens with the Java oracle and require no change
-scripts/verify.sh --live        # also run tests against real elevation providers
+scripts/verify.sh --live        # also run the `live_*` tests against real providers; fails unless
+                                # every one of them runs and passes
 ```
 
 Each step prints PASS, FAIL or NOT RUN, and the script exits non-zero on any failure. Logs,
@@ -152,9 +157,19 @@ Permissions map upstream's permission nodes to operator levels, under the config
 `permissions` section.
 
 Elevation data is fetched on Horizon's worldgen worker threads; the server tick only polls
-finished work. When data cannot be fetched, generation waits and retries rather than producing
-flat terrain. A world whose stored generation fingerprint does not match the configuration stays
-closed to generation, and the server log says why.
+finished work. The generation fingerprint is checked when the earth level opens, before any of
+its chunks. Transient fetch failures (network errors, HTTP 5xx, 429) are retried with backoff up to
+`generation.retry_attempts` times (default 8; 0 retries until the server stops). A chunk fails,
+and is neither published nor saved, when its data is permanently unavailable (unreachable URL,
+malformed tile), when the retries run out, when the server stops, when the world's fingerprint
+does not match, or when a block state does not exist in the game. Generation never substitutes
+flat terrain, an empty chunk or another block.
+
+The failure works around a gap in Horizon's API: `ChunkGenerator::build_terrain` cannot report
+failure, so the mod panics. Horizon's worldgen job runner catches the panic
+(`horizon-threads/src/jobs.rs`), and the chunk stays pending in that server session without
+being published or saved. It is generated again after a restart. This path has only been read in
+the engine source, not run.
 
 ## Configuration
 
@@ -183,8 +198,9 @@ water. The section accepts:
 
 This build has no TLS, so the default HTTPS server cannot be reached. Either serve a copy of the
 tiles over plain HTTP and list its host in `network.plain_http_hosts`, or map the server prefix to
-a local directory with `network.mirrors`, or set `enabled` to `false`. A chunk whose OSM tile
-cannot be fetched waits and retries, like elevation data. An invalid mapping file stops the server
+a local directory with `network.mirrors`, or set `enabled` to `false`; otherwise the server
+refuses the configuration at startup. A chunk whose OSM tile cannot be fetched is retried like
+elevation data. An invalid mapping file stops the server
 from starting rather than generating without features.
 
 Upstream's deprecated `building_outlines_material`, `road_material` and `path_material` keys
@@ -199,7 +215,8 @@ and startup logs upstream's deprecation warning. Editing `osm.json5` is the bett
 `https://cloud.daporkchop.net/gis/treecover2000/`), or from the file named by
 `elevation.tree_cover_config`, which uses the same schema. That server is HTTPS-only, so copy
 `tree_cover.json5` from terraminusminus, point its URL at a plain-HTTP or mirrored copy and set
-`tree_cover_config`, or set `generate_trees` to `false`. With trees off, tree cover is never
+`tree_cover_config`, or set `generate_trees` to `false`; otherwise the server refuses the
+configuration at startup. With trees off, tree cover is never
 fetched (upstream fetched it anyway, TerraPlusMinus issue #77).
 
 How it matches upstream:

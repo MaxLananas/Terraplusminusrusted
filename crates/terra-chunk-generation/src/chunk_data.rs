@@ -173,7 +173,7 @@ impl ChunkDataBuilder {
             match water_depth & TYPE_MASK {
                 TYPE_WATER => {
                     if depth + WATER_DEPTH_OFFSET >= 0 {
-                        ground_height[i] -= depth + WATER_DEPTH_OFFSET;
+                        ground_height[i] = ground_height[i].wrapping_sub(depth + WATER_DEPTH_OFFSET);
                     }
                 }
                 TYPE_OCEAN => {
@@ -231,7 +231,7 @@ impl ChunkTerrain {
     }
 
     pub fn water_height(&self, x: usize, z: usize) -> i32 {
-        self.surface_height(x, z) - 1
+        self.surface_height(x, z).wrapping_sub(1)
     }
 
     pub fn surface_block(&self, x: usize, z: usize) -> Option<&SurfaceBlock> {

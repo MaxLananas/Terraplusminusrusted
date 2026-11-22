@@ -159,9 +159,30 @@ impl TiledScalarDataset {
         }
         let shift = self.shift;
         let mask = (self.resolution - 1) as i32;
-        let sampler = |x: i32, z: i32| match tiles.get(&TilePosition { x: x >> shift, z: z >> shift }) {
-            Some(Some(tile)) => tile[(((z & mask) << shift) | (x & mask)) as usize],
-            _ => f64::NAN,
+        // Every blend tap needs its tile: index the planned tiles densely once (as upstream's
+        // per-request state does) instead of hashing per tap, which cost about 3/4 of the
+        // chunk's sampling time. Taps outside the plan fall back to the map, so the values read
+        // are exactly the same.
+        let table = DenseTiles::new(&plan.tiles, tiles);
+        // Consecutive taps almost always fall in the same tile: remember the last one.
+        let last: std::cell::Cell<Option<LastTile<'_>>> = std::cell::Cell::new(None);
+        let sampler = |x: i32, z: i32| {
+            let position = TilePosition { x: x >> shift, z: z >> shift };
+            let tile = match last.get() {
+                Some((cached, tile)) if cached == position => tile,
+                _ => {
+                    let tile = match table.get(position) {
+                        Some(tile) => Some(tile),
+                        None => tiles.get(&position).and_then(|tile| tile.as_deref()),
+                    };
+                    last.set(Some((position, tile)));
+                    tile
+                }
+            };
+            match tile {
+                Some(tile) => tile[(((z & mask) << shift) | (x & mask)) as usize],
+                None => f64::NAN,
+            }
         };
         let step_x = 1.0 / size_x as f64;
         let step_z = 1.0 / size_z as f64;
@@ -209,9 +230,84 @@ pub struct GridPlan {
 /// Loaded tiles for one request; `None` records a tile the provider reported as absent.
 pub type LoadedTiles = HashMap<TilePosition, Option<Tile>>;
 
+/// The tile of the previous blend tap (`None` inside: the tile is absent).
+type LastTile<'a> = (TilePosition, Option<&'a [f64]>);
+
+/// The planned tiles of one request in a row-major grid over their bounding box.
+struct DenseTiles<'a> {
+    min_x: i32,
+    min_z: i32,
+    width: u32,
+    height: u32,
+    cells: Vec<Option<&'a [f64]>>,
+}
+
+impl<'a> DenseTiles<'a> {
+    /// Plans are bounded by `MAX_TILES_PER_REQUEST`; a sparse plan with a larger bounding box
+    /// (projection folds) gets an empty table and every tap uses the map.
+    const MAX_CELLS: u64 = 4096;
+
+    fn new(planned: &[TilePosition], tiles: &'a LoadedTiles) -> Self {
+        let empty = Self { min_x: 0, min_z: 0, width: 0, height: 0, cells: Vec::new() };
+        let (Some(min_x), Some(max_x)) = (planned.iter().map(|p| p.x).min(), planned.iter().map(|p| p.x).max()) else { return empty };
+        let (Some(min_z), Some(max_z)) = (planned.iter().map(|p| p.z).min(), planned.iter().map(|p| p.z).max()) else { return empty };
+        let width = (i64::from(max_x) - i64::from(min_x) + 1) as u64;
+        let height = (i64::from(max_z) - i64::from(min_z) + 1) as u64;
+        if width * height > Self::MAX_CELLS {
+            return empty;
+        }
+        let (width, height) = (width as u32, height as u32);
+        let mut cells = vec![None; (width * height) as usize];
+        for (position, tile) in tiles {
+            if let Some(index) = Self::index(min_x, min_z, width, height, *position) {
+                cells[index] = tile.as_deref();
+            }
+        }
+        Self { min_x, min_z, width, height, cells }
+    }
+
+    fn index(min_x: i32, min_z: i32, width: u32, height: u32, position: TilePosition) -> Option<usize> {
+        let dx = u32::try_from(i64::from(position.x) - i64::from(min_x)).ok().filter(|dx| *dx < width)?;
+        let dz = u32::try_from(i64::from(position.z) - i64::from(min_z)).ok().filter(|dz| *dz < height)?;
+        Some((dz * width + dx) as usize)
+    }
+
+    /// `None` when the position is outside the table (the caller then asks the map); a cell for
+    /// an absent tile is also `None`, which the map answers the same way.
+    fn get(&self, position: TilePosition) -> Option<&'a [f64]> {
+        Self::index(self.min_x, self.min_z, self.width, self.height, position).and_then(|index| self.cells[index])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dense table must answer exactly as the map: same tile, same absence, and a fallback
+    /// (`None`) for anything outside the plan, including far-away and extreme positions.
+    #[test]
+    fn dense_tiles_agree_with_the_map() {
+        let tile = |value: f64| -> Option<Tile> { Some(Arc::from(vec![value; 4])) };
+        let mut tiles = LoadedTiles::new();
+        tiles.insert(TilePosition { x: -1, z: 5 }, tile(1.0));
+        tiles.insert(TilePosition { x: 0, z: 5 }, None);
+        tiles.insert(TilePosition { x: 1, z: 6 }, tile(2.0));
+        tiles.insert(TilePosition { x: 40, z: 40 }, tile(3.0)); // loaded but outside the plan
+        let planned = [TilePosition { x: -1, z: 5 }, TilePosition { x: 0, z: 5 }, TilePosition { x: 1, z: 6 }];
+        let table = DenseTiles::new(&planned, &tiles);
+        let mut positions: Vec<TilePosition> = (-3..5).flat_map(|x| (3..9).map(move |z| TilePosition { x, z })).collect();
+        positions.extend([TilePosition { x: 40, z: 40 }, TilePosition { x: i32::MIN, z: i32::MAX }, TilePosition { x: i32::MAX, z: i32::MIN }]);
+        for position in positions {
+            let expected = tiles.get(&position).and_then(|tile| tile.as_deref()).map(|t| t[0]);
+            let dense = table.get(position).or_else(|| tiles.get(&position).and_then(|tile| tile.as_deref())).map(|t| t[0]);
+            assert_eq!(dense, expected, "{position:?}");
+        }
+        assert!(table.get(TilePosition { x: 40, z: 40 }).is_none(), "outside the plan the map answers");
+        // A plan whose bounding box is too large gets no table at all.
+        let sparse = DenseTiles::new(&[TilePosition { x: i32::MIN, z: 0 }, TilePosition { x: i32::MAX, z: 0 }], &tiles);
+        assert!(sparse.cells.is_empty());
+        assert!(DenseTiles::new(&[], &tiles).cells.is_empty());
+    }
 
     /// A minimal little-endian, uncompressed, single-strip float32 TIFF. The no-data text must
     /// be longer than three characters (shorter ASCII values belong inline in the entry).

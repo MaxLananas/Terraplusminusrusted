@@ -66,6 +66,18 @@ impl GenerationFingerprint {
         self
     }
 
+    /// Records configured layers this build skipped (`unsupported_layers: skip`): a build that
+    /// supports them would generate different terrain from the same configuration. Written only
+    /// when layers are skipped.
+    #[must_use]
+    pub fn with_skipped_layers(mut self, skipped: &[String]) -> Self {
+        if !skipped.is_empty() {
+            let joined = skipped.join("\n");
+            self.fields.push(("skipped_layers".to_owned(), format!("{:016x}:{}", fnv1a64(joined.as_bytes()), skipped.len())));
+        }
+        self
+    }
+
     fn render(&self) -> String {
         let mut out = format!("{HEADER}\n");
         for (key, value) in &self.fields {
@@ -201,5 +213,16 @@ mod tests {
         fs::write(directory.join(FINGERPRINT_FILE_NAME), "garbage").unwrap();
         assert!(matches!(verify_or_record(&directory, &current), Err(FingerprintError::Corrupt(_))));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn skipped_layers_are_part_of_the_fingerprint_only_when_present() {
+        let current = GenerationFingerprint::compute(&GeneratorSettings::default(), WORLD, b"heights", None);
+        assert_eq!(current.clone().with_skipped_layers(&[]), current, "unchanged when nothing is skipped");
+        let skipped = current.clone().with_skipped_layers(&["layer 3: unsupported parse".to_owned()]);
+        let keys: Vec<String> = current.differences(&skipped).into_iter().map(|(key, _, _)| key).collect();
+        assert_eq!(keys, vec!["skipped_layers".to_owned()]);
+        let other = current.with_skipped_layers(&["layer 4: unsupported parse".to_owned()]);
+        assert_eq!(skipped.differences(&other).len(), 1);
     }
 }

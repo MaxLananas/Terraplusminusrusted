@@ -138,6 +138,30 @@ impl Biome {
     }
 }
 
+/// Appends the runs of `bytes`, which start at sample `position`, to a run-length encoding whose
+/// last run may continue into `bytes` (upstream `RLEByteArray.Builder.append`, one slice at a time).
+fn append_runs(run_starts: &mut Vec<u32>, run_values: &mut Vec<u8>, position: u32, bytes: &[u8]) {
+    let mut index = 0;
+    while index < bytes.len() {
+        let value = bytes[index];
+        if run_values.last() != Some(&value) {
+            run_starts.push(position.wrapping_add(index as u32));
+            run_values.push(value);
+        }
+        // Skip the rest of the run eight bytes at a time (runs average ~190 bytes).
+        let splat = u64::from_ne_bytes([value; 8]);
+        index += 1;
+        while let Some(word) = bytes.get(index..index + 8)
+            && <[u8; 8]>::try_from(word).ok().map(u64::from_ne_bytes) == Some(splat)
+        {
+            index += 8;
+        }
+        while bytes.get(index) == Some(&value) {
+            index += 1;
+        }
+    }
+}
+
 /// The 30-arc-second Köppen-Geiger raster, held as run-length encoded rows.
 #[derive(Debug)]
 pub struct KoppenMap {
@@ -162,13 +186,8 @@ impl KoppenMap {
         let mut run_values = Vec::new();
         let mut position: u32 = 0;
         let mut sink = |bytes: &[u8]| {
-            for &value in bytes {
-                if run_values.last() != Some(&value) {
-                    run_starts.push(position);
-                    run_values.push(value);
-                }
-                position += 1;
-            }
+            append_runs(&mut run_starts, &mut run_values, position, bytes);
+            position = position.wrapping_add(bytes.len() as u32);
             Ok(())
         };
         let size = terra_codec::gunzip_streaming(compressed, SAMPLES, &mut sink)?;
@@ -198,5 +217,47 @@ impl KoppenMap {
         let index = (y as u32) * COLUMNS + x as u32;
         let run = self.run_starts.partition_point(|&start| start <= index).saturating_sub(1);
         Some(self.run_values.get(run).copied().unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_runs;
+
+    /// The word-skipping run builder must produce exactly the runs of the byte-wise upstream
+    /// builder, whatever the run lengths and however the stream is sliced.
+    #[test]
+    fn append_runs_matches_the_bytewise_builder() {
+        let mut state = 0x9E37_79B9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _case in 0..200 {
+            let mut data = Vec::new();
+            while data.len() < 3000 {
+                let value = (next() % 4) as u8;
+                let length = match next() % 4 { 0 => 1, 1 => 1 + next() % 9, 2 => 1 + next() % 40, _ => 1 + next() % 400 };
+                data.extend(std::iter::repeat_n(value, length as usize));
+            }
+            let (mut expected_starts, mut expected_values) = (Vec::new(), Vec::new());
+            for (position, &value) in data.iter().enumerate() {
+                if expected_values.last() != Some(&value) {
+                    expected_starts.push(position as u32);
+                    expected_values.push(value);
+                }
+            }
+            let (mut starts, mut values) = (Vec::new(), Vec::new());
+            let mut position = 0usize;
+            while position < data.len() {
+                let length = (1 + next() as usize % 700).min(data.len() - position);
+                append_runs(&mut starts, &mut values, position as u32, &data[position..position + length]);
+                position += length;
+            }
+            assert_eq!(starts, expected_starts);
+            assert_eq!(values, expected_values);
+        }
     }
 }

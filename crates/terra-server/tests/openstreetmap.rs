@@ -102,7 +102,7 @@ fn rivers_roads_and_buildings_shape_the_chunk() {
 
     assert_eq!(stack.surface_block_names(), vec!["minecraft:gray_concrete", "minecraft:dirt_path", "minecraft:bricks"]);
     let fingerprint_differs = terra_server::TerraStack::build(
-        terra_server::parse_server_config(r#"{"openstreetmap": {"enabled": false}, "biomes": {"use_dataset": false}}"#).unwrap(),
+        terra_server::parse_server_config(r#"{"openstreetmap": {"enabled": false}, "biomes": {"use_dataset": false}, "generate_trees": false, "network": {"plain_http_hosts": ["s3.amazonaws.com"]}}"#).unwrap(),
         &directory,
     )
     .unwrap()
@@ -125,11 +125,11 @@ fn a_missing_tile_fails_the_chunk_instead_of_dropping_features() {
 fn an_edited_mapping_beside_the_config_is_used() {
     let directory = common::scratch("osm-mapping");
     std::fs::write(directory.join("osm.json5"), r#"{"line": {"nothing": {}}, "polygon": {"nothing": {}}}"#).unwrap();
-    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}, "generate_trees": false}"#).unwrap();
+    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}, "generate_trees": false, "network": {"plain_http_hosts": ["s3.amazonaws.com", "cloud.daporkchop.net"]}}"#).unwrap();
     let stack = TerraStack::build(config, &directory).unwrap();
     assert!(stack.surface_block_names().is_empty(), "no OSM blocks and no tree blocks");
     std::fs::write(directory.join("osm.json5"), r#"{"line": {"nothing": {}}}"#).unwrap();
-    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}}"#).unwrap();
+    let config = terra_server::parse_server_config(r#"{"biomes": {"use_dataset": false}, "network": {"plain_http_hosts": ["s3.amazonaws.com", "cloud.daporkchop.net"]}}"#).unwrap();
     let error = TerraStack::build(config, &directory).err().expect("an invalid mapping refuses to start");
     assert!(error.to_string().contains("osm.json5"), "{error}");
     let fresh = common::scratch("osm-extract");

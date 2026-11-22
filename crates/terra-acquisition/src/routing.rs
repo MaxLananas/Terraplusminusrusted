@@ -22,6 +22,15 @@ impl<T: HttpTransport> RoutingFetcher<T> {
         Self { mirror_prefixes: mirrors.iter().map(|(prefix, _)| prefix.clone()).collect(), mirrors: fetcher, http, plain_http_hosts }
     }
 
+    /// Whether URLs from `template` (with `${x}`-style placeholders) can be fetched at all: a
+    /// configured mirror, plain HTTP, or HTTPS for a host listed in `plain_http_hosts`.
+    pub fn check_route(&self, template: &str) -> Result<(), String> {
+        if self.mirror_prefixes.iter().any(|prefix| template.starts_with(prefix.as_str())) {
+            return Ok(());
+        }
+        self.network_url(template).map(drop)
+    }
+
     /// The URL actually requested over the network, or why none is.
     pub fn network_url(&self, url: &str) -> Result<String, String> {
         if url.starts_with("http://") {
@@ -42,7 +51,7 @@ impl<T: HttpTransport> TileFetcher for RoutingFetcher<T> {
         if self.mirror_prefixes.iter().any(|prefix| url.starts_with(prefix.as_str())) {
             return self.mirrors.fetch(url);
         }
-        let network_url = self.network_url(url).map_err(|reason| ElevationError::Fetch { url: url.to_owned(), reason })?;
+        let network_url = self.network_url(url).map_err(|reason| ElevationError::Unreachable { url: url.to_owned(), reason })?;
         self.http.fetch(&network_url)
     }
 }
@@ -60,6 +69,6 @@ mod tests {
         assert!(router.network_url("https://other.example/x").is_err());
         assert!(router.network_url("ftp://x/y").is_err());
         assert_eq!(router.fetch("https://mirror.example/definitely-absent.png").unwrap(), FetchOutcome::Missing);
-        assert!(router.fetch("https://other.example/x").is_err());
+        assert!(matches!(router.fetch("https://other.example/x"), Err(ElevationError::Unreachable { .. })));
     }
 }

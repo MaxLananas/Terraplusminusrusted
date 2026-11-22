@@ -4,19 +4,29 @@
 //!
 //! Generation runs on Horizon's worldgen workers and waits there for real elevation data; the
 //! server tick only polls finished work. The world's generation fingerprint is checked when the
-//! server starts, and generation stays closed if it does not match.
+//! earth level opens (`level_load`, before any of its chunks), and generation stays closed if it
+//! does not match.
+//!
+//! A chunk that cannot be generated (refused fingerprint, permanent data error, retries
+//! exhausted, server stopping, unknown block state) fails: `build_terrain` panics. Horizon's
+//! worldgen job runner catches the panic (`horizon-threads` `jobs.rs`), the chunk's job delivers
+//! nothing, and the chunk is neither published nor saved, so a later run generates it properly.
+//! Returning normally would publish whatever the chunk holds, and an engine-side terrain error
+//! is turned into an empty chunk, so neither is used.
 #![deny(unsafe_code)]
 
 use mod_api::{
     BiomeSource, BlockKey, BlockState, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, CommandSource, DimensionSettings, Flow, Host, Hooks, InstanceDirectory,
-    PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, ServerTickPhase, Text, TextClick, TextHover, TextStyle,
+    LevelLoadEvent, PlayerRef, Registrar, RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, ServerTickEvent,
+    ServerTickPhase, StateConstraint, Text, TextClick, TextHover, TextStyle,
 };
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use terra_chunk_generation::WorldHeight;
 use terra_server::{
-    Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationCounters, GenerationGate, LevelHeight, PendingTeleports, RegionIndex,
+    Authorization, BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationFailure, LevelHeight, PendingTeleports, RegionIndex,
     ServerConfig, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep, extract_default_osm_mapping, messages, messages::{ChatMessage, legacy_spans}, parse_server_config,
     split_block_state, terrain_for_generation, write_chunk, write_trees, TreeTarget,
 };
@@ -28,8 +38,7 @@ const CONFIG_FILE: &str = "config/terraplusminus/terraplusminus.json5";
 
 struct Shared {
     stack: TerraStack,
-    gate: GenerationGate,
-    counters: GenerationCounters,
+    control: GenerationControl,
 }
 
 fn log(message: &str) {
@@ -70,7 +79,7 @@ fn load_shared(context: &RegistrationContext) -> Result<Shared, String> {
         }
     }
     let stack = TerraStack::build(config, &base).map_err(|error| error.to_string())?;
-    Ok(Shared { stack, gate: GenerationGate::default(), counters: GenerationCounters::default() })
+    Ok(Shared { stack, control: GenerationControl::default() })
 }
 
 struct EarthGenerator {
@@ -85,41 +94,99 @@ struct RegisteredBlock {
     properties: Vec<(String, String)>,
 }
 
-struct AccessWriter<'a>(&'a mut dyn ChunkAccess);
+/// Writes into the engine chunk and counts states the engine refused.
+struct AccessWriter<'a> {
+    chunk: &'a mut dyn ChunkAccess,
+    refused: usize,
+}
 
 impl BlockWriter<BlockState> for AccessWriter<'_> {
     fn set_block(&mut self, position: [i32; 3], state: BlockState) {
-        self.0.set_block(position, state);
+        if !self.chunk.set_block(position, state) {
+            self.refused += 1;
+        }
+    }
+}
+
+/// Ends a chunk that must not be completed. The engine's terrain callback has no failure
+/// channel: returning would publish the chunk as generated, and the engine turns terrain errors
+/// into empty chunks. Its worldgen job runner catches this panic, so only this chunk's job is
+/// lost; the chunk is not published or saved.
+#[allow(clippy::panic)] // Deliberate fail-closed; see above and the crate documentation.
+fn fail_chunk(chunk_x: i32, chunk_z: i32, failure: &GenerationFailure) -> ! {
+    panic!("[{MOD_ID}] chunk ({chunk_x}, {chunk_z}) was not generated: {failure}")
+}
+
+impl EarthGenerator {
+    /// Every registered block resolved strictly in the engine's registry: an unknown block,
+    /// property or value fails, it is never replaced.
+    fn resolve_blocks(&self, chunk: &dyn ChunkAccess) -> Result<Vec<(String, BlockState)>, GenerationFailure> {
+        self.blocks
+            .iter()
+            .map(|block| {
+                let constraints: Vec<StateConstraint> = block.properties.iter().map(|(key, value)| StateConstraint::new(key.as_str(), value.as_str())).collect();
+                BlockState::of(chunk.metadata(), block.key, &constraints)
+                    .map(|state| (block.name.clone(), state))
+                    .map_err(|error| GenerationFailure::Permanent(format!("block state `{}` does not exist in this game ({error:?})", block.name)))
+            })
+            .collect()
+    }
+
+    fn generate(&self, chunk: &mut dyn ChunkAccess) -> Result<(), GenerationFailure> {
+        let shared = &self.shared;
+        let position = chunk.pos();
+        let wait = shared.stack.config().generation_wait;
+        shared.control.gate.wait_open(Duration::from_secs(30), wait, &mut |_| log(&format!("chunk ({}, {}) waits for the generation fingerprint check", position.x, position.z)))?;
+        let resolved = self.resolve_blocks(&*chunk)?;
+        let terrain = terrain_for_generation(&shared.stack, &shared.control, position.x, position.z, &mut |message| log(&message))?;
+        let world = WorldHeight { min_y: chunk.min_y(), max_y: chunk.min_y() + chunk.height() };
+        // The generator only places registered blocks; a miss is recorded and fails the chunk
+        // instead of placing something else.
+        let missing: Arc<Mutex<Vec<String>>> = Arc::default();
+        let Some(&(_, any_state)) = resolved.first() else { return Err(GenerationFailure::Internal("no blocks registered".into())) };
+        let misses = Arc::clone(&missing);
+        let mut palette = BlockPalette::new(move |name: &str| match resolved.iter().find(|(known, _)| known == name) {
+            Some((_, state)) => *state,
+            None => {
+                if let Ok(mut misses) = misses.lock() {
+                    misses.push(name.to_owned());
+                }
+                any_state
+            }
+        });
+        let level_seed = chunk.seed();
+        let mut writer = AccessWriter { chunk, refused: 0 };
+        write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut writer);
+        // Trees come after the terrain and may overwrite it, as upstream's populator does.
+        let target = TreeTarget { chunk_x: position.x, chunk_z: position.z, world, level_seed };
+        write_trees(&shared.stack, &shared.control, &terrain, target, &mut palette, &mut writer, &mut |message| log(&message))?;
+        let missing = missing.lock().map_err(|_| GenerationFailure::Internal("palette lock poisoned".into()))?;
+        if !missing.is_empty() {
+            return Err(GenerationFailure::Internal(format!("blocks without a registered state: {}", missing.join(", "))));
+        }
+        if writer.refused > 0 {
+            return Err(GenerationFailure::Internal(format!("the engine refused {} block writes", writer.refused)));
+        }
+        Ok(())
     }
 }
 
 impl ChunkGenerator for EarthGenerator {
     fn build_terrain(&self, chunk: &mut dyn ChunkAccess) {
-        let shared = &self.shared;
         let position = chunk.pos();
-        shared.gate.wait_open(Duration::from_secs(60), &mut |state| match state {
-            GateState::Refused(reason) => log(&format!("chunk ({}, {}) not generated: {reason}", position.x, position.z)),
-            _ => log(&format!("chunk ({}, {}) waits for the generation fingerprint check", position.x, position.z)),
-        });
-        let terrain = terrain_for_generation(&shared.stack, &shared.counters, position.x, position.z, &mut |message| log(&message));
-        let world = WorldHeight { min_y: chunk.min_y(), max_y: chunk.min_y() + chunk.height() };
-        let resolved: Vec<(String, BlockState)> = self
-            .blocks
-            .iter()
-            .map(|block| {
-                let properties: Vec<(&str, &str)> = block.properties.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
-                let state = if properties.is_empty() { chunk.state(block.key) } else { chunk.state_with(block.key, &properties) };
-                (block.name.clone(), state)
-            })
-            .collect();
-        let Some(&(_, stone)) = resolved.first() else { return };
-        let mut palette = BlockPalette::new(move |name: &str| resolved.iter().find(|(known, _)| known == name).map_or(stone, |(_, state)| *state));
-        let level_seed = chunk.seed();
-        write_chunk(&shared.stack, &terrain, position.x, position.z, world, &mut palette, &mut AccessWriter(&mut *chunk));
-        // Trees come after the terrain and may overwrite it, as upstream's populator does.
-        let target = TreeTarget { chunk_x: position.x, chunk_z: position.z, world, level_seed };
-        write_trees(&shared.stack, &shared.counters, &terrain, target, &mut palette, &mut AccessWriter(chunk), &mut |message| log(&message));
-        shared.counters.chunks_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counters = &self.shared.control.counters;
+        match self.generate(chunk) {
+            Ok(()) => {
+                counters.chunks_written.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(failure) => {
+                counters.chunks_failed.fetch_add(1, Ordering::Relaxed);
+                if failure != GenerationFailure::Cancelled {
+                    log(&format!("chunk ({}, {}) not generated: {failure}", position.x, position.z));
+                }
+                fail_chunk(position.x, position.z, &failure);
+            }
+        }
     }
 }
 
@@ -267,6 +334,12 @@ impl TerraPlusMinus {
             TpllRequest::start(&arguments, &world_name, shared.stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, config.generator.y_offset, &world)
         };
         match (request, &step) {
+            // The target chunk is not generated yet: refuse while generation cannot produce it,
+            // rather than teleporting the player into a chunk that will fail.
+            (Some(_), TpllStep::NeedsSurface { .. }) if shared.control.gate.state() != GateState::Open => {
+                log(&format!("/tpll refused: generation is {:?}", shared.control.gate.state()));
+                Self::feedback(host, &messages::unavailable(prefix));
+            }
             (Some(request), TpllStep::NeedsSurface { .. }) => {
                 let Ok(mut pending) = self.pending.lock() else { return };
                 let table = pending.get_or_insert_with(|| PendingTeleports::new(config.max_pending_teleports, config.generation_wait));
@@ -282,10 +355,30 @@ impl TerraPlusMinus {
         }
     }
 
+    /// Checks the world's generation fingerprint once and opens or refuses generation; also
+    /// opens the region index used by `/tpll`. Without a world directory generation fails rather
+    /// than waiting.
+    fn check_fingerprint(&self, host: &mut dyn ServerHost) {
+        let Some(shared) = self.shared.get() else { return };
+        let Some(world_directory) = host.world_dir() else {
+            shared.control.gate.set(GateState::Failed("the world directory is unavailable, so the generation fingerprint cannot be checked".into()));
+            return log("generation disabled: the world directory is unavailable");
+        };
+        let _ = self.regions.set(RegionIndex::new(world_directory.join("dimensions").join(MOD_ID).join(DIMENSION).join("region"), 256, Duration::from_secs(2)));
+        if shared.control.gate.state() != GateState::AwaitingFingerprint {
+            return;
+        }
+        let status = shared.stack.verify_world(&world_directory.join("horizon-mod-data").join(MOD_ID));
+        match shared.control.gate.apply_fingerprint(&status) {
+            GateState::Refused(reason) => log(&format!("generation refused: {reason}")),
+            state => log(&format!("generation fingerprint {status:?}: {state:?}")),
+        }
+    }
+
     fn status(&self, host: &mut dyn ServerHost) {
         let Some(shared) = self.shared.get() else { return Self::feedback(host, "§cTerraPlusMinus failed to start; see the server log.") };
         let pending = self.pending.lock().ok().and_then(|table| table.as_ref().map(PendingTeleports::len)).unwrap_or(0);
-        let mut lines = vec![format!("generation: {:?}", shared.gate.state()), shared.counters.summary(), format!("pending /tpll: {pending}")];
+        let mut lines = vec![format!("generation: {:?}", shared.control.gate.state()), shared.control.counters.summary(), format!("pending /tpll: {pending}")];
         lines.extend(shared.stack.diagnostics_report().lines().map(str::to_owned));
         for line in lines {
             Self::feedback(host, &line);
@@ -310,14 +403,19 @@ impl Hooks for TerraPlusMinus {
         let mut seen = std::collections::HashSet::new();
         names.retain(|name| seen.insert(name.clone()));
         let mut blocks = Vec::with_capacity(names.len());
+        let mut malformed = Vec::new();
         for name in names {
             match split_block_state(&name) {
                 Some((id, properties)) => {
                     let properties = properties.into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
                     blocks.push(RegisteredBlock { key: registrar.block_key(id), name, properties });
                 }
-                None => log(&format!("ignoring malformed block state `{name}`; stone is placed instead")),
+                None => malformed.push(name),
             }
+        }
+        if !malformed.is_empty() {
+            log(&format!("not registering the earth dimension: malformed block states in the configuration: {}", malformed.join(", ")));
+            return;
         }
         let _ = self.air.set(["minecraft:air", "minecraft:cave_air", "minecraft:void_air"].into_iter().map(|name| registrar.block_key(name)).collect());
         registrar.register_chunk_generator(DIMENSION, EarthGenerator { shared: Arc::clone(&shared), blocks });
@@ -337,14 +435,23 @@ impl Hooks for TerraPlusMinus {
         let _ = self.shared.set(shared);
     }
 
-    fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
-        let (Some(shared), Some(world_directory)) = (self.shared.get(), host.world_dir()) else { return };
-        let status = shared.stack.verify_world(&world_directory.join("horizon-mod-data").join(MOD_ID));
-        match shared.gate.apply_fingerprint(&status) {
-            GateState::Refused(reason) => log(&format!("generation refused: {reason}")),
-            state => log(&format!("generation fingerprint {status:?}: {state:?}")),
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        // Before any earth chunk: the world the server opens in loads before `server_started`,
+        // and its chunks would otherwise wait for a check that comes after them.
+        if event.dimension == LEVEL_ID {
+            self.check_fingerprint(host);
         }
-        let _ = self.regions.set(RegionIndex::new(world_directory.join("dimensions").join(MOD_ID).join(DIMENSION).join("region"), 256, Duration::from_secs(2)));
+    }
+
+    fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        self.check_fingerprint(host);
+    }
+
+    fn server_stopping(&self, _: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
+        // Ends waits and backoffs at once; chunks still generating fail instead of completing.
+        let Some(shared) = self.shared.get() else { return };
+        shared.control.gate.shut_down();
+        shared.stack.shut_down();
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
@@ -380,8 +487,14 @@ impl Hooks for TerraPlusMinus {
             table.poll(&shared.stack.config().linked_worlds, &world)
         };
         let prefix = shared.stack.config().prefix.as_str();
+        let generating = shared.control.gate.state() == GateState::Open;
         for (player, outcome) in finished {
             match outcome {
+                // Generation closed (refused, stopping, failed) while the surface was looked up.
+                TeleportOutcome::Step(TpllStep::Teleport { .. }) if !generating => {
+                    log(&format!("/tpll dropped: generation is {:?}", shared.control.gate.state()));
+                    Self::tell(host, player, &messages::unavailable(prefix));
+                }
                 TeleportOutcome::Step(step) => Self::finish(host, player, step, prefix, &mut |host, line| Self::tell(host, player, line)),
                 TeleportOutcome::Unavailable(reason) => {
                     log(&format!("/tpll surface lookup failed: {reason}"));

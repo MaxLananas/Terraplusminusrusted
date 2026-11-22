@@ -3,7 +3,8 @@ python=3.11.2
 tifffile=2026.3.3
 imagecodecs=2026.3.6
 numpy=2.4.6
-# file digests (not golden-checked by scripts/check-fixtures.sh)
+# file digests, verified by scripts/check-fixtures.sh; make-fixtures.py with the versions above
+# reproduces every case byte for byte (checked 2026-11-21)
 file db9c2168d04aa92405de8c22940fa2745723d8eaacc5d46ba32c146c6e0e0157  cases/f32_lzw_pred3_tiled.f32.gz
 file a4f893fdc7ec7518919cfe790e2dca2be00153ea84d23d31de9dd98d03778472  cases/f32_lzw_pred3_tiled.tif
 file 70815e0cdd107a584ea116bb99d528f3011ffd7da63859e300ce78c4feb59d25  cases/f32_nodata.f32.gz

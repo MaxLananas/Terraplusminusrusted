@@ -6,10 +6,9 @@ use crate::config::ServerConfig;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use terra_acquisition::{DiskCache, DiskCacheLimits, DiskCachedFetcher, HttpTileFetcher, PlainHttpTransport, RetryPolicy, RoutingFetcher, TransportLimits};
 use terra_chunk_generation::{
-    Block, ChunkLoader, ChunkTerrain, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, LoaderError, TerrainGenerator, TreeLibrary, TreePopulator,
+    Block, ChunkLoader, FingerprintError, FingerprintStatus, GenerationFingerprint, KoppenMap, TerrainGenerator, TreeLibrary, TreePopulator,
     verify_or_record,
 };
 use terra_osm::{DEFAULT_OSM_CONFIG, OsmDataset, OsmMapper, OsmSettings};
@@ -23,6 +22,10 @@ pub enum StackError {
     Projection(String),
     OpenStreetMap(String),
     Trees(String),
+    /// Enabled data sources that this build cannot fetch.
+    Unreachable(String),
+    /// Block states (from the OpenStreetMap mapping or the tree library) that are malformed.
+    InvalidBlocks(String),
 }
 
 impl std::fmt::Display for StackError {
@@ -34,6 +37,8 @@ impl std::fmt::Display for StackError {
             Self::Projection(reason) => write!(f, "projection: {reason}"),
             Self::OpenStreetMap(reason) => write!(f, "OpenStreetMap: {reason}"),
             Self::Trees(reason) => write!(f, "trees: {reason}"),
+            Self::Unreachable(reason) => write!(f, "{reason}"),
+            Self::InvalidBlocks(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -47,6 +52,30 @@ impl TileFetcher for SharedFetcher {
     fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
         self.0.fetch(url)
     }
+}
+
+/// Refuses sources none of whose URLs this build can fetch, naming each with the fixes.
+fn check_sources<T: terra_acquisition::HttpTransport>(routing: &RoutingFetcher<T>, sources: &[(String, Vec<String>)]) -> Result<(), StackError> {
+    let mut problems = Vec::new();
+    for (label, templates) in sources {
+        let reasons: Vec<String> = templates.iter().filter_map(|template| routing.check_route(template).err()).collect();
+        if reasons.len() == templates.len() {
+            let reason = if templates.is_empty() { "no URLs configured".to_owned() } else { reasons.join("; ") };
+            problems.push(format!("{label}: {reason}"));
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let count = problems.len();
+    let shown: Vec<String> = problems.into_iter().take(8).collect();
+    let more = if count > shown.len() { format!(" (and {} more)", count - shown.len()) } else { String::new() };
+    Err(StackError::Unreachable(format!(
+        "{count} enabled data source(s) cannot be fetched by this build, which has no TLS: {}{more}. Fix: map the URL prefixes to local copies with network.mirrors, \
+         or list the hosts in network.plain_http_hosts (unencrypted, unauthenticated HTTP; only for hosts that serve the same data over HTTP), \
+         or turn the feature off (openstreetmap.enabled, generate_trees, elevation.heights_config)",
+        shown.join("; ")
+    )))
 }
 
 pub struct TerraStack {
@@ -69,9 +98,33 @@ impl TerraStack {
         let mut layers = load_heights_config(&heights_text, config.unsupported_layers).map_err(StackError::Elevation)?;
         let network = &config.network;
         let limits = TransportLimits { connect_timeout: network.connect_timeout, io_timeout: network.io_timeout, total_timeout: network.total_timeout, ..TransportLimits::default() };
-        let policy = RetryPolicy { max_attempts: network.attempts, max_per_host: network.max_per_host, ..RetryPolicy::default() };
+        // One fetch never outlives its attempts plus their backoffs, however the server behaves.
+        let base = RetryPolicy::default();
+        let fetch_deadline = network.total_timeout.saturating_mul(network.attempts.max(1)) + base.max_backoff.saturating_mul(network.attempts.saturating_sub(1));
+        let policy = RetryPolicy { max_attempts: network.attempts, max_per_host: network.max_per_host, fetch_deadline, ..base };
         let mirrors: Vec<_> = network.mirrors.iter().map(|(prefix, directory)| (prefix.clone(), base_directory.join(directory))).collect();
         let routing = RoutingFetcher::new(&mirrors, HttpTileFetcher::new(PlainHttpTransport::default(), limits, policy), network.plain_http_hosts.clone());
+        // Every enabled source must be fetchable before anything is registered: generation would
+        // otherwise wait on data that can never arrive.
+        let mut sources: Vec<(String, Vec<String>)> = layers.dataset.layers().iter().map(|layer| (format!("elevation layer {}", layer.dataset.id), layer.dataset.url_templates.clone())).collect();
+        let tree_cover = if config.generate_trees {
+            let tree_cover_text = match &config.tree_cover_config {
+                Some(path) => {
+                    let path = base_directory.join(path);
+                    std::fs::read_to_string(&path).map_err(|error| StackError::Io(format!("reading {}: {error}", path.display())))?
+                }
+                None => DEFAULT_TREE_COVER.to_owned(),
+            };
+            let tree_cover = load_tree_cover_config(&tree_cover_text, config.unsupported_layers).map_err(|error| StackError::Trees(format!("tree cover config: {error}")))?;
+            sources.extend(tree_cover.dataset.layers().iter().map(|layer| (format!("tree cover layer {}", layer.dataset.id), layer.dataset.url_templates.clone())));
+            Some((tree_cover_text, tree_cover))
+        } else {
+            None
+        };
+        if config.openstreetmap.enabled {
+            sources.push(("OpenStreetMap (openstreetmap.servers)".to_owned(), config.openstreetmap.servers.clone()));
+        }
+        check_sources(&routing, &sources)?;
         let fetcher: Arc<dyn TileFetcher> = match &network.cache_directory {
             Some(directory) => {
                 let directory = base_directory.join(directory);
@@ -86,15 +139,7 @@ impl TerraStack {
         let projection = terra_projection::terraplusminus_projection(config.generator.x_offset, config.generator.z_offset).map_err(|error| StackError::Projection(error.to_string()))?;
         let mut fingerprint = GenerationFingerprint::compute(&config.generator, config.world, heights_text.as_bytes(), koppen.as_ref().map(|_| KoppenMap::embedded_bytes()));
         let mut generator = TerrainGenerator::new(Arc::clone(&projection), Arc::new(layers.dataset), provider, koppen, config.generator.clone());
-        if config.generate_trees {
-            let tree_cover_text = match &config.tree_cover_config {
-                Some(path) => {
-                    let path = base_directory.join(path);
-                    std::fs::read_to_string(&path).map_err(|error| StackError::Io(format!("reading {}: {error}", path.display())))?
-                }
-                None => DEFAULT_TREE_COVER.to_owned(),
-            };
-            let tree_cover = load_tree_cover_config(&tree_cover_text, config.unsupported_layers).map_err(|error| StackError::Trees(format!("tree cover config: {error}")))?;
+        if let Some((tree_cover_text, tree_cover)) = tree_cover {
             layers.skipped.extend(tree_cover.skipped.into_iter().map(|skipped| format!("tree cover {skipped}")));
             let library = TreeLibrary::upstream().map_err(|error| StackError::Trees(error.to_string()))?;
             fingerprint = fingerprint.with_trees(terra_chunk_generation::trees::UPSTREAM_TREES.as_bytes(), tree_cover_text.as_bytes());
@@ -108,8 +153,14 @@ impl TerraStack {
             fingerprint = fingerprint.with_openstreetmap(mapping_text.as_bytes(), &settings.servers);
             generator = generator.with_openstreetmap(Arc::new(OsmDataset::new(Arc::new(mapper), projection, fetcher, &settings)));
         }
+        fingerprint = fingerprint.with_skipped_layers(&layers.skipped);
         let loader = ChunkLoader::new(Arc::new(generator), config.loader).map_err(|error| StackError::Io(format!("starting chunk workers: {error}")))?;
-        Ok(Self { config, loader, fingerprint, skipped_layers: layers.skipped })
+        let stack = Self { config, loader, fingerprint, skipped_layers: layers.skipped };
+        let invalid: Vec<String> = stack.surface_block_names().iter().filter_map(|name| crate::engine_bridge::validate_block_state(name).err()).collect();
+        if !invalid.is_empty() {
+            return Err(StackError::InvalidBlocks(invalid.join("; ")));
+        }
+        Ok(stack)
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -160,23 +211,9 @@ impl TerraStack {
         verify_or_record(world_directory, &self.fingerprint)
     }
 
-    /// For generation worker threads, which must produce real terrain or nothing: waits and
-    /// retries with backoff until the chunk data loads. `on_retry` reports each failure. Only a
-    /// loader shutdown ends the wait unsuccessfully.
-    pub fn terrain_for_generation(&self, chunk_x: i32, chunk_z: i32, on_retry: &mut dyn FnMut(&LoaderError, u32)) -> Result<Arc<ChunkTerrain>, LoaderError> {
-        let mut backoff = Duration::from_millis(500);
-        for attempt in 1.. {
-            match self.loader.load_blocking(chunk_x, chunk_z, self.config.generation_wait) {
-                Ok(terrain) => return Ok(terrain),
-                Err(LoaderError::ShutDown) => return Err(LoaderError::ShutDown),
-                Err(error) => {
-                    on_retry(&error, attempt);
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
-            }
-        }
-        Err(LoaderError::ShutDown)
+    /// Stops generation work: the loader refuses new requests and releases every waiter.
+    pub fn shut_down(&self) {
+        self.loader.shut_down();
     }
 
     pub fn diagnostics_report(&self) -> String {

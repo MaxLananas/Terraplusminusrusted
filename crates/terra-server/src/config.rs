@@ -73,6 +73,9 @@ pub struct ServerConfig {
     pub permissions: PermissionLevels,
     pub loader: LoaderLimits,
     pub generation_wait: Duration,
+    /// Attempts at loading a chunk's data through transient failures before the chunk fails;
+    /// 0 retries until the server stops. Permanent failures never retry.
+    pub generation_retry_attempts: u32,
     pub max_pending_teleports: usize,
     /// Accepted but deprecated settings, worded as upstream's startup warnings. Callers log them.
     pub warnings: Vec<String>,
@@ -106,6 +109,7 @@ impl Default for ServerConfig {
             permissions: PermissionLevels { tpll: 0, tpll_other_world: 2, tpll_ungenerated_chunks: 2, admin: 2, diagnostics: 2, info_commands: 0 },
             loader: LoaderLimits::for_host(),
             generation_wait: Duration::from_secs(120),
+            generation_retry_attempts: 8,
             max_pending_teleports: 64,
             warnings: Vec::new(),
         }
@@ -234,6 +238,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         }
     }
     if let Some(material) = root.string("surface_material")? {
+        crate::engine_bridge::validate_block_state(&material.trim().to_ascii_lowercase()).map_err(|reason| ConfigError(format!("surface_material: {reason}")))?;
         config.generator.surface_material = Block::from_material_name(material);
     }
     for (key, block) in [("building_outlines_material", "minecraft:bricks"), ("road_material", "minecraft:gray_concrete"), ("path_material", "minecraft:dirt_path")] {
@@ -244,6 +249,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
                  Consider removing it from your configuration and editing {} instead.",
                 crate::stack::OSM_MAPPING_FILE
             ));
+            crate::engine_bridge::validate_block_state(&material.trim().to_ascii_lowercase()).map_err(|reason| ConfigError(format!("{key}: {reason}")))?;
             config.generator.surface_replacements.push((block.to_owned(), Block::from_material_name(material)));
         }
     }
@@ -320,7 +326,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
             diagnostics: level("diagnostics", 2)?,
         };
     }
-    if let Some(generation) = root.section("generation", &["workers", "queue_capacity", "ready_capacity", "wait_timeout_ms", "max_pending_teleports"])? {
+    if let Some(generation) = root.section("generation", &["workers", "queue_capacity", "ready_capacity", "wait_timeout_ms", "retry_attempts", "max_pending_teleports"])? {
         let defaults = config.loader;
         config.loader = LoaderLimits {
             workers: generation.integer("workers", defaults.workers as i64, 1..=64)? as usize,
@@ -329,6 +335,7 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         };
         config.generation_wait = millis(generation.integer("wait_timeout_ms", 120_000, 1_000..=3_600_000)?);
         config.max_pending_teleports = generation.integer("max_pending_teleports", 64, 1..=10_000)? as usize;
+        config.generation_retry_attempts = generation.integer("retry_attempts", 8, 0..=1_000_000)? as u32;
     }
     Ok(config)
 }
@@ -377,6 +384,15 @@ mod tests {
         for text in [r#"{"openstreetmap": {"servers": []}}"#, r#"{"openstreetmap": {"servers": ["ftp://x/"]}}"#, r#"{"openstreetmap": {"server": []}}"#] {
             assert!(parse_server_config(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn malformed_materials_are_configuration_errors_not_stone() {
+        for (key, value) in [("surface_material", "grass block"), ("surface_material", "minecraft:oak_slab[type=top"), ("road_material", "minecraft:x[a=b,a=c]"), ("path_material", "")] {
+            let error = parse_server_config(&format!(r#"{{"{key}": "{value}"}}"#)).unwrap_err();
+            assert!(error.0.contains(key) && error.0.contains("malformed block state"), "{error:?}");
+        }
+        assert!(parse_server_config(r#"{"surface_material": "minecraft:oak_slab[type=top]"}"#).is_ok());
     }
 
     #[test]

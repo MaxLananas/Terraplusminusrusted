@@ -28,7 +28,9 @@ run_step lockfile "${cargo_command[@]}" metadata --locked --format-version 1 --n
 run_step clippy "${cargo_command[@]}" clippy --locked --workspace --all-targets -- -D warnings
 run_step tests "${cargo_command[@]}" test --locked --workspace
 run_step fixture-integrity scripts/check-fixtures.sh
+run_step fixture-integrity-negative scripts/test-check-fixtures.sh
 run_step dependency-licenses scripts/check-dependencies.sh
+run_step staging-safety python3 scripts/test-stage-horizon-mod.py
 run_step horizon-mod-against-stub scripts/check-horizon-mod.sh
 
 if $with_oracle; then
@@ -38,7 +40,7 @@ else
     skip_step oracle "pass --oracle (needs the pinned JDK/ECJ toolchain and upstream checkouts)"
 fi
 if $with_live; then
-    run_step live-tests env TERRA_LIVE_TESTS=1 "${cargo_command[@]}" test --locked --workspace -- --ignored
+    run_step live-tests scripts/run-live-tests.sh
 else
     skip_step live-tests "pass --live (needs access to elevation providers)"
 fi

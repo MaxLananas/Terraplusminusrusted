@@ -109,3 +109,19 @@ fn pending_teleports_are_bounded_and_replaceable() {
     assert_eq!(pending.submit(2, request.unwrap(), &step, PLAYER, stack.loader()), Err(terra_server::TeleportRefusal::TooManyPending));
     assert!(matches!(wait_for(&mut pending, &stack, &world), TeleportOutcome::Step(TpllStep::Teleport { .. })));
 }
+
+#[test]
+fn the_exclusive_top_of_the_world_is_a_valid_feet_position() {
+    // `y` is where the player's feet go, one above the block stood on; upstream compares it with
+    // `getMaxHeight()` the same way (`TpllCommand`: `mcCoords.getBlockY() > tpWorld.getMaxHeight()`).
+    // Feet at max_y stand on the topmost block (max_y - 1); one higher is outside the world.
+    let (stack, _) = stack("top-boundary", "");
+    let world = world(&[("earth", -64, 2032)]);
+    let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 2032", PLAYER, &world).1 else { panic!("feet at max_y must teleport") };
+    assert_eq!(y, 2032.0);
+    assert_eq!(start(&stack, "35.995 -113.247 2033", PLAYER, &world).1, TpllStep::Unreachable);
+    // The bottom is exclusive the other way: feet must be above min_y.
+    assert_eq!(start(&stack, "35.995 -113.247 -64", PLAYER, &world).1, TpllStep::Unreachable);
+    let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 -63", PLAYER, &world).1 else { panic!() };
+    assert_eq!(y, -63.0);
+}

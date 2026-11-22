@@ -20,5 +20,5 @@ pub use gzip::{gunzip, gunzip_streaming};
 pub use java_number::{java_double_compare, parse_java_double};
 pub use png::{PngImage, PngLimits, decode_png};
 pub use relaxed_json::{JsonError, JsonValue, parse_relaxed_json, parse_relaxed_json_with_duplicate_keys};
-pub use tiff::{TiffRaster, decode_tiff_scalar};
+pub use tiff::{TiffLimits, TiffRaster, decode_tiff_scalar, decode_tiff_scalar_limited};
 pub use zlib::zlib_decompress;

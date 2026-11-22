@@ -2,15 +2,17 @@
 //! TLS-capable client implements for `https://`.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportLimits {
+    /// Per connection attempt (each resolved address), within `total_timeout`.
     pub connect_timeout: Duration,
-    /// Per-read socket timeout.
+    /// Per socket read or write, within `total_timeout`.
     pub io_timeout: Duration,
-    /// Deadline for the whole exchange.
+    /// Hard deadline for the whole exchange: name resolution, connection, request and response.
     pub total_timeout: Duration,
     pub max_body_bytes: u64,
     pub max_header_bytes: usize,
@@ -102,17 +104,68 @@ fn parse_http_url(url: &str) -> Result<ParsedUrl<'_>, TransportError> {
     Ok(ParsedUrl { host, port, path })
 }
 
-struct DeadlineReader<R> {
-    inner: R,
-    deadline: Instant,
+/// Time left before `deadline`, or `Timeout` when none is.
+fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() { Err(TransportError::Timeout) } else { Ok(left) }
 }
 
-impl<R: Read> Read for DeadlineReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if Instant::now() > self.deadline {
+/// Resolves `host` within the deadline. The system resolver cannot be interrupted, so it runs on
+/// a helper thread that is abandoned (and ends on its own) when the deadline passes first.
+fn resolve(host: &str, port: u16, deadline: Instant) -> Result<Vec<SocketAddr>, TransportError> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let (sender, receiver) = mpsc::channel();
+    let name = host.to_owned();
+    std::thread::Builder::new()
+        .name("terra-dns".into())
+        .spawn(move || {
+            let result = (name.as_str(), port).to_socket_addrs().map(Iterator::collect::<Vec<_>>).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| TransportError::Connect(format!("cannot start name resolution: {error}")))?;
+    match receiver.recv_timeout(remaining(deadline)?) {
+        Ok(result) => result.map_err(TransportError::Connect),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(TransportError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(TransportError::Connect("name resolution failed".into())),
+    }
+}
+
+/// A socket whose every read and write waits at most `min(io_timeout, time left)`, so the
+/// exchange cannot outlive the deadline by more than one scheduling delay.
+struct DeadlineStream {
+    inner: TcpStream,
+    deadline: Instant,
+    io_timeout: Duration,
+}
+
+impl DeadlineStream {
+    fn arm(&self, write: bool) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline exceeded"));
         }
+        let timeout = Some(left.min(self.io_timeout));
+        if write { self.inner.set_write_timeout(timeout) } else { self.inner.set_read_timeout(timeout) }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.arm(false)?;
         self.inner.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.arm(true)?;
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -127,13 +180,12 @@ impl HttpTransport for PlainHttpTransport {
     fn get(&self, url: &str, limits: &TransportLimits) -> Result<HttpResponse, TransportError> {
         let parsed = parse_http_url(url)?;
         let deadline = Instant::now() + limits.total_timeout;
-        let addresses = (parsed.host.trim_start_matches('[').trim_end_matches(']'), parsed.port)
-            .to_socket_addrs()
-            .map_err(|error| TransportError::Connect(error.to_string()))?;
+        let addresses = resolve(parsed.host.trim_start_matches('[').trim_end_matches(']'), parsed.port, deadline)?;
         let mut last_error = TransportError::Connect(format!("no address for {}", parsed.host));
         let mut stream = None;
         for address in addresses {
-            match TcpStream::connect_timeout(&address, limits.connect_timeout) {
+            let timeout = remaining(deadline)?.min(limits.connect_timeout);
+            match TcpStream::connect_timeout(&address, timeout) {
                 Ok(connected) => {
                     stream = Some(connected);
                     break;
@@ -141,9 +193,7 @@ impl HttpTransport for PlainHttpTransport {
                 Err(error) => last_error = TransportError::Connect(error.to_string()),
             }
         }
-        let mut stream = stream.ok_or(last_error)?;
-        stream.set_read_timeout(Some(limits.io_timeout)).map_err(io_error)?;
-        stream.set_write_timeout(Some(limits.io_timeout)).map_err(io_error)?;
+        let mut stream = DeadlineStream { inner: stream.ok_or(last_error)?, deadline, io_timeout: limits.io_timeout };
         let agent = if self.user_agent.is_empty() { "terraplusminus-rust" } else { &self.user_agent };
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
@@ -151,7 +201,7 @@ impl HttpTransport for PlainHttpTransport {
             if parsed.port == 80 { parsed.host.to_owned() } else { format!("{}:{}", parsed.host, parsed.port) }
         );
         stream.write_all(request.as_bytes()).map_err(io_error)?;
-        let mut reader = BufReader::new(DeadlineReader { inner: stream, deadline });
+        let mut reader = BufReader::new(stream);
         let (status, headers) = read_head(&mut reader, limits.max_header_bytes)?;
         let body = read_body(&mut reader, &headers, limits.max_body_bytes)?;
         Ok(HttpResponse { status, headers, body })
@@ -200,7 +250,8 @@ fn read_head(reader: &mut impl BufRead, max_bytes: usize) -> Result<(u16, Vec<(S
 }
 
 fn read_limited(reader: &mut impl Read, length: u64, limit: u64, out: &mut Vec<u8>) -> Result<(), TransportError> {
-    if out.len() as u64 + length > limit {
+    // Checked: a declared size near u64::MAX must not wrap past the limit.
+    if (out.len() as u64).checked_add(length).is_none_or(|total| total > limit) {
         return Err(TransportError::BodyTooLarge { limit });
     }
     let before = out.len();
@@ -218,13 +269,18 @@ fn read_body(reader: &mut impl BufRead, headers: &[(String, String)], limit: u64
         return Err(TransportError::Protocol(format!("unrequested content-encoding {encoding}")));
     }
     if header("transfer-encoding").is_some_and(|value| value.to_ascii_lowercase().contains("chunked")) {
-        let mut budget = 1 << 16;
+        // Each chunk-size line and terminator gets its own small budget (the chunk count is
+        // already bounded by the body limit, every chunk carrying at least one byte); the
+        // trailer section shares one.
+        const CHUNK_LINE_BYTES: usize = 4096;
         loop {
+            let mut budget = CHUNK_LINE_BYTES;
             let size_line = read_line(reader, &mut budget)?;
             let size_text = size_line.split(';').next().unwrap_or("").trim();
             let size = u64::from_str_radix(size_text, 16).map_err(|_| TransportError::Protocol(format!("bad chunk size {size_text:?}")))?;
             if size == 0 {
-                while !read_line(reader, &mut budget)?.is_empty() {}
+                let mut trailer_budget = 1 << 16;
+                while !read_line(reader, &mut trailer_budget)?.is_empty() {}
                 return Ok(body);
             }
             read_limited(reader, size, limit, &mut body)?;
@@ -238,7 +294,7 @@ fn read_body(reader: &mut impl BufRead, headers: &[(String, String)], limit: u64
         read_limited(reader, length, limit, &mut body)?;
         return Ok(body);
     }
-    reader.take(limit + 1).read_to_end(&mut body).map_err(io_error)?;
+    reader.take(limit.saturating_add(1)).read_to_end(&mut body).map_err(io_error)?;
     if body.len() as u64 > limit {
         return Err(TransportError::BodyTooLarge { limit });
     }
@@ -269,6 +325,52 @@ mod tests {
         let mut reader = &raw[..];
         let (_, headers) = read_head(&mut reader, 1024).unwrap();
         assert_eq!(read_body(&mut reader, &headers, 4), Err(TransportError::BodyTooLarge { limit: 4 }));
+    }
+
+    /// A declared size near `u64::MAX` used to overflow the limit check: a panic with overflow
+    /// checks, and without them a wrapped sum that passed the check and read the rest of the
+    /// stream unbounded.
+    #[test]
+    fn huge_declared_sizes_are_refused_not_wrapped() {
+        for raw in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nabc".to_owned(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\nffffffffffffffff\r\nxyz".to_owned(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\nfffffffffffffffe\r\nxyz".to_owned(),
+        ] {
+            let mut reader = raw.as_bytes();
+            let (_, headers) = read_head(&mut reader, 1024).unwrap();
+            assert_eq!(read_body(&mut reader, &headers, 1 << 20), Err(TransportError::BodyTooLarge { limit: 1 << 20 }), "{raw:?}");
+        }
+        let mut reader = &b"HTTP/1.1 200 OK\r\n\r\nabc"[..];
+        let (_, headers) = read_head(&mut reader, 1024).unwrap();
+        assert_eq!(read_body(&mut reader, &headers, u64::MAX).unwrap(), b"abc");
+    }
+
+    /// The chunk-size lines of a body used to share one 64 KiB budget, so a valid response sent
+    /// in many small chunks failed as "header too large".
+    #[test]
+    fn many_small_chunks_are_accepted() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..20_000 {
+            raw.extend_from_slice(b"1;name=value\r\nx\r\n");
+        }
+        raw.extend_from_slice(b"0\r\nX-Trailer: 1\r\n\r\n");
+        let mut reader = &raw[..];
+        let (_, headers) = read_head(&mut reader, 1024).unwrap();
+        assert_eq!(read_body(&mut reader, &headers, 1 << 20).unwrap().len(), 20_000);
+        // Still bounded: an endless chunk-size line or trailer section fails.
+        let mut endless = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        endless.extend(std::iter::repeat_n(b'0', 100_000));
+        let mut reader = &endless[..];
+        let (_, headers) = read_head(&mut reader, 1024).unwrap();
+        assert!(read_body(&mut reader, &headers, 1 << 20).is_err());
+        let mut trailers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        for _ in 0..10_000 {
+            trailers.extend_from_slice(b"X-Trailer: 1234567890\r\n");
+        }
+        let mut reader = &trailers[..];
+        let (_, headers) = read_head(&mut reader, 1024).unwrap();
+        assert!(read_body(&mut reader, &headers, 1 << 20).is_err());
     }
 
     #[test]

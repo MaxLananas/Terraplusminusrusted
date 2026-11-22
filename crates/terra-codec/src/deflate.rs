@@ -199,13 +199,14 @@ impl Output<'_> {
         }
         self.reserve(length)?;
         let start = self.window.len() - distance;
-        if distance >= length {
-            self.window.extend_from_within(start..start + length);
-        } else {
-            for offset in 0..length {
-                let byte = self.window[start + offset];
-                self.window.push(byte);
-            }
+        // An overlapping match repeats the last `distance` bytes: copy the already written part
+        // of the match in doubling blocks instead of byte by byte (runs of distance 1 are most of
+        // the Köppen raster).
+        let mut copied = 0;
+        while copied < length {
+            let block = (self.window.len() - start).min(length - copied);
+            self.window.extend_from_within(start..start + block);
+            copied += block;
         }
         self.maybe_flush()
     }

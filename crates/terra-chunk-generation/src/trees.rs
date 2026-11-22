@@ -202,7 +202,7 @@ impl TreePopulator {
                 // Upstream returns from `populate`: no further trees in this chunk.
                 return trees;
             }
-            let base_y = ground + self.y_offset;
+            let base_y = ground.wrapping_add(self.y_offset);
             if base_y >= world.max_y - 35 || base_y <= world.min_y || terrain.surface_block(x, z).is_some() {
                 continue;
             }

@@ -46,7 +46,9 @@ this environment. See [Limits](#limits).
 |---|---|---|---|---|---|
 | TMM `Http` | Bounded concurrent fetching with retries | `terra-acquisition/src/http.rs`, `policy.rs` | Worker threads only, never on the tick | `loopback_http.rs::fetches_through_retries_and_reports_missing`, `stalled_server_times_out`, `policy.rs::*` | Implemented |
 | Rate limits (429, `Retry-After`) | Back off per host | `policy.rs` | Same | `rate_limit_cooldown_applies_to_the_host` | Implemented |
-| HTTPS | TLS fetching | Refused, never downgraded. `plain_http_hosts` or a mirror is required. | Same | `https_is_refused_not_downgraded` | Not ported (no TLS without crates.io) |
+| HTTPS | TLS fetching | Refused, never downgraded. `plain_http_hosts` or a mirror is required; a configuration with an enabled source that cannot be fetched is refused before the dimension registers (`stack.rs::check_sources`) | Same | `https_is_refused_not_downgraded`, `generation_failures.rs::https_only_sources_are_refused_before_anything_starts` | Not ported (no TLS without crates.io) |
+| Transport deadlines | One hard deadline per exchange (DNS, connect, write, read) and per fetch (queueing, attempts, backoff) | `http.rs` (`resolve`, `DeadlineStream`), `policy.rs` (`fetch_deadline`) | Same | `loopback_http.rs::total_timeout_is_a_hard_deadline_even_with_a_long_io_timeout`, `a_dripping_server_cannot_extend_the_deadline`, `one_deadline_covers_every_attempt_and_backoff`, `a_stalled_attempt_is_cut_to_the_remaining_fetch_deadline` | Implemented; the DNS bound abandons the resolver thread, which ends on its own |
+| Generation failure | Permanent errors fail at once, transient ones retry `generation.retry_attempts` times, stopping cancels waits and backoffs, a refused or poisoned gate fails | `engine_bridge.rs` (`GenerationGate`, `GenerationFailure`, `terrain_for_generation`), `loader.rs::shut_down` | `build_terrain` panics on failure (caught by Horizon's job runner, chunk not published or saved); `level_load` checks the fingerprint, `server_stopping` cancels | `generation_failures.rs::*`, `engine_bridge.rs::tests::*gate*` | Implemented; Horizon: stub-checked, engine behaviour read from source only |
 | TMM `Disk` cache | On-disk tile cache | `disk_cache.rs`: atomic publication, versioned keys, LRU byte budget | `<world>/horizon-mod-data/terraplusminus` and the configured cache directory | `round_trips_and_survives_reopen`, `detects_corruption_and_discards_partial_writes`, `evicts_least_recently_used_beyond_budget` | Implemented |
 | TPM chunk cache (expire after 5 min access) | RAM cache of baked chunks | `terra-chunk-generation/src/loader.rs`: bounded queue, dedup, cancellation | Same | `loader_concurrency.rs::*` (5 tests) | Implemented |
 | Decompression bombs and path traversal | Defensive input handling | `terra-codec` output limits; `routing.rs` | Same | `deflate.rs::output_limit_is_enforced`, `png.rs::rejects_corruption_and_limits`, `routing.rs::routes_mirrors_rewrites_listed_hosts_and_refuses_others` | Implemented |
@@ -106,11 +108,19 @@ this environment. See [Limits](#limits).
 | TPM `DistortionCommand` | Tissot-based scale and angle report | `messages.rs::distortion_message` | `/distortion` | `bte_tissot_matches_upstream`, `matches_java_double_text` (`%.6f`, `%.4f`) | Implemented; Horizon: stub-checked |
 | TPM `Permission` nodes | `t+-.tpll`, `.tpll.otherWorld`, `.tpll.ungenerated-chunks`, `.admin`, `.where`, `.offset`, `.distortion` | `config.rs::PermissionLevels` maps nodes to vanilla operator levels | `Command::op(usage, level)` plus checks in the handlers | `enforces_authorization_and_bounds` | Implemented (operator levels replace permission plugins) |
 | `t+-.autoteleport`, `t+-.notify.update` | Auto-teleport, update notices | Not implemented | n/a | n/a | Not ported |
-| Teleport readiness | Never teleport into ungenerated or unloaded terrain | `teleports.rs`: bounded pending table, timeout, replaceable | Polled at `ServerTickPhase::ServerTickStart` | `pending_teleports_are_bounded_and_replaceable` | Implemented |
+| Teleport readiness | Never teleport into ungenerated or unloaded terrain | `teleports.rs`: bounded pending table, timeout, replaceable | Polled at `ServerTickPhase::ServerTickStart`; refused or dropped while generation is not open | `pending_teleports_are_bounded_and_replaceable`, `the_exclusive_top_of_the_world_is_a_valid_feet_position` | Implemented; Horizon: stub-checked |
 | Diagnostics | Queue, cache and fingerprint state | `TerraStack::diagnostics_report` | `/terraplusminus status` (diagnostics level) | Exercised by `terra-cli benchmark` | Implemented |
 | `PlayerJoinEvent`, `PlayerCommandPreprocessEvent`, `PluginMessageEvent` | Join handling, command rewriting, proxy messages | Not implemented | n/a | n/a | Not ported |
 
 ## Limits
+
+- **The Horizon deliverable is incomplete.** There has been no real SDK build and no server run,
+  so joining, generation in the engine, lighting, collision, teleport, save, stop and restart
+  are all unverified. It must not be called complete or production-ready.
+- Formatting is unverified: no rustfmt for the pinned toolchain is reachable, and
+  `scripts/release-build.sh` fails on that by design.
+- Mirrors (`network.mirrors`) are trusted to hold the same data as the URLs they replace. The
+  fingerprint records the configured URLs, not the tile contents.
 
 - Horizon is not compiled or run here: it needs Rust 1.95 and crates.io, and neither is reachable.
   The adapter is only type-checked against a hand-written stub whose signatures cite the SDK

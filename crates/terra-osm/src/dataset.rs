@@ -30,18 +30,33 @@ const MAX_KEY_LENGTH: usize = 256;
 pub enum OsmError {
     /// Every server answered 404; upstream fails the chunk the same way.
     Missing { key: String },
-    Unavailable { key: String, reasons: String },
+    /// `permanent`: every server failed in a way retrying cannot fix (unreachable URL,
+    /// malformed content).
+    Unavailable { key: String, reasons: String, permanent: bool },
     Malformed { key: String, reason: String },
     InvalidReference { key: String, location: String },
     ReferenceCycle { location: String },
     TooManyTiles { chunk: (i32, i32), tiles: usize },
 }
 
+impl OsmError {
+    /// Whether retrying cannot help: malformed or invalid data, reference loops, oversized
+    /// requests and servers that cannot be reached by this build. A missing resource (404) is
+    /// treated as transient, as upstream retries the chunk.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Missing { .. } => false,
+            Self::Unavailable { permanent, .. } => *permanent,
+            Self::Malformed { .. } | Self::InvalidReference { .. } | Self::ReferenceCycle { .. } | Self::TooManyTiles { .. } => true,
+        }
+    }
+}
+
 impl fmt::Display for OsmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { key } => write!(f, "OpenStreetMap resource {key} is missing on every server"),
-            Self::Unavailable { key, reasons } => write!(f, "OpenStreetMap resource {key} could not be fetched: {reasons}"),
+            Self::Unavailable { key, reasons, .. } => write!(f, "OpenStreetMap resource {key} could not be fetched: {reasons}"),
             Self::Malformed { key, reason } => write!(f, "OpenStreetMap resource {key} is malformed: {reason}"),
             Self::InvalidReference { key, location } => write!(f, "OpenStreetMap resource {key} references the invalid location {location:?}"),
             Self::ReferenceCycle { location } => write!(f, "OpenStreetMap references loop through {location} (or nest deeper than {MAX_REFERENCE_DEPTH})"),
@@ -200,6 +215,8 @@ impl OsmDataset {
     /// counts as failed and the next one is tried.
     fn fetch_objects(&self, key: &str) -> Result<Vec<GeoJsonObject>, OsmError> {
         let mut missing = false;
+        // A malformed answer is permanent; a network failure on any server is not.
+        let mut transient = false;
         let mut reasons = Vec::new();
         for server in &self.servers {
             let url = format!("{server}{key}");
@@ -209,13 +226,16 @@ impl OsmDataset {
                     Err(error) => reasons.push(format!("{url}: {error}")),
                 },
                 Ok(FetchOutcome::Missing) => missing = true,
-                Err(error) => reasons.push(format!("{url}: {error}")),
+                Err(error) => {
+                    transient |= !error.is_permanent();
+                    reasons.push(format!("{url}: {error}"));
+                }
             }
         }
         match (missing, reasons.is_empty()) {
             (true, _) => Err(OsmError::Missing { key: key.to_owned() }),
-            (false, true) => Err(OsmError::Unavailable { key: key.to_owned(), reasons: "no servers configured".into() }),
-            (false, false) => Err(OsmError::Unavailable { key: key.to_owned(), reasons: reasons.join("; ") }),
+            (false, true) => Err(OsmError::Unavailable { key: key.to_owned(), reasons: "no servers configured".into(), permanent: true }),
+            (false, false) => Err(OsmError::Unavailable { key: key.to_owned(), reasons: reasons.join("; "), permanent: !transient }),
         }
     }
 
@@ -338,6 +358,23 @@ fn tile_range(corners: &[GeoCoordinate; 4]) -> Option<TileRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanence_of_every_variant() {
+        let key = || "tile/1/2.json".to_owned();
+        let cases = [
+            (OsmError::Missing { key: key() }, false),
+            (OsmError::Unavailable { key: key(), reasons: "reset".into(), permanent: false }, false),
+            (OsmError::Unavailable { key: key(), reasons: "no TLS".into(), permanent: true }, true),
+            (OsmError::Malformed { key: key(), reason: "x".into() }, true),
+            (OsmError::InvalidReference { key: key(), location: "../x".into() }, true),
+            (OsmError::ReferenceCycle { location: "a.json".into() }, true),
+            (OsmError::TooManyTiles { chunk: (0, 0), tiles: 5000 }, true),
+        ];
+        for (error, permanent) in cases {
+            assert_eq!(error.is_permanent(), permanent, "{error}");
+        }
+    }
 
     #[test]
     fn keys_from_remote_data_must_be_plain_relative_paths() {

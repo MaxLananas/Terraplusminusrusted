@@ -41,7 +41,7 @@ fn column(path: &str, latitude: f64, longitude: f64) -> Result<(), String> {
     let (local_x, local_z) = ((x & 15) as usize, (z & 15) as usize);
     let y_offset = stack.config().generator.y_offset;
     println!("block x={x} z={z} chunk=({}, {})", x >> 4, z >> 4);
-    println!("surface_y={} ground_y={}", terrain.surface_height(local_x, local_z) + y_offset, terrain.ground_height(local_x, local_z) + y_offset);
+    println!("surface_y={} ground_y={}", terrain.surface_height(local_x, local_z).wrapping_add(y_offset), terrain.ground_height(local_x, local_z).wrapping_add(y_offset));
     println!("biome={}", stack.generator().biome_at_block(x, z).resource_name());
     if stack.generator().trees().is_some() {
         // TreePopulator compares every draw against the chunk's first column.
@@ -58,8 +58,8 @@ fn tpll(path: &str, arguments: &str) -> Result<(), String> {
     let (x, z) = block_of(&stack, target.position.latitude, target.position.longitude)?;
     let terrain = stack.loader().load_blocking(x >> 4, z >> 4, stack.config().generation_wait).map_err(|error| error.to_string())?;
     let y = match target.height {
-        Some(height) => height.floor() as i32 + stack.config().generator.y_offset,
-        None => terrain.surface_height((x & 15) as usize, (z & 15) as usize) + stack.config().generator.y_offset + 1,
+        Some(height) => (height.floor() as i32).wrapping_add(stack.config().generator.y_offset),
+        None => terrain.surface_height((x & 15) as usize, (z & 15) as usize).wrapping_add(stack.config().generator.y_offset).wrapping_add(1),
     };
     println!("{} {} -> x={x} y={y} z={z}", target.position.latitude, target.position.longitude);
     Ok(())

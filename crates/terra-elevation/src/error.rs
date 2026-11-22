@@ -13,6 +13,9 @@ pub enum ElevationError {
     Decode { url: String, error: DecodeError },
     TileDecode(DecodeError),
     Fetch { url: String, reason: String },
+    /// The URL cannot be fetched by this build's configuration at all (no TLS, no mirror, an
+    /// unsupported scheme): retrying cannot help.
+    Unreachable { url: String, reason: String },
     /// Every URL failed for a tile (`Http.getFirst` "All URLs completed exceptionally!").
     AllSourcesFailed { dataset: String, failures: Vec<String> },
     Cancelled,
@@ -30,6 +33,7 @@ impl fmt::Display for ElevationError {
             Self::Decode { url, error } => write!(f, "failed to decode {url}: {error}"),
             Self::TileDecode(error) => write!(f, "failed to decode tile: {error}"),
             Self::Fetch { url, reason } => write!(f, "failed to fetch {url}: {reason}"),
+            Self::Unreachable { url, reason } => write!(f, "cannot fetch {url}: {reason}"),
             Self::AllSourcesFailed { dataset, failures } => {
                 write!(f, "all sources failed for dataset {dataset}: {}", failures.join("; "))
             }
@@ -41,6 +45,19 @@ impl fmt::Display for ElevationError {
 
 impl std::error::Error for ElevationError {}
 
+impl ElevationError {
+    /// Whether retrying the same request can succeed. Configuration errors, unsupported formats,
+    /// malformed tile content and unreachable URLs are permanent; network failures, overload and
+    /// cancellation are not. Missing tiles are not errors (they are ocean).
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::InvalidConfiguration(_) | Self::UnsupportedFormat(_) | Self::RequestTooLarge { .. } | Self::Decode { .. } | Self::TileDecode(_) | Self::Unreachable { .. } => true,
+            Self::OutOfProjectionBounds | Self::LayerOutOfProjectionBounds => true,
+            Self::AllSourcesFailed { .. } | Self::Fetch { .. } | Self::Cancelled | Self::Overloaded => false,
+        }
+    }
+}
+
 impl From<OutOfProjectionBounds> for ElevationError {
     fn from(_: OutOfProjectionBounds) -> Self {
         Self::OutOfProjectionBounds
@@ -50,5 +67,49 @@ impl From<OutOfProjectionBounds> for ElevationError {
 impl From<DecodeError> for ElevationError {
     fn from(error: DecodeError) -> Self {
         Self::TileDecode(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retry policy depends on this split: a permanent error stops the chunk at once, a
+    /// transient one is retried with backoff. Every variant is listed, so adding one forces a
+    /// decision here.
+    #[test]
+    fn permanence_of_every_variant() {
+        let url = || "https://example.test/1.png".to_owned();
+        let cases = [
+            (ElevationError::OutOfProjectionBounds, true),
+            (ElevationError::LayerOutOfProjectionBounds, true),
+            (ElevationError::InvalidConfiguration("x".into()), true),
+            (ElevationError::UnsupportedFormat("x".into()), true),
+            (ElevationError::RequestTooLarge { tiles: 9 }, true),
+            (ElevationError::Decode { url: url(), error: DecodeError::Truncated }, true),
+            (ElevationError::TileDecode(DecodeError::Truncated), true),
+            (ElevationError::Unreachable { url: url(), reason: "no TLS".into() }, true),
+            (ElevationError::Fetch { url: url(), reason: "reset".into() }, false),
+            (ElevationError::AllSourcesFailed { dataset: "d".into(), failures: vec!["reset".into()] }, false),
+            (ElevationError::Cancelled, false),
+            (ElevationError::Overloaded, false),
+        ];
+        for (error, permanent) in cases {
+            assert_eq!(error.is_permanent(), permanent, "{error}");
+            match error {
+                ElevationError::OutOfProjectionBounds
+                | ElevationError::LayerOutOfProjectionBounds
+                | ElevationError::InvalidConfiguration(_)
+                | ElevationError::UnsupportedFormat(_)
+                | ElevationError::RequestTooLarge { .. }
+                | ElevationError::Decode { .. }
+                | ElevationError::TileDecode(_)
+                | ElevationError::Fetch { .. }
+                | ElevationError::Unreachable { .. }
+                | ElevationError::AllSourcesFailed { .. }
+                | ElevationError::Cancelled
+                | ElevationError::Overloaded => {}
+            }
+        }
     }
 }

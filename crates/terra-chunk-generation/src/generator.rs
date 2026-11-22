@@ -84,6 +84,21 @@ pub enum GenerationError {
     Elevation(ElevationError),
     OpenStreetMap(OsmError),
     TreeCover(ElevationError),
+    /// Generation of this chunk panicked (a bug, or data the decoders do not handle). The
+    /// message is the panic payload. Permanent: the same inputs would panic again.
+    Internal(String),
+}
+
+impl GenerationError {
+    /// Whether retrying the chunk cannot succeed (see [`ElevationError::is_permanent`] and
+    /// [`OsmError::is_permanent`]).
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Elevation(error) | Self::TreeCover(error) => error.is_permanent(),
+            Self::OpenStreetMap(error) => error.is_permanent(),
+            Self::Internal(_) => true,
+        }
+    }
 }
 
 impl fmt::Display for GenerationError {
@@ -92,6 +107,7 @@ impl fmt::Display for GenerationError {
             Self::Elevation(error) => write!(f, "elevation data unavailable: {error}"),
             Self::OpenStreetMap(error) => write!(f, "OpenStreetMap data unavailable: {error}"),
             Self::TreeCover(error) => write!(f, "tree cover data unavailable: {error}"),
+            Self::Internal(message) => write!(f, "chunk generation failed internally: {message}"),
         }
     }
 }
@@ -241,7 +257,9 @@ impl TerrainGenerator {
         populator.blocks_in_chunk(chunk_x, chunk_z, world, level_seed, neighbour, &|x, z| self.koppen_class_at_block(x, z))
     }
 
-    /// `generateNoise` followed by `generateSurface` for one chunk.
+    /// `generateNoise` followed by `generateSurface` for one chunk. Height arithmetic is Java's
+    /// wrapping `int` arithmetic: saturated heights (a ±inf layer) must not panic in builds with
+    /// overflow checks, and must behave as upstream does in all builds.
     pub fn fill_chunk(&self, terrain: &ChunkTerrain, chunk_x: i32, chunk_z: i32, world: WorldHeight, sink: &mut dyn ColumnSink) {
         let y_offset = self.settings.y_offset;
         let min_surface_cube = world.min_y.wrapping_sub(y_offset) >> 4;
@@ -252,18 +270,18 @@ impl TerrainGenerator {
         let base_z = chunk_z.wrapping_shl(4);
         for x in 0..16 {
             for z in 0..16 {
-                let ground = (terrain.ground_height(x, z) + y_offset).min(top);
-                let water = (terrain.water_height(x, z) + y_offset).min(top);
+                let ground = terrain.ground_height(x, z).wrapping_add(y_offset).min(top);
+                let water = terrain.water_height(x, z).wrapping_add(y_offset).min(top);
                 if fill_noise {
                     if ground >= world.min_y {
                         sink.fill(x, z, world.min_y, ground, &Block::Stone);
                     }
-                    let water_bottom = (ground + 1).max(world.min_y);
+                    let water_bottom = ground.wrapping_add(1).max(world.min_y);
                     if water >= water_bottom {
                         sink.fill(x, z, water_bottom, water, &Block::Water);
                     }
                 }
-                let ground_y = terrain.ground_height(x, z) + y_offset;
+                let ground_y = terrain.ground_height(x, z).wrapping_add(y_offset);
                 let start_mountain_height = random.next_int_between(7500, 7520);
                 if ground_y < world.min_y || ground_y >= world.max_y {
                     continue;
@@ -277,7 +295,7 @@ impl TerrainGenerator {
                         self.default_surface(self.biome_at_block(quart_x, quart_z))
                     }
                 };
-                let under_water = ground_y + 1 >= world.max_y || (fill_noise && ground_y < water);
+                let under_water = ground_y.wrapping_add(1) >= world.max_y || (fill_noise && ground_y < water);
                 if under_water && surface.is_grass_like() {
                     surface = Block::Dirt;
                 }
@@ -306,8 +324,8 @@ impl TerrainGenerator {
     /// `getBaseHeight` for chunk-local columns of `terrain`.
     pub fn base_height(&self, terrain: &ChunkTerrain, x: usize, z: usize, kind: HeightmapKind) -> i32 {
         match kind {
-            HeightmapKind::OceanFloor => terrain.ground_height(x, z) + self.settings.y_offset,
-            HeightmapKind::Surface => terrain.surface_height(x, z) + self.settings.y_offset,
+            HeightmapKind::OceanFloor => terrain.ground_height(x, z).wrapping_add(self.settings.y_offset),
+            HeightmapKind::Surface => terrain.surface_height(x, z).wrapping_add(self.settings.y_offset),
         }
     }
 }
@@ -317,4 +335,22 @@ pub const FIXED_SPAWN: (i32, i32, i32) = (3_517_417, 58, -5_288_234);
 
 pub fn project_block(projection: &dyn GeographicProjection, x: f64, z: f64) -> Option<(f64, f64)> {
     projection.to_geo(ProjectedCoordinate::new(x, z)).ok().map(|geo| (geo.longitude, geo.latitude))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permanence_follows_the_cause() {
+        let transient = ElevationError::Fetch { url: "u".into(), reason: "reset".into() };
+        let permanent = ElevationError::RequestTooLarge { tiles: 9 };
+        assert!(!GenerationError::Elevation(transient.clone()).is_permanent());
+        assert!(GenerationError::Elevation(permanent.clone()).is_permanent());
+        assert!(!GenerationError::TreeCover(transient).is_permanent());
+        assert!(GenerationError::TreeCover(permanent).is_permanent());
+        assert!(!GenerationError::OpenStreetMap(OsmError::Missing { key: "k".into() }).is_permanent());
+        assert!(GenerationError::OpenStreetMap(OsmError::ReferenceCycle { location: "l".into() }).is_permanent());
+        assert!(GenerationError::Internal("panic".into()).is_permanent());
+    }
 }

@@ -83,6 +83,11 @@ fn cache_key(url: &str) -> String {
     format!("{:016x}{:016x}", fnv1a(url.as_bytes(), 0xcbf2_9ce4_8422_2325), fnv1a(url.as_bytes(), 0x6c62_272e_07bb_0142))
 }
 
+/// The shape `cache_key` produces: 32 lowercase hexadecimal digits.
+fn is_cache_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn encode_entry(url: &str, outcome: &FetchOutcome) -> Vec<u8> {
     let (kind, body): (u8, &[u8]) = match outcome {
         FetchOutcome::Found(body) => (1, body),
@@ -127,7 +132,12 @@ impl DiskCache {
         let directory = root.join(CACHE_FORMAT_VERSION);
         fs::create_dir_all(directory.join("partial"))?;
         for leftover in fs::read_dir(directory.join("partial"))? {
-            fs::remove_file(leftover?.path())?;
+            // Only files this cache could have written; anything else (a directory someone put
+            // there) is left alone rather than failing the whole cache or deleting a tree.
+            let leftover = leftover?;
+            if !leftover.file_type()?.is_dir() {
+                let _ = fs::remove_file(leftover.path());
+            }
         }
         let mut found = Vec::new();
         for shard in fs::read_dir(&directory)? {
@@ -138,8 +148,10 @@ impl DiskCache {
             for entry in fs::read_dir(shard.path())? {
                 let entry = entry?;
                 let path = entry.path();
-                let Some(key) = path.file_stem().and_then(|stem| stem.to_str()).filter(|key| key.len() == 32) else { continue };
-                if path.extension().and_then(|ext| ext.to_str()) != Some(ENTRY_EXTENSION) {
+                // Only files at the path `entry_path` gives for their key: a foreign or misplaced
+                // file would otherwise be counted against the budget but never deleted.
+                let Some(key) = path.file_stem().and_then(|stem| stem.to_str()).filter(|key| is_cache_key(key)) else { continue };
+                if path.extension().and_then(|ext| ext.to_str()) != Some(ENTRY_EXTENSION) || shard.file_name().to_str() != Some(&key[..2]) || !entry.file_type()?.is_file() {
                     continue;
                 }
                 let metadata = entry.metadata()?;
@@ -169,7 +181,7 @@ impl DiskCache {
         let key = cache_key(url);
         let path = self.entry_path(&key);
         let known = self.index.lock().unwrap_or_else(PoisonError::into_inner).entries.contains_key(&key);
-        let decoded = if known { fs::read(&path).ok().map(|bytes| (decode_entry(url, &bytes), bytes.len() as u64)) } else { None };
+        let decoded = if known { self.read_entry(&path).map(|bytes| (decode_entry(url, &bytes), bytes.len() as u64)) } else { None };
         let mut index = self.index.lock().unwrap_or_else(PoisonError::into_inner);
         match decoded {
             Some((Some(FetchOutcome::Missing), _)) if self.missing_expired(&path) => {
@@ -200,6 +212,16 @@ impl DiskCache {
                 None
             }
         }
+    }
+
+    /// Reads at most the byte budget: a larger file was not written by this cache and is
+    /// returned truncated, which fails its CRC and is discarded as corrupt.
+    fn read_entry(&self, path: &Path) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(self.limits.max_bytes.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+        Some(bytes)
     }
 
     fn missing_expired(&self, path: &Path) -> bool {
@@ -333,6 +355,45 @@ mod tests {
         assert!(cache.get("http://a/1").is_none());
         let statistics = cache.statistics();
         assert!(statistics.bytes <= 2500 && statistics.evictions == 1, "{statistics:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A 32-byte non-hexadecimal name used to be indexed and then sliced at byte 2 by
+    /// `entry_path`, panicking at startup; a directory in `partial` failed `open` altogether.
+    #[test]
+    fn foreign_files_neither_panic_nor_count() {
+        let root = scratch("foreign");
+        let directory = root.join(CACHE_FORMAT_VERSION);
+        fs::create_dir_all(directory.join("ab")).unwrap();
+        fs::create_dir_all(directory.join("partial").join("keep-me")).unwrap();
+        fs::write(directory.join("partial").join("keep-me").join("note"), b"x").unwrap();
+        // "é" is two bytes: byte 2 falls inside it.
+        let non_ascii = format!("aé{}", "0".repeat(29));
+        assert_eq!(non_ascii.len(), 32);
+        fs::write(directory.join("ab").join(format!("{non_ascii}.tile")), vec![0; 5000]).unwrap();
+        // Valid key, wrong shard: deleting it by key would miss it.
+        fs::write(directory.join("ab").join(format!("cd{}.tile", "0".repeat(30))), vec![0; 5000]).unwrap();
+        fs::write(directory.join("ab").join(format!("ABCD{}.tile", "0".repeat(28))), vec![0; 5000]).unwrap();
+        let limits = DiskCacheLimits { max_bytes: 1000, ..DiskCacheLimits::default() };
+        let cache = DiskCache::open(&root, limits).unwrap();
+        assert_eq!(cache.statistics().entries, 0, "only files the cache could have written are indexed");
+        assert!(directory.join("partial").join("keep-me").join("note").exists(), "a directory in partial is not deleted");
+        cache.put("http://a/1", &FetchOutcome::Found(vec![1; 10])).unwrap();
+        assert_eq!(cache.get("http://a/1"), Some(FetchOutcome::Found(vec![1; 10])));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_entry_is_discarded_without_reading_it_all() {
+        let root = scratch("oversized");
+        let limits = DiskCacheLimits { max_bytes: 4096, ..DiskCacheLimits::default() };
+        let cache = DiskCache::open(&root, limits).unwrap();
+        cache.put("http://a/1", &FetchOutcome::Found(vec![1; 10])).unwrap();
+        let path = cache.entry_path(&cache_key("http://a/1"));
+        fs::write(&path, vec![7; 1 << 20]).unwrap();
+        assert_eq!(cache.get("http://a/1"), None);
+        assert_eq!(cache.statistics().corrupt_entries, 1);
+        assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

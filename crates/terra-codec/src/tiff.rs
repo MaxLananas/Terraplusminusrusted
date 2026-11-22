@@ -22,6 +22,39 @@ pub struct TiffRaster {
 const MAX_DIRECTORIES: usize = 64;
 const MAX_ENTRIES: usize = 4096;
 
+/// Resource limits for one decode, checked with overflow-safe arithmetic before anything is
+/// allocated or decompressed. The file is untrusted: its declared sizes never set an allocation
+/// on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TiffLimits {
+    /// Image width times height.
+    pub max_pixels: u64,
+    /// Decoded bytes of one strip or tile (tiles may overhang the image edge).
+    pub max_segment_bytes: u64,
+    /// Decoded bytes of all strips and tiles together.
+    pub max_decoded_bytes: u64,
+    /// Strips or tiles in the image.
+    pub max_segments: u64,
+    /// Values in one array field (offsets, byte counts, bits per sample).
+    pub max_field_values: u64,
+}
+
+impl TiffLimits {
+    /// Limits for images of at most `max_pixels`: a segment may decode to at most four times the
+    /// largest image at 8 bytes per sample (overhanging tiles), with a 1 MiB floor for tiny
+    /// images, and all segments together to at most twice that.
+    pub fn for_pixels(max_pixels: u64) -> Self {
+        let segment = max_pixels.saturating_mul(32).max(1 << 20);
+        Self {
+            max_pixels,
+            max_segment_bytes: segment,
+            max_decoded_bytes: segment.saturating_mul(2),
+            max_segments: max_pixels.clamp(1, 1 << 20),
+            max_field_values: max_pixels.clamp(16, 1 << 20),
+        }
+    }
+}
+
 const TAG_WIDTH: u16 = 256;
 const TAG_HEIGHT: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
@@ -101,8 +134,9 @@ impl Directory {
         self.entries.iter().find(|entry| entry.tag == tag)
     }
 
-    /// An unsigned integer field (BYTE, SHORT or LONG) as values.
-    fn integers(&self, reader: Reader<'_>, tag: u16) -> Result<Option<Vec<u64>>, DecodeError> {
+    /// An unsigned integer field (BYTE, SHORT or LONG) as values. The values must lie inside the
+    /// file and number at most `max_values` before anything is allocated.
+    fn integers_limited(&self, reader: Reader<'_>, tag: u16, max_values: u64) -> Result<Option<Vec<u64>>, DecodeError> {
         let Some(entry) = self.find(tag) else { return Ok(None) };
         let size = match entry.kind {
             1 => 1,
@@ -110,10 +144,13 @@ impl Directory {
             4 => 4,
             _ => return Err(invalid("integer field has a non-integer type")),
         };
-        if entry.count > (1 << 24) {
-            return Err(invalid("field count too large"));
+        if entry.count > max_values {
+            return Err(DecodeError::LimitExceeded(format!("TIFF field {tag} has {} values (limit {max_values})", entry.count)));
         }
-        let mut values = Vec::with_capacity(entry.count as usize);
+        // Proves the whole array is inside the file, so the allocation below is bounded by it.
+        reader.slice(entry.value_offset, entry.count.checked_mul(size).ok_or(invalid("field too large"))?)?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(entry.count as usize).map_err(|_| DecodeError::LimitExceeded("TIFF field allocation failed".into()))?;
         for index in 0..entry.count {
             let offset = entry.value_offset + index * size;
             values.push(match size {
@@ -125,8 +162,9 @@ impl Directory {
         Ok(Some(values))
     }
 
+    /// A single-valued integer field: its first value, from a field of at most 16 values.
     fn integer(&self, reader: Reader<'_>, tag: u16) -> Result<Option<u64>, DecodeError> {
-        Ok(self.integers(reader, tag)?.and_then(|values| values.first().copied()))
+        Ok(self.integers_limited(reader, tag, 16)?.and_then(|values| values.first().copied()))
     }
 
     fn ascii(&self, reader: Reader<'_>, tag: u16) -> Result<Option<String>, DecodeError> {
@@ -192,7 +230,7 @@ fn supported_layout(reader: Reader<'_>, directory: &Directory) -> Result<Option<
         Some(0 | 1) => {}
         _ => return Ok(None),
     }
-    let bits = directory.integers(reader, TAG_BITS_PER_SAMPLE)?.unwrap_or_else(|| vec![1]);
+    let bits = directory.integers_limited(reader, TAG_BITS_PER_SAMPLE, 16)?.unwrap_or_else(|| vec![1]);
     if bits.len() != 1 || directory.integer(reader, TAG_SAMPLES_PER_PIXEL)?.unwrap_or(1) != 1 {
         return Ok(None);
     }
@@ -214,9 +252,16 @@ fn supported_layout(reader: Reader<'_>, directory: &Directory) -> Result<Option<
     Ok(Some(Layout { width, height, bytes_per_sample: bits / 8, kind, compression, predictor }))
 }
 
-/// Decodes the first supported directory of `bytes`. Images over `max_pixels` are refused before
-/// anything is decompressed.
+/// Decodes the first supported directory of `bytes` with [`TiffLimits::for_pixels`]. Images over
+/// `max_pixels` are refused before anything is decompressed.
 pub fn decode_tiff_scalar(bytes: &[u8], max_pixels: u64) -> Result<TiffRaster, DecodeError> {
+    decode_tiff_scalar_limited(bytes, &TiffLimits::for_pixels(max_pixels))
+}
+
+/// Decodes the first supported directory of `bytes`, refusing anything over `limits` with
+/// [`DecodeError::ImageTooLarge`] or [`DecodeError::LimitExceeded`] before allocating for it.
+pub fn decode_tiff_scalar_limited(bytes: &[u8], limits: &TiffLimits) -> Result<TiffRaster, DecodeError> {
+    let max_pixels = limits.max_pixels;
     let little = match bytes.get(..4) {
         Some([b'I', b'I', 42, 0]) => true,
         Some([b'M', b'M', 0, 42]) => false,
@@ -232,7 +277,7 @@ pub fn decode_tiff_scalar(bytes: &[u8], max_pixels: u64) -> Result<TiffRaster, D
         if layout.width == 0 || layout.height == 0 || pixels > max_pixels {
             return Err(DecodeError::ImageTooLarge { width: layout.width as u32, height: layout.height as u32 });
         }
-        let data = decode_raster(reader, directory, &layout)?;
+        let data = decode_raster(reader, directory, &layout, limits)?;
         return Ok(TiffRaster {
             width: layout.width as u32,
             height: layout.height as u32,
@@ -243,34 +288,54 @@ pub fn decode_tiff_scalar(bytes: &[u8], max_pixels: u64) -> Result<TiffRaster, D
     Err(unsupported("no supported TIFF directories could be found"))
 }
 
-fn decode_raster(reader: Reader<'_>, directory: &Directory, layout: &Layout) -> Result<Vec<f32>, DecodeError> {
-    let (segment_width, segment_height, offsets, counts) = if directory.find(TAG_TILE_OFFSETS).is_some() {
+fn limit_exceeded(what: &str, value: u64, limit: u64) -> DecodeError {
+    DecodeError::LimitExceeded(format!("TIFF {what} of {value} exceeds the limit of {limit}"))
+}
+
+fn decode_raster(reader: Reader<'_>, directory: &Directory, layout: &Layout, limits: &TiffLimits) -> Result<Vec<f32>, DecodeError> {
+    let tiled = directory.find(TAG_TILE_OFFSETS).is_some();
+    let (segment_width, segment_height) = if tiled {
         let tile_width = directory.integer(reader, TAG_TILE_WIDTH)?.ok_or(invalid("missing TileWidth"))?;
         let tile_height = directory.integer(reader, TAG_TILE_LENGTH)?.ok_or(invalid("missing TileLength"))?;
-        let offsets = directory.integers(reader, TAG_TILE_OFFSETS)?.unwrap_or_default();
-        let counts = directory.integers(reader, TAG_TILE_BYTE_COUNTS)?.ok_or(invalid("missing TileByteCounts"))?;
-        (tile_width, tile_height, offsets, counts)
+        (tile_width, tile_height)
     } else {
-        let rows = directory.integer(reader, TAG_ROWS_PER_STRIP)?.unwrap_or(layout.height).min(layout.height);
-        let offsets = directory.integers(reader, TAG_STRIP_OFFSETS)?.ok_or(invalid("missing StripOffsets"))?;
-        let counts = directory.integers(reader, TAG_STRIP_BYTE_COUNTS)?.ok_or(invalid("missing StripByteCounts"))?;
-        (layout.width, rows, offsets, counts)
+        (layout.width, directory.integer(reader, TAG_ROWS_PER_STRIP)?.unwrap_or(layout.height).min(layout.height))
     };
     if segment_width == 0 || segment_height == 0 || segment_width > 1 << 16 || segment_height > 1 << 16 {
         return Err(invalid("invalid tile or strip size"));
     }
+    // Every size below is checked before the segment arrays are read or anything is decoded.
+    let row_bytes = segment_width.checked_mul(layout.bytes_per_sample).ok_or(invalid("segment too large"))?;
+    let full_segment_bytes = row_bytes.checked_mul(segment_height).ok_or(invalid("segment too large"))?;
+    if full_segment_bytes > limits.max_segment_bytes {
+        return Err(limit_exceeded("decoded segment size", full_segment_bytes, limits.max_segment_bytes));
+    }
     let across = layout.width.div_ceil(segment_width);
     let down = layout.height.div_ceil(segment_height);
-    if offsets.len() as u64 != across * down || counts.len() != offsets.len() {
+    let segments = across.checked_mul(down).ok_or(invalid("too many segments"))?;
+    if segments > limits.max_segments {
+        return Err(limit_exceeded("segment count", segments, limits.max_segments));
+    }
+    // Tiles are always full size; strips end at the image.
+    let decoded_total = if tiled { segments.checked_mul(full_segment_bytes) } else { layout.height.checked_mul(row_bytes) }.ok_or(invalid("image too large"))?;
+    if decoded_total > limits.max_decoded_bytes {
+        return Err(limit_exceeded("total decoded size", decoded_total, limits.max_decoded_bytes));
+    }
+    let field_limit = segments.min(limits.max_field_values);
+    let (offset_tag, count_tag) = if tiled { (TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS) } else { (TAG_STRIP_OFFSETS, TAG_STRIP_BYTE_COUNTS) };
+    let offsets = directory.integers_limited(reader, offset_tag, field_limit)?.ok_or(invalid("missing segment offsets"))?;
+    let counts = directory.integers_limited(reader, count_tag, field_limit)?.ok_or(invalid("missing segment byte counts"))?;
+    if offsets.len() as u64 != segments || counts.len() != offsets.len() {
         return Err(invalid("segment offsets do not cover the image"));
     }
-    let mut data = vec![0.0f32; (layout.width * layout.height) as usize];
-    let row_bytes = segment_width * layout.bytes_per_sample;
+    let pixels = layout.width.checked_mul(layout.height).ok_or(invalid("image too large"))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(pixels as usize).map_err(|_| DecodeError::LimitExceeded("TIFF raster allocation failed".into()))?;
+    data.resize(pixels as usize, 0.0f32);
     for (index, (&offset, &count)) in offsets.iter().zip(&counts).enumerate() {
         let index = index as u64;
         let (left, top) = ((index % across) * segment_width, (index / across) * segment_height);
-        // Strips end at the image; tiles are always full size.
-        let rows = if directory.find(TAG_TILE_OFFSETS).is_some() { segment_height } else { segment_height.min(layout.height - top) };
+        let rows = if tiled { segment_height } else { segment_height.min(layout.height - top) };
         let expected = (row_bytes * rows) as usize;
         let mut segment = decompress(reader.slice(offset, count)?, layout.compression, expected)?;
         if segment.len() < expected {
@@ -323,7 +388,8 @@ fn sample_value(bytes: &[u8], kind: SampleKind, little: bool) -> f32 {
 
 fn decompress(input: &[u8], compression: u64, expected: usize) -> Result<Vec<u8>, DecodeError> {
     match compression {
-        1 => Ok(input.to_vec()),
+        // Never copies more than the segment needs, whatever the declared byte count.
+        1 => Ok(input[..input.len().min(expected)].to_vec()),
         5 => lzw_decode(input, expected),
         8 | 32946 => zlib_decompress(input, expected),
         32773 => packbits_decode(input, expected),
@@ -383,7 +449,8 @@ fn lzw_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {
     if input.len() >= 2 && input[0] == 0 && input[1] & 1 != 0 {
         return Err(unsupported("pre-6.0 (LSB-first) LZW"));
     }
-    let mut out: Vec<u8> = Vec::with_capacity(limit);
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve(limit.min(input.len().saturating_mul(16))).map_err(|_| DecodeError::LimitExceeded("LZW output allocation failed".into()))?;
     let mut table = vec![(0usize, 0usize); 4096];
     let mut next = 258usize;
     let mut width = 9u32;
@@ -444,7 +511,9 @@ fn lzw_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {
 }
 
 fn packbits_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {
-    let mut out = Vec::with_capacity(limit);
+    // PackBits expands at most 128 times (a two-byte run of 128).
+    let mut out = Vec::new();
+    out.try_reserve(limit.min(input.len().saturating_mul(64))).map_err(|_| DecodeError::LimitExceeded("PackBits output allocation failed".into()))?;
     let mut position = 0;
     while position < input.len() && out.len() < limit {
         let header = input[position] as i8;

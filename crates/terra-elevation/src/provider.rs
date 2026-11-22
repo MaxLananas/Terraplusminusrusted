@@ -132,9 +132,42 @@ struct CacheState {
 }
 
 #[derive(Default)]
+enum FlightOutcome {
+    #[default]
+    Pending,
+    Done(Result<Option<Tile>, ElevationError>),
+    /// The leader's fetch panicked: followers start over (one of them becomes the new leader).
+    Abandoned,
+}
+
+#[derive(Default)]
 struct InFlight {
-    result: Mutex<Option<Result<Option<Tile>, ElevationError>>>,
+    result: Mutex<FlightOutcome>,
     ready: Condvar,
+}
+
+impl InFlight {
+    fn finish(&self, outcome: FlightOutcome) {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = outcome;
+        self.ready.notify_all();
+    }
+}
+
+/// Unregisters the leader's flight if its fetch unwinds, so the tile is not left "loading"
+/// forever with every later request for it blocked.
+struct LeaderGuard<'a> {
+    state: &'a Mutex<CacheState>,
+    key: Option<CacheKey>,
+    flight: Arc<InFlight>,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).in_flight.remove(&key);
+            self.flight.finish(FlightOutcome::Abandoned);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -184,48 +217,54 @@ enum Role {
 impl<F: TileFetcher> TileProvider for CachingTileProvider<F> {
     fn load(&self, dataset: &TiledScalarDataset, position: TilePosition) -> Result<Option<Tile>, ElevationError> {
         let key: CacheKey = (Arc::from(dataset.id.as_str()), position);
-        let role = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.clock += 1;
-            let tick = state.clock;
-            if let Some((tile, old_tick)) = state.entries.get_mut(&key) {
-                let tile = tile.clone();
-                let previous = std::mem::replace(old_tick, tick);
-                state.recency.remove(&previous);
-                state.recency.insert(tick, key);
-                state.hits += 1;
-                return Ok(tile);
-            }
-            state.misses += 1;
-            match state.in_flight.get(&key) {
-                Some(flight) => Role::Follower(Arc::clone(flight)),
-                None => {
-                    let flight = Arc::new(InFlight::default());
-                    state.in_flight.insert(key.clone(), Arc::clone(&flight));
-                    Role::Leader(flight)
+        loop {
+            let role = {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.clock += 1;
+                let tick = state.clock;
+                if let Some((tile, old_tick)) = state.entries.get_mut(&key) {
+                    let tile = tile.clone();
+                    let previous = std::mem::replace(old_tick, tick);
+                    state.recency.remove(&previous);
+                    state.recency.insert(tick, key);
+                    state.hits += 1;
+                    return Ok(tile);
                 }
-            }
-        };
-        match role {
-            Role::Follower(flight) => {
-                let mut result = flight.result.lock().unwrap_or_else(PoisonError::into_inner);
-                while result.is_none() {
-                    result = flight.ready.wait(result).unwrap_or_else(PoisonError::into_inner);
-                }
-                result.clone().unwrap_or(Err(ElevationError::Cancelled))
-            }
-            Role::Leader(flight) => {
-                let outcome = fetch_first(&self.fetcher, dataset, position);
-                {
-                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    state.in_flight.remove(&key);
-                    if let Ok(tile) = &outcome {
-                        self.insert(&mut state, key, tile.clone());
+                state.misses += 1;
+                match state.in_flight.get(&key) {
+                    Some(flight) => Role::Follower(Arc::clone(flight)),
+                    None => {
+                        let flight = Arc::new(InFlight::default());
+                        state.in_flight.insert(key.clone(), Arc::clone(&flight));
+                        Role::Leader(flight)
                     }
                 }
-                *flight.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome.clone());
-                flight.ready.notify_all();
-                outcome
+            };
+            match role {
+                Role::Follower(flight) => {
+                    let mut result = flight.result.lock().unwrap_or_else(PoisonError::into_inner);
+                    loop {
+                        match &*result {
+                            FlightOutcome::Done(outcome) => return outcome.clone(),
+                            FlightOutcome::Abandoned => break,
+                            FlightOutcome::Pending => result = flight.ready.wait(result).unwrap_or_else(PoisonError::into_inner),
+                        }
+                    }
+                }
+                Role::Leader(flight) => {
+                    let mut guard = LeaderGuard { state: &self.state, key: Some(key.clone()), flight: Arc::clone(&flight) };
+                    let outcome = fetch_first(&self.fetcher, dataset, position);
+                    guard.key = None;
+                    {
+                        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        state.in_flight.remove(&key);
+                        if let Ok(tile) = &outcome {
+                            self.insert(&mut state, key, tile.clone());
+                        }
+                    }
+                    flight.finish(FlightOutcome::Done(outcome.clone()));
+                    return outcome;
+                }
             }
         }
     }

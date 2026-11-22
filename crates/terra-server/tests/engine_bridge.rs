@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use terra_chunk_generation::WorldHeight;
-use terra_server::{BiomeLookup, BlockPalette, BlockWriter, GenerationCounters, terrain_for_generation, write_chunk};
+use terra_server::{BiomeLookup, BlockPalette, BlockWriter, GenerationControl, terrain_for_generation, write_chunk};
 
 #[derive(Default)]
 /// Last write wins, as the engine's `set_block` replaces: upstream fills stone up to the ground
@@ -39,8 +39,8 @@ fn writes_real_columns_up_to_the_surface() {
     let (stack, _) = common::stack("bridge-columns", "");
     let block = stack.generator().projection().from_geo(terra_projection::GeoCoordinate::new(-113.247, 35.995)).unwrap();
     let (chunk_x, chunk_z) = ((block.x.floor() as i32) >> 4, (block.y.floor() as i32) >> 4);
-    let counters = GenerationCounters::default();
-    let terrain = terrain_for_generation(&stack, &counters, chunk_x, chunk_z, &mut |message| panic!("{message}"));
+    let control = GenerationControl::default();
+    let terrain = terrain_for_generation(&stack, &control, chunk_x, chunk_z, &mut |message| panic!("{message}")).unwrap();
     let world = WorldHeight { min_y: -64, max_y: 2032 };
     let mut chunk = FakeChunk::default();
     write_chunk(&stack, &terrain, chunk_x, chunk_z, world, &mut palette(), &mut chunk);

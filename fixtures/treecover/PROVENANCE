@@ -3,3 +3,14 @@ Python 3.11.2, numpy 2.4.6 and tifffile 2026.3.3 (LZW, horizontal predictor, uin
 GDAL_NODATA "255"), in the URL layout of upstream's tree_cover.json5
 (https://cloud.daporkchop.net/gis/treecover2000/13/${x}/${z}.tiff). The tiles cover z13 columns
 1518-1520 and rows 3216-3218, around the terrarium fixture in fixtures/elevation/terrarium.
+# file digests: regenerating with make-fixture.py and the versions above reproduces these bytes
+# exactly (checked 2026-11-21); scripts/check-fixtures.sh verifies them.
+file 1f0b9c7e75cb732cf71e16e118cd60a8c2e1e03987cc3d5000316a551b3a23c6  13/1518/3216.tiff
+file 1f0b9c7e75cb732cf71e16e118cd60a8c2e1e03987cc3d5000316a551b3a23c6  13/1518/3217.tiff
+file 4acacc55e79ad8a336a31002157723fbe15c3b32ed2792449f1b1dd70308e530  13/1518/3218.tiff
+file 9fa0a50c9a38c40e73612e0bdb0abe18d862dc9c75d608a02d27262da28b0784  13/1519/3216.tiff
+file 9fa0a50c9a38c40e73612e0bdb0abe18d862dc9c75d608a02d27262da28b0784  13/1519/3217.tiff
+file 1a2a1bcd75049ff3a7bf51a5664acb07abfd39a960fb179836215d46314c74f0  13/1519/3218.tiff
+file 7db15e10efd2c7a1acdb5fb4f04a5dc5611fac61bfe1f1361672be006faedafc  13/1520/3216.tiff
+file 7db15e10efd2c7a1acdb5fb4f04a5dc5611fac61bfe1f1361672be006faedafc  13/1520/3217.tiff
+file 6cd23d0b021da01e0c98a292f0eefa7944246e1a2ed93dcd0d3057987436caeb  13/1520/3218.tiff

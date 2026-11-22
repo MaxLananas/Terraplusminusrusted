@@ -189,7 +189,7 @@ impl TpllRequest {
 
     /// Continues after [`TpllStep::NeedsSurface`] with the generator's surface height there.
     pub fn resume_with_surface(&self, surface_height: i32, linked: &LinkedWorlds, authorization: Authorization, world: &dyn TeleportWorld) -> TpllStep {
-        self.finalize(&self.world.clone(), f64::from(surface_height + self.y_offset) + 1.0, linked, authorization, world)
+        self.finalize(&self.world.clone(), f64::from(surface_height.wrapping_add(self.y_offset)) + 1.0, linked, authorization, world)
     }
 
     fn finalize(&self, world_name: &str, y: f64, linked: &LinkedWorlds, authorization: Authorization, world: &dyn TeleportWorld) -> TpllStep {

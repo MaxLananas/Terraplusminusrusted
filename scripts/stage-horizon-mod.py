@@ -89,13 +89,13 @@ def validate_destination(argument, root=ROOT, home=None):
         if not output.is_dir():
             raise Refused(f"{output} exists and is not a directory")
         marker = output / MARKER
-        if marker.is_symlink() or not marker.is_file() or marker.read_text(errors="replace") != MARKER_TEXT:
+        if marker.is_symlink() or not marker.is_file() or marker.read_text(encoding="utf-8", errors="replace") != MARKER_TEXT:
             raise Refused(f"{output} exists and was not created by this script (no {MARKER}); remove it yourself or choose another directory")
     return output
 
 
 def build_package(output):
-    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     shutil.copytree(ROOT / "horizon-mod", output, ignore=shutil.ignore_patterns(".horizon", "target"), dirs_exist_ok=True)
     for crate in CRATES:
         source = ROOT / "crates" / crate
@@ -104,13 +104,13 @@ def build_package(output):
         for part in ("src", "resources"):
             if (source / part).is_dir():
                 shutil.copytree(source / part, destination / part)
-        manifest = rewrite_manifest((source / "Cargo.toml").read_text(), workspace)
+        manifest = rewrite_manifest((source / "Cargo.toml").read_text(encoding="utf-8"), workspace)
         tomllib.loads(manifest)
-        (destination / "Cargo.toml").write_text(manifest)
+        (destination / "Cargo.toml").write_text(manifest, encoding="utf-8")
     for directory in ("assets/terraplusminus", "data/terraplusminus"):
         (output / directory).mkdir(parents=True, exist_ok=True)
     shutil.copy(ROOT / "LICENSE", output / "LICENSE")
-    (output / MARKER).write_text(MARKER_TEXT)
+    (output / MARKER).write_text(MARKER_TEXT, encoding="utf-8")
 
 
 def stage(argument):

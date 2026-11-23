@@ -1,4 +1,4 @@
-//! Signatures from horizon-mod-vocab at ffd59c4e0cebd16c0982016f040b3a9b70e8b83b; see README.
+//! Signatures from horizon-mod-vocab at 2b77287de099c9316278ba7ac4d83590fdb7ef30; see README.
 #![allow(unused_variables, dead_code, clippy::all)]
 
 use std::path::PathBuf;

@@ -9,7 +9,7 @@ under `tools/oracle`.
 |---|---|---|---|
 | [TerraPlusMinus](https://github.com/BTE-Germany/TerraPlusMinus) | `5af87efafb0930c454da1ee49f098531018acca9` | MIT, (c) 2022-2026 BTE Germany | Generator, commands, configuration, `koppen_map.gz` |
 | [terraminusminus](https://github.com/SmylerMC/terraminusminus) | `a1432a9beabd79025e62c8de0d0b1a99e7ea9943` | MIT, (c) 2020 BuildTheEarth.net | Projections, `conformal.gz`, elevation datasets, `heights.json5` |
-| [Horizon](https://github.com/horizon-rust/horizon) | `ffd59c4e0cebd16c0982016f040b3a9b70e8b83b` | LGPL-3.0 | Native mod API (`horizon-mod-vocab`), manifest format |
+| [Horizon](https://github.com/horizon-rust/horizon) | `2b77287de099c9316278ba7ac4d83590fdb7ef30` | LGPL-3.0 | Native mod API (`horizon-mod-vocab`), manifest format |
 | horizon-mixins | `e59da9094f0c2fdda6c627fe9eff22dec6a906f0` | (Horizon project) | Recorded in the mod manifest's `[native]` table |
 | [Paper](https://github.com/PaperMC/Paper) | `d81ca50aeb956bccd912c124638f556b564ea8af` | GPL-3.0 (read only) | Behavior reference for the surface RNG seed; no code copied |
 | [PorkLib](https://github.com/PorkStudios/PorkLib) | `836334a9655fe9c5fae088db74a7830af108a2bd` | (read only) | Semantics of `floorI`, `ceilI`, `lerp` and `clamp` |

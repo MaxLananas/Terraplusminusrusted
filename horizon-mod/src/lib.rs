@@ -69,9 +69,13 @@ fn load_shared(context: &RegistrationContext) -> Result<Shared, String> {
     let instance = context.instance_dir().ok().and_then(instance_path).ok_or("the instance directory is unavailable")?;
     let path = instance.join(CONFIG_FILE);
     let config = match std::fs::read_to_string(&path) {
-        Ok(text) => parse_server_config(&text).map_err(|error| format!("{}: {error}", path.display()))?,
+        Ok(text) => {
+            let config = parse_server_config(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+            log(&format!("configuration read from {}", path.display()));
+            config
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            log(&format!("no {CONFIG_FILE}; using the upstream defaults (AWS terrain tiles and the OpenStreetMap server need network.plain_http_hosts or a mirror)"));
+            log(&format!("no configuration at {}; using the defaults (https:// sources are fetched through curl, network.https_command)", path.display()));
             ServerConfig::default()
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),

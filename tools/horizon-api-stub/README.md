@@ -2,8 +2,15 @@
 
 The real SDK cannot be built in this environment: it requires Rust 1.95 and crates.io. This
 stub declares only the items `horizon-mod/src/lib.rs` uses, with signatures copied from
-`horizon-mod-vocab` at Horizon `ffd59c4e0cebd16c0982016f040b3a9b70e8b83b`. Its bodies do
-nothing.
+`horizon-mod-vocab` at Horizon `2b77287de099c9316278ba7ac4d83590fdb7ef30` (`nightly-2026-11-22`). Its
+bodies do nothing.
+
+The mod was first written against `ffd59c4e0cebd16c0982016f040b3a9b70e8b83b`. That build has no
+published SDK (`sdk-<commit>` release), so the launcher could not build the mod for it. The pin moved
+to the dated Nightly above, which has an SDK with Windows x64, Linux and macOS slices. Between the two
+commits, every source file in the table below is byte-identical, except `host/services.rs`. That file
+only gains `RuntimeLevels::reset_vanilla`, which has a default body. The only removal is the
+`RuntimeGenerator`/`RuntimeLevel` re-export, which the mod does not use.
 
 `scripts/check-horizon-mod.sh` stages the mod with this stub in place of
 `.horizon/sdk/api/crates/horizon-mod-api`, then type-checks and lints it. That catches mistakes

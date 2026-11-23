@@ -31,6 +31,8 @@ pub enum TileFormat {
     FlipZ(Box<TileFormat>),
     /// `swap_axes`.
     SwapAxes(Box<TileFormat>),
+    /// `from_int`: an integer parser chain, [`crate::int_format::NO_DATA`] becoming `NaN`.
+    FromInt(Box<crate::int_format::IntFormat>),
 }
 
 impl TileFormat {
@@ -46,23 +48,11 @@ impl TileFormat {
                 let factor = 1.0 / value;
                 inner.parse(bytes, resolution)?.into_iter().map(|sample| sample * factor).collect()
             }
-            Self::FlipX(inner) => {
-                let mut values = inner.parse(bytes, resolution)?;
-                values.chunks_exact_mut(size).for_each(<[f64]>::reverse);
-                values
-            }
-            Self::FlipZ(inner) => {
-                let values = inner.parse(bytes, resolution)?;
-                values.chunks_exact(size).rev().flatten().copied().collect()
-            }
-            Self::SwapAxes(inner) => {
-                let mut values = inner.parse(bytes, resolution)?;
-                for i in 1..size {
-                    for j in 0..i {
-                        values.swap(i * size + j, j * size + i);
-                    }
-                }
-                values
+            Self::FlipX(inner) => crate::int_format::flip_x(inner.parse(bytes, resolution)?, size),
+            Self::FlipZ(inner) => crate::int_format::flip_z(inner.parse(bytes, resolution)?, size),
+            Self::SwapAxes(inner) => crate::int_format::swap_axes(inner.parse(bytes, resolution)?, size),
+            Self::FromInt(inner) => {
+                inner.parse(bytes, resolution)?.into_iter().map(|value| if value != crate::int_format::NO_DATA { f64::from(value) } else { f64::NAN }).collect()
             }
         })
     }

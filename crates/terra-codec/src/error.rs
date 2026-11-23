@@ -15,6 +15,8 @@ pub enum DecodeError {
     LengthMismatch { expected: u32, actual: u32 },
     InvalidPng(&'static str),
     UnsupportedPng(String),
+    InvalidJpeg(&'static str),
+    UnsupportedJpeg(String),
     ImageTooLarge { width: u32, height: u32 },
     /// A declared size, count or allocation over a decoder resource limit.
     LimitExceeded(String),
@@ -45,6 +47,8 @@ impl fmt::Display for DecodeError {
             }
             Self::InvalidPng(reason) => write!(f, "invalid PNG: {reason}"),
             Self::UnsupportedPng(reason) => write!(f, "unsupported PNG: {reason}"),
+            Self::InvalidJpeg(reason) => write!(f, "invalid JPEG: {reason}"),
+            Self::UnsupportedJpeg(reason) => write!(f, "unsupported JPEG: {reason}"),
             Self::LimitExceeded(reason) => write!(f, "{reason}"),
             Self::ImageTooLarge { width, height } => {
                 write!(f, "image dimensions {width}x{height} exceed the configured limit")

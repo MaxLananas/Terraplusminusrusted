@@ -1,14 +1,61 @@
-//! PNG decoding to packed ARGB, matching `BufferedImage.getRGB` for the colour types it accepts.
+//! PNG decoding to packed ARGB, matching `BufferedImage.getRGB` after `ImageIO.read` (OpenJDK's
+//! `PNGImageReader`) for every colour type, bit depth and interlace method.
 //!
-//! Supported: non-interlaced truecolour (8-bit), truecolour+alpha (8-bit) and indexed (1/2/4/8-bit)
-//! images, with `tRNS` transparency. Grayscale and 16-bit images are rejected explicitly because
-//! `ImageIO` applies colour-space conversions to them that have not been verified against the oracle.
+//! What ImageIO does, measured exhaustively against the oracle JDK (`tools/oracle`):
+//!
+//! * truecolour and indexed samples are used as they are; 16-bit samples become
+//!   `(v * 255 + 32767) / 65535`;
+//! * 8- and 16-bit grayscale goes through Java's linear gray colour space, which `getRGB` converts
+//!   to sRGB: `round(255 * sRGB(v / max))`, held here as the 256 thresholds of that step curve so
+//!   no floating-point library is involved;
+//! * 1-, 2- and 4-bit grayscale is scaled to 8 bits (`v * 255 / max`) without that curve, unless
+//!   the image has a `tRNS` chunk: then ImageIO expands it to 8-bit gray with alpha, applies the
+//!   curve, and compares the *expanded* sample with the raw `tRNS` value (so a key of 2 in a 2-bit
+//!   image never matches, while 170 does);
+//! * alpha is never premultiplied; `gAMA`, `cHRM`, `sRGB` and `iCCP` are ignored as ImageIO's
+//!   `getRGB` ignores them.
 
 use crate::checksum::crc32;
 use crate::zlib::zlib_decompress;
 use crate::DecodeError;
 
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// The smallest 16-bit linear gray value that `getRGB` maps to each 8-bit sRGB value
+/// (`round(255 * sRGB(v / 65535))`), recorded from the oracle JDK and checked against the
+/// formula by `gray_curve_matches_srgb`.
+const GRAY_TO_SRGB_THRESHOLDS: [u16; 256] = [
+    0, 10, 30, 50, 70, 90, 110, 130, 150, 170, 189, 209, 230, 253, 276, 301,
+    327, 354, 382, 412, 443, 475, 509, 544, 580, 618, 657, 698, 740, 783, 828, 875,
+    923, 972, 1023, 1075, 1129, 1185, 1242, 1300, 1360, 1422, 1486, 1551, 1617, 1685, 1755, 1827,
+    1900, 1975, 2052, 2130, 2210, 2292, 2376, 2461, 2548, 2637, 2727, 2820, 2914, 3010, 3108, 3208,
+    3309, 3412, 3518, 3625, 3734, 3844, 3957, 4072, 4188, 4307, 4427, 4550, 4674, 4800, 4928, 5059,
+    5191, 5325, 5461, 5599, 5740, 5882, 6026, 6173, 6321, 6471, 6624, 6778, 6935, 7094, 7255, 7418,
+    7583, 7750, 7919, 8091, 8265, 8440, 8618, 8798, 8981, 9165, 9352, 9541, 9732, 9925, 10121, 10318,
+    10518, 10720, 10925, 11132, 11341, 11552, 11765, 11981, 12199, 12420, 12643, 12868, 13095, 13325, 13557, 13791,
+    14028, 14267, 14508, 14752, 14998, 15247, 15498, 15751, 16007, 16265, 16525, 16788, 17054, 17321, 17592, 17864,
+    18139, 18417, 18697, 18980, 19264, 19552, 19842, 20134, 20429, 20727, 21027, 21329, 21634, 21942, 22252, 22564,
+    22880, 23197, 23518, 23840, 24166, 24494, 24824, 25158, 25493, 25832, 26173, 26516, 26862, 27211, 27563, 27917,
+    28273, 28633, 28995, 29359, 29727, 30097, 30469, 30845, 31223, 31603, 31987, 32373, 32762, 33153, 33547, 33944,
+    34344, 34747, 35152, 35560, 35970, 36384, 36800, 37219, 37640, 38065, 38492, 38922, 39355, 39790, 40229, 40670,
+    41114, 41561, 42011, 42463, 42918, 43377, 43838, 44301, 44768, 45238, 45710, 46185, 46663, 47144, 47628, 48115,
+    48605, 49097, 49593, 50091, 50592, 51096, 51604, 52114, 52627, 53142, 53661, 54183, 54708, 55235, 55766, 56300,
+    56836, 57376, 57918, 58464, 59012, 59564, 60118, 60675, 61236, 61799, 62366, 62935, 63508, 64083, 64662, 65244,
+];
+
+/// Java's linear gray (16-bit) to sRGB (8-bit).
+fn gray16_to_srgb(value: u16) -> u8 {
+    (GRAY_TO_SRGB_THRESHOLDS.partition_point(|&threshold| threshold <= value) - 1) as u8
+}
+
+pub(crate) fn gray8_to_srgb(value: u8) -> u8 {
+    gray16_to_srgb(u16::from(value) * 257)
+}
+
+/// `ComponentColorModel`'s 16-to-8-bit rounding.
+fn narrow16(value: u16) -> u8 {
+    ((u32::from(value) * 255 + 32767) / 65535) as u8
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PngLimits {
@@ -33,8 +80,10 @@ pub struct PngImage {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorType {
+    Gray,
     Truecolor,
     Indexed,
+    GrayAlpha,
     TruecolorAlpha,
 }
 
@@ -43,13 +92,18 @@ struct Header {
     height: u32,
     bit_depth: u8,
     color_type: ColorType,
+    interlaced: bool,
 }
+
+/// Adam7: first column, first row, column step and row step of each pass.
+const ADAM7: [(usize, usize, usize, usize); 7] = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
 
 impl Header {
     fn channels(&self) -> usize {
         match self.color_type {
+            ColorType::Gray | ColorType::Indexed => 1,
+            ColorType::GrayAlpha => 2,
             ColorType::Truecolor => 3,
-            ColorType::Indexed => 1,
             ColorType::TruecolorAlpha => 4,
         }
     }
@@ -58,12 +112,29 @@ impl Header {
         self.channels() * usize::from(self.bit_depth)
     }
 
-    fn row_bytes(&self) -> usize {
-        (self.width as usize * self.bits_per_pixel()).div_ceil(8)
+    fn row_bytes(&self, width: usize) -> usize {
+        (width * self.bits_per_pixel()).div_ceil(8)
     }
 
     fn filter_stride(&self) -> usize {
         self.bits_per_pixel().div_ceil(8)
+    }
+
+    /// The sub-images stored one after the other: (first x, first y, x step, y step, width, height).
+    fn passes(&self) -> Vec<(usize, usize, usize, usize, usize, usize)> {
+        let (width, height) = (self.width as usize, self.height as usize);
+        if !self.interlaced {
+            return vec![(0, 0, 1, 1, width, height)];
+        }
+        ADAM7
+            .iter()
+            .map(|&(x0, y0, dx, dy)| (x0, y0, dx, dy, width.saturating_sub(x0).div_ceil(dx), height.saturating_sub(y0).div_ceil(dy)))
+            .filter(|pass| pass.4 > 0 && pass.5 > 0)
+            .collect()
+    }
+
+    fn raw_size(&self) -> usize {
+        self.passes().iter().map(|pass| pass.5 * (self.row_bytes(pass.4) + 1)).sum()
     }
 }
 
@@ -84,22 +155,18 @@ fn parse_header(data: &[u8], limits: &PngLimits) -> Result<Header, DecodeError> 
     if compression != 0 || filter != 0 {
         return Err(DecodeError::InvalidPng("unknown compression or filter method"));
     }
-    if interlace != 0 {
-        return Err(DecodeError::UnsupportedPng("Adam7 interlacing".into()));
+    if interlace > 1 {
+        return Err(DecodeError::InvalidPng("unknown interlace method"));
     }
     let color_type = match (color_type, bit_depth) {
-        (2, 8) => ColorType::Truecolor,
-        (6, 8) => ColorType::TruecolorAlpha,
+        (0, 1 | 2 | 4 | 8 | 16) => ColorType::Gray,
+        (2, 8 | 16) => ColorType::Truecolor,
         (3, 1 | 2 | 4 | 8) => ColorType::Indexed,
-        (0 | 4, _) => {
-            return Err(DecodeError::UnsupportedPng(format!(
-                "grayscale colour type {color_type} (ImageIO converts it through a gray colour space)"
-            )));
-        }
-        (2 | 6, 16) => return Err(DecodeError::UnsupportedPng("16-bit samples".into())),
+        (4, 8 | 16) => ColorType::GrayAlpha,
+        (6, 8 | 16) => ColorType::TruecolorAlpha,
         _ => return Err(DecodeError::InvalidPng("invalid colour type and bit depth combination")),
     };
-    Ok(Header { width, height, bit_depth, color_type })
+    Ok(Header { width, height, bit_depth, color_type, interlaced: interlace == 1 })
 }
 
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
@@ -116,15 +183,13 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-fn unfilter(header: &Header, raw: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    let row_bytes = header.row_bytes();
-    let stride = header.filter_stride();
-    let height = header.height as usize;
-    if raw.len() != height * (row_bytes + 1) {
+/// Reverses the row filters of one (sub-)image of `rows` rows of `row_bytes` bytes.
+fn unfilter(raw: &[u8], rows: usize, row_bytes: usize, stride: usize) -> Result<Vec<u8>, DecodeError> {
+    if raw.len() != rows * (row_bytes + 1) {
         return Err(DecodeError::InvalidPng("decompressed image data has the wrong size"));
     }
-    let mut pixels = vec![0u8; height * row_bytes];
-    for y in 0..height {
+    let mut pixels = vec![0u8; rows * row_bytes];
+    for y in 0..rows {
         let filter = raw[y * (row_bytes + 1)];
         let source = &raw[y * (row_bytes + 1) + 1..(y + 1) * (row_bytes + 1)];
         let (done, rest) = pixels.split_at_mut(y * row_bytes);
@@ -146,6 +211,20 @@ fn unfilter(header: &Header, raw: &[u8]) -> Result<Vec<u8>, DecodeError> {
         }
     }
     Ok(pixels)
+}
+
+/// Sample `index` of an unfiltered row, at any bit depth.
+fn sample(row: &[u8], index: usize, depth: u8) -> u16 {
+    match depth {
+        16 => u16::from_be_bytes([row[2 * index], row[2 * index + 1]]),
+        8 => u16::from(row[index]),
+        _ => {
+            let depth = usize::from(depth);
+            let per_byte = 8 / depth;
+            let shift = 8 - depth * (index % per_byte + 1);
+            (u16::from(row[index / per_byte]) >> shift) & ((1 << depth) - 1)
+        }
+    }
 }
 
 pub fn decode_png(bytes: &[u8], limits: &PngLimits) -> Result<PngImage, DecodeError> {
@@ -206,46 +285,93 @@ pub fn decode_png(bytes: &[u8], limits: &PngLimits) -> Result<PngImage, DecodeEr
         offset += 12 + length;
     }
     let header = header.ok_or(DecodeError::InvalidPng("missing IHDR"))?;
-    let expected_raw = header.height as usize * (header.row_bytes() + 1);
-    let raw = zlib_decompress(&compressed, expected_raw)?;
-    let pixels = unfilter(&header, &raw)?;
-    let row_bytes = header.row_bytes();
+    if header.color_type == ColorType::Indexed && palette.is_empty() {
+        return Err(DecodeError::InvalidPng("indexed image without PLTE"));
+    }
+    let raw = zlib_decompress(&compressed, header.raw_size())?;
+    if raw.len() != header.raw_size() {
+        return Err(DecodeError::InvalidPng("decompressed image data has the wrong size"));
+    }
+    // Every sample of the full image, after de-interlacing.
     let (width, height) = (header.width as usize, header.height as usize);
+    let channels = header.channels();
+    let mut samples = vec![0u16; width * height * channels];
+    let mut consumed = 0;
+    for (x0, y0, dx, dy, pass_width, pass_height) in header.passes() {
+        let row_bytes = header.row_bytes(pass_width);
+        let size = pass_height * (row_bytes + 1);
+        let pixels = unfilter(&raw[consumed..consumed + size], pass_height, row_bytes, header.filter_stride())?;
+        consumed += size;
+        for (row_index, row) in pixels.chunks_exact(row_bytes).enumerate() {
+            let y = y0 + row_index * dy;
+            for column in 0..pass_width {
+                let x = x0 + column * dx;
+                for channel in 0..channels {
+                    samples[(y * width + x) * channels + channel] = sample(row, column * channels + channel, header.bit_depth);
+                }
+            }
+        }
+    }
+    let key = |index: usize| transparency.get(2 * index..2 * index + 2).map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
     let mut argb = Vec::with_capacity(width * height);
     match header.color_type {
+        ColorType::Gray => {
+            let gray_key = (transparency.len() == 2).then(|| key(0)).flatten();
+            for &value in &samples {
+                let pixel = match (header.bit_depth, gray_key) {
+                    (16, key) => {
+                        let gray = gray16_to_srgb(value);
+                        (if key == Some(value) { 0 } else { 0xFF00_0000 }) | u32::from_be_bytes([0, gray, gray, gray])
+                    }
+                    (8, key) => {
+                        let gray = gray8_to_srgb(value as u8);
+                        (if key == Some(value) { 0 } else { 0xFF00_0000 }) | u32::from_be_bytes([0, gray, gray, gray])
+                    }
+                    (depth, None) => {
+                        let gray = (u32::from(value) * 255 / ((1 << depth) - 1)) as u8;
+                        u32::from_be_bytes([0xFF, gray, gray, gray])
+                    }
+                    (depth, Some(key)) => {
+                        // Expanded to 8 bits, then compared with the raw key, as ImageIO does.
+                        let expanded = (u32::from(value) * 255 / ((1 << depth) - 1)) as u16;
+                        let gray = gray8_to_srgb(expanded as u8);
+                        (if key == expanded { 0 } else { 0xFF00_0000 }) | u32::from_be_bytes([0, gray, gray, gray])
+                    }
+                };
+                argb.push(pixel);
+            }
+        }
+        ColorType::GrayAlpha => {
+            for pair in samples.chunks_exact(2) {
+                let (gray, alpha) = if header.bit_depth == 16 { (gray16_to_srgb(pair[0]), narrow16(pair[1])) } else { (gray8_to_srgb(pair[0] as u8), pair[1] as u8) };
+                argb.push(u32::from_be_bytes([alpha, gray, gray, gray]));
+            }
+        }
         ColorType::Truecolor => {
-            let transparent = (transparency.len() == 6)
-                .then(|| [transparency[1], transparency[3], transparency[5]]);
-            for row in pixels.chunks_exact(row_bytes) {
-                for rgb in row.chunks_exact(3) {
-                    let alpha = if Some([rgb[0], rgb[1], rgb[2]]) == transparent { 0 } else { 0xFF };
-                    argb.push(u32::from_be_bytes([alpha, rgb[0], rgb[1], rgb[2]]));
-                }
+            let rgb_key = (transparency.len() == 6).then(|| [key(0), key(1), key(2)]);
+            for rgb in samples.chunks_exact(3) {
+                let narrow = |value: u16| if header.bit_depth == 16 { narrow16(value) } else { value as u8 };
+                let transparent = match rgb_key {
+                    Some(key) if header.bit_depth == 16 => key == [Some(rgb[0]), Some(rgb[1]), Some(rgb[2])],
+                    // 8-bit images compare the low byte of each key sample.
+                    Some(key) => key.map(|k| k.map(|k| k & 0xFF)) == [Some(rgb[0]), Some(rgb[1]), Some(rgb[2])],
+                    None => false,
+                };
+                argb.push(u32::from_be_bytes([if transparent { 0 } else { 0xFF }, narrow(rgb[0]), narrow(rgb[1]), narrow(rgb[2])]));
             }
         }
         ColorType::TruecolorAlpha => {
-            for row in pixels.chunks_exact(row_bytes) {
-                for rgba in row.chunks_exact(4) {
-                    argb.push(u32::from_be_bytes([rgba[3], rgba[0], rgba[1], rgba[2]]));
-                }
+            for rgba in samples.chunks_exact(4) {
+                let narrow = |value: u16| if header.bit_depth == 16 { narrow16(value) } else { value as u8 };
+                argb.push(u32::from_be_bytes([narrow(rgba[3]), narrow(rgba[0]), narrow(rgba[1]), narrow(rgba[2])]));
             }
         }
         ColorType::Indexed => {
-            if palette.is_empty() {
-                return Err(DecodeError::InvalidPng("indexed image without PLTE"));
-            }
-            let depth = usize::from(header.bit_depth);
-            let per_byte = 8 / depth;
-            let mask = (1u16 << depth) - 1;
-            for row in pixels.chunks_exact(row_bytes) {
-                for x in 0..width {
-                    let byte = row[x / per_byte];
-                    let shift = 8 - depth * (x % per_byte + 1);
-                    let index = usize::from((u16::from(byte) >> shift) & mask);
-                    let rgb = palette.get(index).ok_or(DecodeError::InvalidPng("palette index out of range"))?;
-                    let alpha = transparency.get(index).copied().unwrap_or(0xFF);
-                    argb.push(u32::from_be_bytes([alpha, rgb[0], rgb[1], rgb[2]]));
-                }
+            for &index in &samples {
+                let index = usize::from(index);
+                let rgb = palette.get(index).ok_or(DecodeError::InvalidPng("palette index out of range"))?;
+                let alpha = transparency.get(index).copied().unwrap_or(0xFF);
+                argb.push(u32::from_be_bytes([alpha, rgb[0], rgb[1], rgb[2]]));
             }
         }
     }
@@ -334,6 +460,47 @@ mod tests {
     }
 
     #[test]
+    fn gray_curve_matches_srgb() {
+        let srgb = |linear: f64| if linear <= 0.003_130_8 { 12.92 * linear } else { 1.055 * linear.powf(1.0 / 2.4) - 0.055 };
+        for value in 0..=u16::MAX {
+            // Away from the rounding edges the formula and the recorded table must agree.
+            let exact = srgb(f64::from(value) / 65535.0) * 255.0;
+            if (exact.fract() - 0.5).abs() > 1e-6 {
+                assert_eq!(gray16_to_srgb(value), (exact + 0.5) as u8, "{value}");
+            }
+        }
+        assert_eq!((gray8_to_srgb(0), gray8_to_srgb(10), gray8_to_srgb(255)), (0, 0x38, 0xFF));
+        assert_eq!((narrow16(128), narrow16(255), narrow16(32767), narrow16(32768), narrow16(65407)), (0, 1, 127, 128, 255));
+    }
+
+    #[test]
+    fn gray_alpha_sixteen_bit_and_interlaced() {
+        // 8-bit gray with a tRNS key.
+        let image = decode_png(&encode(4, 1, 0, 8, &[0, 0, 5, 6, 255], &[chunk(b"tRNS", &[0, 5])]), &PngLimits::default()).unwrap();
+        assert_eq!(image.argb, vec![0xFF00_0000, 0x0026_2626, 0xFF2A_2A2A, 0xFFFF_FFFF]);
+        // 2-bit gray: plain scaling, or the curve and an expanded-value key with tRNS.
+        assert_eq!(decode_png(&encode(4, 1, 0, 2, &[0, 0b0001_1011], &[]), &PngLimits::default()).unwrap().argb, vec![0xFF00_0000, 0xFF55_5555, 0xFFAA_AAAA, 0xFFFF_FFFF]);
+        let keyed = decode_png(&encode(4, 1, 0, 2, &[0, 0b0001_1011], &[chunk(b"tRNS", &[0, 170])]), &PngLimits::default()).unwrap();
+        assert_eq!(keyed.argb, vec![0xFF00_0000, 0xFF9C_9C9C, 0x00D5_D5D5, 0xFFFF_FFFF]);
+        // 16-bit truecolour with a key, and gray+alpha.
+        let rgb16 = [0u8, 0, 1, 0, 2, 0, 3, 0, 1, 0, 2, 0, 4];
+        assert_eq!(decode_png(&encode(2, 1, 2, 16, &rgb16, &[chunk(b"tRNS", &[0, 1, 0, 2, 0, 3])]), &PngLimits::default()).unwrap().argb, vec![0, 0xFF00_0000]);
+        assert_eq!(decode_png(&encode(2, 1, 4, 8, &[0, 10, 255, 20, 128], &[]), &PngLimits::default()).unwrap().argb, vec![0xFF38_3838, 0x804F_4F4F]);
+        // Adam7: a 3x3 gray image stored as passes 1 (0,0), 4 (2,0), 5 (0,2),(2,2), 6 (1,0),(1,2), 7 row 1.
+        // 4-bit samples, packed high nibble first.
+        let interlaced = [0, 0x00, /* pass 4 */ 0, 0x20, /* pass 5 */ 0, 0x68, /* pass 6 */ 0, 0x10, 0, 0x70, /* pass 7 */ 0, 0x34, 0x50];
+        let mut ihdr = 3u32.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&3u32.to_be_bytes());
+        ihdr.extend_from_slice(&[4, 0, 0, 0, 1]);
+        let mut png = SIGNATURE.to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IDAT", &stored_zlib(&interlaced)));
+        png.extend(chunk(b"IEND", &[]));
+        let image = decode_png(&png, &PngLimits::default()).unwrap();
+        assert_eq!(image.argb.iter().map(|p| (p & 0xFF) as u8 / 17).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
     fn rejects_corruption_and_limits() {
         let raw = [0u8, 1, 2, 3];
         let good = encode(1, 1, 2, 8, &raw, &[]);
@@ -348,8 +515,8 @@ mod tests {
             assert!(decode_png(&good[..cut], &PngLimits::default()).is_err());
         }
         assert!(matches!(
-            decode_png(&encode(1, 1, 0, 8, &[0, 7], &[]), &PngLimits::default()),
-            Err(DecodeError::UnsupportedPng(_))
+            decode_png(&encode(1, 1, 0, 3, &[0, 7], &[]), &PngLimits::default()),
+            Err(DecodeError::InvalidPng(_))
         ));
     }
 }

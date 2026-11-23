@@ -2,7 +2,7 @@
 //! Apache Commons Imaging (`TiffDirectory.getRasterData`): the first grayscale, one-sample
 //! directory with an integer or IEEE floating-point sample format is read into `f32` values.
 //!
-//! Supported: classic TIFF (not BigTIFF) in either byte order; strips or tiles; no compression,
+//! Supported: classic TIFF and BigTIFF (as Commons Imaging reads both) in either byte order; strips or tiles; no compression,
 //! LZW, Deflate (8 and 32946) and PackBits; horizontal (2) and floating-point (3) predictors;
 //! 8, 16 and 32-bit integers, signed or unsigned, and 32 or 64-bit floats.
 
@@ -81,67 +81,101 @@ fn unsupported(reason: impl Into<String>) -> DecodeError {
 }
 
 #[derive(Clone, Copy)]
-struct Reader<'a> {
-    bytes: &'a [u8],
-    little: bool,
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) little: bool,
+    /// BigTIFF: 8-byte offsets and counts, 20-byte directory entries.
+    pub(crate) big: bool,
 }
 
-impl Reader<'_> {
-    fn slice(&self, offset: u64, length: u64) -> Result<&[u8], DecodeError> {
+impl<'a> Reader<'a> {
+    /// Reads the header: byte order, version 42 (classic) or 43 (BigTIFF, with its offset size 8
+    /// and reserved zero), and the first directory offset.
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<(Self, u64), DecodeError> {
+        let (little, big) = match bytes.get(..4) {
+            Some([b'I', b'I', 42, 0]) => (true, false),
+            Some([b'M', b'M', 0, 42]) => (false, false),
+            Some([b'I', b'I', 43, 0]) => (true, true),
+            Some([b'M', b'M', 0, 43]) => (false, true),
+            Some(_) => return Err(invalid("not a TIFF file")),
+            None => return Err(DecodeError::Truncated),
+        };
+        let reader = Self { bytes, little, big };
+        let first = if big {
+            if reader.u16_at(4)? != 8 || reader.u16_at(6)? != 0 {
+                return Err(invalid("malformed BigTIFF header"));
+            }
+            reader.u64_at(8)?
+        } else {
+            u64::from(reader.u32_at(4)?)
+        };
+        Ok((reader, first))
+    }
+
+    pub(crate) fn slice(&self, offset: u64, length: u64) -> Result<&[u8], DecodeError> {
         let start = usize::try_from(offset).map_err(|_| invalid("offset out of range"))?;
         let length = usize::try_from(length).map_err(|_| invalid("length out of range"))?;
         let end = start.checked_add(length).ok_or(invalid("offset out of range"))?;
         self.bytes.get(start..end).ok_or(DecodeError::Truncated)
     }
 
-    fn u16_at(&self, offset: u64) -> Result<u16, DecodeError> {
+    pub(crate) fn u16_at(&self, offset: u64) -> Result<u16, DecodeError> {
         let bytes = self.slice(offset, 2)?;
         let pair = [bytes[0], bytes[1]];
         Ok(if self.little { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) })
     }
 
-    fn u32_at(&self, offset: u64) -> Result<u32, DecodeError> {
+    pub(crate) fn u32_at(&self, offset: u64) -> Result<u32, DecodeError> {
         let bytes = self.slice(offset, 4)?;
         let quad = [bytes[0], bytes[1], bytes[2], bytes[3]];
         Ok(if self.little { u32::from_le_bytes(quad) } else { u32::from_be_bytes(quad) })
     }
+
+    pub(crate) fn u64_at(&self, offset: u64) -> Result<u64, DecodeError> {
+        let bytes = self.slice(offset, 8)?;
+        let mut octet = [0u8; 8];
+        octet.copy_from_slice(bytes);
+        Ok(if self.little { u64::from_le_bytes(octet) } else { u64::from_be_bytes(octet) })
+    }
 }
 
-struct Entry {
-    tag: u16,
-    kind: u16,
-    count: u64,
+pub(crate) struct Entry {
+    pub(crate) tag: u16,
+    pub(crate) kind: u16,
+    pub(crate) count: u64,
     /// Absolute offset of the value bytes (inline values point into the entry itself).
-    value_offset: u64,
+    pub(crate) value_offset: u64,
 }
 
 fn type_size(kind: u16) -> Option<u64> {
     match kind {
         1 | 2 | 6 | 7 => Some(1),
         3 | 8 => Some(2),
-        4 | 9 | 11 => Some(4),
-        5 | 10 | 12 => Some(8),
+        4 | 9 | 11 | 13 => Some(4),
+        5 | 10 | 12 | 16 | 17 | 18 => Some(8),
         _ => None,
     }
 }
 
-struct Directory {
-    entries: Vec<Entry>,
+pub(crate) struct Directory {
+    pub(crate) entries: Vec<Entry>,
 }
 
 impl Directory {
-    fn find(&self, tag: u16) -> Option<&Entry> {
+    pub(crate) fn find(&self, tag: u16) -> Option<&Entry> {
         self.entries.iter().find(|entry| entry.tag == tag)
     }
 
-    /// An unsigned integer field (BYTE, SHORT or LONG) as values. The values must lie inside the
-    /// file and number at most `max_values` before anything is allocated.
-    fn integers_limited(&self, reader: Reader<'_>, tag: u16, max_values: u64) -> Result<Option<Vec<u64>>, DecodeError> {
+    /// An unsigned integer field (BYTE, SHORT, LONG, IFD, or BigTIFF's LONG8 and IFD8) as values.
+    /// The values must lie inside the file and number at most `max_values` before anything is
+    /// allocated.
+    pub(crate) fn integers_limited(&self, reader: Reader<'_>, tag: u16, max_values: u64) -> Result<Option<Vec<u64>>, DecodeError> {
         let Some(entry) = self.find(tag) else { return Ok(None) };
         let size = match entry.kind {
             1 => 1,
             3 => 2,
-            4 => 4,
+            4 | 13 => 4,
+            16 | 18 => 8,
             _ => return Err(invalid("integer field has a non-integer type")),
         };
         if entry.count > max_values {
@@ -156,14 +190,15 @@ impl Directory {
             values.push(match size {
                 1 => u64::from(reader.slice(offset, 1)?[0]),
                 2 => u64::from(reader.u16_at(offset)?),
-                _ => u64::from(reader.u32_at(offset)?),
+                4 => u64::from(reader.u32_at(offset)?),
+                _ => reader.u64_at(offset)?,
             });
         }
         Ok(Some(values))
     }
 
     /// A single-valued integer field: its first value, from a field of at most 16 values.
-    fn integer(&self, reader: Reader<'_>, tag: u16) -> Result<Option<u64>, DecodeError> {
+    pub(crate) fn integer(&self, reader: Reader<'_>, tag: u16) -> Result<Option<u64>, DecodeError> {
         Ok(self.integers_limited(reader, tag, 16)?.and_then(|values| values.first().copied()))
     }
 
@@ -178,34 +213,44 @@ impl Directory {
     }
 }
 
-fn read_directories(reader: Reader<'_>, first: u64) -> Result<Vec<Directory>, DecodeError> {
+/// Reads the chain of image directories from `first`, at most `max` of them.
+pub(crate) fn read_directories_limited(reader: Reader<'_>, first: u64, max: usize) -> Result<Vec<Directory>, DecodeError> {
+    // Classic: 2-byte entry count, 12-byte entries with a 4-byte count and value, 4-byte link.
+    // BigTIFF: 8-byte entry count, 20-byte entries with an 8-byte count and value, 8-byte link.
+    let (count_size, entry_size, field_size) = if reader.big { (8, 20, 8) } else { (2, 12, 4) };
+    let read_field = |at: u64| -> Result<u64, DecodeError> { if reader.big { reader.u64_at(at) } else { reader.u32_at(at).map(u64::from) } };
     let mut directories = Vec::new();
     let mut seen = Vec::new();
     let mut offset = first;
-    while offset != 0 {
+    while offset != 0 && directories.len() < max {
         if directories.len() == MAX_DIRECTORIES || seen.contains(&offset) {
             return Err(invalid("too many or cyclic image directories"));
         }
         seen.push(offset);
-        let count = u64::from(reader.u16_at(offset)?);
-        if count as usize > MAX_ENTRIES {
+        let count = if reader.big { reader.u64_at(offset)? } else { u64::from(reader.u16_at(offset)?) };
+        if count > MAX_ENTRIES as u64 {
             return Err(invalid("too many directory entries"));
         }
         let mut entries = Vec::with_capacity(count as usize);
         for index in 0..count {
-            let at = offset + 2 + index * 12;
+            let at = offset + count_size + index * entry_size;
             let tag = reader.u16_at(at)?;
             let kind = reader.u16_at(at + 2)?;
-            let count = u64::from(reader.u32_at(at + 4)?);
+            let count = read_field(at + 4)?;
             let Some(size) = type_size(kind) else { continue };
             let total = size.checked_mul(count).ok_or(invalid("field too large"))?;
-            let value_offset = if total <= 4 { at + 8 } else { u64::from(reader.u32_at(at + 8)?) };
+            let value_at = at + 4 + field_size;
+            let value_offset = if total <= field_size { value_at } else { read_field(value_at)? };
             entries.push(Entry { tag, kind, count, value_offset });
         }
         directories.push(Directory { entries });
-        offset = u64::from(reader.u32_at(offset + 2 + count * 12)?);
+        offset = read_field(offset + count_size + count * entry_size)?;
     }
     Ok(directories)
+}
+
+fn read_directories(reader: Reader<'_>, first: u64) -> Result<Vec<Directory>, DecodeError> {
+    read_directories_limited(reader, first, MAX_DIRECTORIES)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,15 +307,8 @@ pub fn decode_tiff_scalar(bytes: &[u8], max_pixels: u64) -> Result<TiffRaster, D
 /// [`DecodeError::ImageTooLarge`] or [`DecodeError::LimitExceeded`] before allocating for it.
 pub fn decode_tiff_scalar_limited(bytes: &[u8], limits: &TiffLimits) -> Result<TiffRaster, DecodeError> {
     let max_pixels = limits.max_pixels;
-    let little = match bytes.get(..4) {
-        Some([b'I', b'I', 42, 0]) => true,
-        Some([b'M', b'M', 0, 42]) => false,
-        Some([b'I', b'I', 43, 0] | [b'M', b'M', 0, 43]) => return Err(unsupported("BigTIFF")),
-        Some(_) => return Err(invalid("not a TIFF file")),
-        None => return Err(DecodeError::Truncated),
-    };
-    let reader = Reader { bytes, little };
-    let directories = read_directories(reader, u64::from(reader.u32_at(4)?))?;
+    let (reader, first) = Reader::open(bytes)?;
+    let directories = read_directories(reader, first)?;
     for directory in &directories {
         let Some(layout) = supported_layout(reader, directory)? else { continue };
         let pixels = layout.width.checked_mul(layout.height).ok_or(invalid("image too large"))?;
@@ -288,7 +326,7 @@ pub fn decode_tiff_scalar_limited(bytes: &[u8], limits: &TiffLimits) -> Result<T
     Err(unsupported("no supported TIFF directories could be found"))
 }
 
-fn limit_exceeded(what: &str, value: u64, limit: u64) -> DecodeError {
+pub(crate) fn limit_exceeded(what: &str, value: u64, limit: u64) -> DecodeError {
     DecodeError::LimitExceeded(format!("TIFF {what} of {value} exceeds the limit of {limit}"))
 }
 
@@ -342,14 +380,22 @@ fn decode_raster(reader: Reader<'_>, directory: &Directory, layout: &Layout, lim
             return Err(DecodeError::Truncated);
         }
         segment.truncate(expected);
-        for row in segment.chunks_exact_mut(row_bytes as usize) {
-            undo_predictor(row, layout, reader.little)?;
+        // Commons Imaging (`unpackIntSamples`) undoes differencing on signed 16-bit samples by
+        // summing them sign-extended in Java `int`s, so a row's running sum can leave the 16-bit
+        // range where the TIFF specification would wrap. That is what upstream's `parse_tiff`
+        // produces, so it is reproduced here; other layouts follow the specification.
+        let java_int_differencing = layout.predictor == 2 && layout.kind == SampleKind::Signed && layout.bytes_per_sample == 2;
+        if !java_int_differencing {
+            for row in segment.chunks_exact_mut(row_bytes as usize) {
+                undo_predictor(row, layout, reader.little)?;
+            }
         }
         for y in 0..rows {
             let image_y = top + y;
             if image_y >= layout.height {
                 break;
             }
+            let mut running = 0i32;
             for x in 0..segment_width {
                 let image_x = left + x;
                 if image_x >= layout.width {
@@ -359,7 +405,13 @@ fn decode_raster(reader: Reader<'_>, directory: &Directory, layout: &Layout, lim
                 let sample = &segment[at..at + layout.bytes_per_sample as usize];
                 // Predictor 3 leaves samples big-endian whatever the file's byte order.
                 let little = reader.little && layout.predictor != 3;
-                data[(image_y * layout.width + image_x) as usize] = sample_value(sample, layout.kind, little);
+                data[(image_y * layout.width + image_x) as usize] = if java_int_differencing {
+                    let raw = if little { i16::from_le_bytes([sample[0], sample[1]]) } else { i16::from_be_bytes([sample[0], sample[1]]) };
+                    running = running.wrapping_add(i32::from(raw));
+                    running as f32
+                } else {
+                    sample_value(sample, layout.kind, little)
+                };
             }
         }
     }
@@ -386,7 +438,7 @@ fn sample_value(bytes: &[u8], kind: SampleKind, little: bool) -> f32 {
     }
 }
 
-fn decompress(input: &[u8], compression: u64, expected: usize) -> Result<Vec<u8>, DecodeError> {
+pub(crate) fn decompress(input: &[u8], compression: u64, expected: usize) -> Result<Vec<u8>, DecodeError> {
     match compression {
         // Never copies more than the segment needs, whatever the declared byte count.
         1 => Ok(input[..input.len().min(expected)].to_vec()),
@@ -500,8 +552,10 @@ fn lzw_decode(input: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {
                 }
             }
         }
-        if out.len() > limit {
-            return Err(DecodeError::OutputLimitExceeded { limit });
+        // Commons Imaging's decompressor stops once the segment is complete, ignoring the rest.
+        if out.len() >= limit {
+            out.truncate(limit);
+            return Ok(out);
         }
         previous = Some((start, out.len() - start));
         if next + 1 >= (1 << width) && width < 12 {
@@ -544,10 +598,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_tiff_and_bigtiff() {
+    fn rejects_non_tiff_and_malformed_bigtiff() {
         assert_eq!(decode_tiff_scalar(b"\x89PNG", 1 << 20), Err(DecodeError::InvalidTiff("not a TIFF file")));
-        assert!(matches!(decode_tiff_scalar(b"II\x2b\x00\x08\x00\x00\x00", 1 << 20), Err(DecodeError::UnsupportedTiff(_))));
+        assert_eq!(decode_tiff_scalar(b"II\x2b\x00\x04\x00\x00\x00\x10\0\0\0\0\0\0\0", 1 << 20), Err(DecodeError::InvalidTiff("malformed BigTIFF header")));
+        assert_eq!(decode_tiff_scalar(b"II\x2b\x00\x08\x00\x00\x00", 1 << 20), Err(DecodeError::Truncated));
         assert_eq!(decode_tiff_scalar(b"II", 1 << 20), Err(DecodeError::Truncated));
+    }
+
+    /// A BigTIFF and the same raster as classic TIFF decode identically.
+    #[test]
+    fn bigtiff_reads_like_classic_tiff() {
+        fn build(big: bool) -> Vec<u8> {
+            // 3x2 little-endian 16-bit unsigned grayscale, one uncompressed strip.
+            let pixels: [u16; 6] = [1, 2, 3, 400, 500, 65535];
+            let data: Vec<u8> = pixels.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let entries: [(u16, u16, u64); 8] = [(256, 3, 3), (257, 3, 2), (258, 3, 16), (259, 3, 1), (262, 3, 1), (273, if big { 16 } else { 4 }, 0), (277, 3, 1), (279, 4, 12)];
+            let (header, count_size, entry_size, field_size) = if big { (16u64, 8u64, 20u64, 8usize) } else { (8, 2, 12, 4) };
+            let directory_size = count_size + entries.len() as u64 * entry_size + field_size as u64;
+            let data_offset = header + directory_size;
+            let mut out = Vec::new();
+            if big {
+                out.extend_from_slice(b"II\x2b\x00\x08\x00\x00\x00");
+                out.extend_from_slice(&header.to_le_bytes());
+                out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+            } else {
+                out.extend_from_slice(b"II\x2a\x00");
+                out.extend_from_slice(&(header as u32).to_le_bytes());
+                out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            }
+            for (tag, kind, value) in entries {
+                let value = if tag == 273 { data_offset } else { value };
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&kind.to_le_bytes());
+                let count = 1u64;
+                out.extend_from_slice(&count.to_le_bytes()[..field_size]);
+                out.extend_from_slice(&value.to_le_bytes()[..field_size]);
+            }
+            out.extend_from_slice(&[0u8; 8][..field_size]);
+            out.extend_from_slice(&data);
+            out
+        }
+        let classic = decode_tiff_scalar(&build(false), 1 << 20).unwrap();
+        let big = decode_tiff_scalar(&build(true), 1 << 20).unwrap();
+        assert_eq!(classic.data, vec![1.0, 2.0, 3.0, 400.0, 500.0, 65535.0]);
+        assert_eq!(big, classic);
     }
 
     #[test]

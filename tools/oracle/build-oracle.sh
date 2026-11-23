@@ -52,7 +52,7 @@ prepare_toolchain
 java="$toolchain/jdk/jdk4py/java-runtime/bin/java"
 classpath="$toolchain/jars/guava.jar:$toolchain/jars/failureaccess.jar:$toolchain/jars/gson.jar"
 
-"$root/scripts/fetch-upstream.sh" terraminusminus
+"$root/scripts/fetch-upstream.sh" terraminusminus commons-imaging
 upstream="$root/.upstream/terraminusminus/src/main"
 package_root="$upstream/java/net/buildtheearth/terraminusminus"
 
@@ -104,6 +104,12 @@ upstream_sources=(
     dataset/BlendMode.java
     config/scalarparse/d/DoubleScalarParser.java
     config/scalarparse/d/ParseTerrariumPngDSP.java
+    config/scalarparse/d/FromIntDSP.java
+    config/scalarparse/d/ParseTiffDSP.java
+    config/scalarparse/d/ParseTiffAutoDSP.java
+    config/scalarparse/d/ParseTiffFloatingPointDSP.java
+    config/scalarparse/d/ParseTiffIntDSP.java
+    config/scalarparse/i
     # OpenStreetMap: GeoJSON model and parsers, the osm.json5 mapper, vector geometries and draw
     # functions, and the spatial indexes. Delomboked by patches/delombok-osm.patch (see delombok-osm.py).
     dataset/geojson/AbstractGeoJsonDeserializer.java
@@ -146,7 +152,7 @@ done
 
 sources=()
 while IFS= read -r -d '' file; do sources+=("$file"); done < <(
-    find "$patched" "$oracle/stubs/src" "$oracle/harness/src" "$build/generated" -name '*.java' -print0 | sort -z
+    find "$patched" "$oracle/stubs/src" "$oracle/harness/src" "$build/generated" "$root/.upstream/commons-imaging/src/main/java" -name '*.java' -print0 | sort -z
 )
 
 "$java" -jar "$toolchain/jars/ecj.jar" -21 -encoding UTF-8 -nowarn -proc:none \
@@ -163,6 +169,7 @@ record_provenance() {
     local directory="$1"
     {
         echo "terraminusminus_commit=$TERRAMINUSMINUS_COMMIT"
+        echo "commons_imaging_commit=$COMMONS_IMAGING_COMMIT"
         echo "java_version=$("$java" -version 2>&1 | head -n 1)"
         echo "jdk_wheel_sha256=$JDK_WHEEL_SHA256"
         echo "ecj_jar_sha256=$(sha256sum "$toolchain/jars/ecj.jar" | cut -d' ' -f1)"
@@ -204,4 +211,10 @@ osm_mapping="$upstream/resources/net/buildtheearth/terraminusminus/dataset/osm/o
 run_harness terraplusminus.oracle.OsmGoldenDump "$osm_mapping" "$root/fixtures/osm" "$osm_fixtures"
 record_provenance "$osm_fixtures"
 echo "osm_json5_sha256=$(sha256sum "$osm_mapping" | cut -d' ' -f1)" >> "$osm_fixtures/PROVENANCE"
-echo "fixtures written to $fixtures, $elevation_fixtures, $coordinate_fixtures, $command_fixtures and $osm_fixtures"
+image_fixtures="$root/fixtures/images/golden"
+mkdir -p "$image_fixtures"
+rm -f "$image_fixtures"/*.tsv.gz
+run_harness terraplusminus.oracle.ImageGoldenDump "$root/fixtures/images/input" "$image_fixtures"
+record_provenance "$image_fixtures"
+(cd "$root/fixtures/images/input" && for input in *; do echo "file $(sha256sum "$input" | cut -d' ' -f1)  ../input/$input"; done) >> "$image_fixtures/PROVENANCE"
+echo "fixtures written to $fixtures, $elevation_fixtures, $coordinate_fixtures, $command_fixtures, $osm_fixtures and $image_fixtures"

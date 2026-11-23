@@ -35,6 +35,7 @@ for name in "${selection[@]}"; do
         terraplusminus) fetch terraplusminus "$TERRAPLUSMINUS_REPOSITORY" "$TERRAPLUSMINUS_COMMIT" ;;
         terraminusminus) fetch terraminusminus "$TERRAMINUSMINUS_REPOSITORY" "$TERRAMINUSMINUS_COMMIT" ;;
         horizon) fetch horizon "$HORIZON_REPOSITORY" "$HORIZON_COMMIT" ;;
+        commons-imaging) fetch commons-imaging "$COMMONS_IMAGING_REPOSITORY" "$COMMONS_IMAGING_COMMIT" ;;
         *) echo "error: unknown upstream '$name'" >&2; exit 2 ;;
     esac
 done

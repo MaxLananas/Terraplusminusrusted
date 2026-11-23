@@ -22,7 +22,16 @@ fn decodes_every_case_like_the_reference() {
         assert_eq!((raster.width.to_string(), raster.height.to_string()), (fields[1].to_owned(), fields[2].to_owned()), "{name}");
         let expected = gunzip(&std::fs::read(fixtures().join("cases").join(format!("{name}.f32.gz"))).unwrap(), 1 << 24).unwrap();
         let expected: Vec<u32> = expected.chunks_exact(4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).collect();
-        let actual: Vec<u32> = raster.data.iter().map(|value| value.to_bits()).collect();
+        // Signed 16-bit differencing is summed in Java `int`s by upstream (Commons Imaging), the
+        // reference wraps as the TIFF specification says: compare those modulo 2^16 here, the
+        // exact upstream values being checked by terra-elevation's `image_parsers_oracle`.
+        let wraps_like_the_specification = name.starts_with("i16_") && name.contains("pred2");
+        let actual: Vec<u32> = raster
+            .data
+            .iter()
+            .map(|&value| if wraps_like_the_specification { f32::from(value as i32 as i16) } else { value })
+            .map(f32::to_bits)
+            .collect();
         assert_eq!(actual.len(), expected.len(), "{name}");
         if let Some(index) = actual.iter().zip(&expected).position(|(a, e)| a != e) {
             panic!("{name}: sample {index} is {} but the reference says {}", f32::from_bits(actual[index]), f32::from_bits(expected[index]));

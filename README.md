@@ -17,10 +17,17 @@ What works and is tested here:
   indicatrix, compared against the Java oracle.
 - Elevation datasets, terrarium decoding and all four blend modes, matching upstream bit for bit
   on the recorded fixtures.
-- GeoTIFF layers (classic TIFF; none, LZW, Deflate and PackBits compression; predictors 2 and 3)
-  and upstream's parser chain (`add`, `multiply`, `divide`, flips, axis swap) and projection
-  transforms (`scale`, `offset`, flips, axis swap). Decoding matches `tifffile` bit for bit on 16
-  reference files. Upstream's complete `heights.json5` (1979 layers) loads.
+- GeoTIFF layers (classic TIFF and BigTIFF; none, LZW, Deflate and PackBits compression;
+  predictors 2 and 3) and upstream's parser chain (`add`, `multiply`, `divide`, flips, axis swap)
+  and projection transforms (`scale`, `offset`, flips, axis swap). Every raster upstream's
+  `parse_tiff` reads decodes to the same doubles bit for bit, checked against Apache Commons
+  Imaging (pinned in `scripts/upstream-revisions.env`) run by the oracle. Upstream's complete
+  `heights.json5` (1979 layers) loads.
+- Every integer parser of terraminusminus (`parse_png`, `parse_jpg`, `parse_tiff`, `add`, `and`,
+  flips, axis swap, `grayscale_extract`, `rgb_extract`, `require_opaque`) and `from_int`. Images
+  decode exactly as `ImageIO` and `BufferedImage.getRGB` do (sRGB curve on gray PNGs, JPEG
+  colour conversion, ...): 103 fixture images are compared pixel for pixel with the JDK, and every
+  parser chain with upstream's own classes.
 - Tree cover (`TreeCoverBaker`) and TerraPlusMinus's `TreePopulator`: the 16 custom tree
   schematics, chosen by Köppen class, placed by Paper's populator random. See [Trees](#trees).
 - Chunk terrain, Köppen biomes and the generation fingerprint.
@@ -38,15 +45,16 @@ What is not done:
   stub of the API (`tools/horizon-api-stub`), whose README cites the SDK source of every
   signature. The checks a real server run would cover (joining, lighting, collision,
   save/restart) are still open.
-- **Not ported:**
-  - HTTPS. The default elevation, OSM and tree-cover servers are HTTPS-only, so the defaults are
-    refused at startup, before the dimension registers, until every enabled source is mirrored,
-    served over plain HTTP (`network.plain_http_hosts`) or turned off (see
-    [OpenStreetMap](#openstreetmap) and [Trees](#trees));
-  - the `from_int` TIFF parser and BigTIFF;
-  - the SERVER linked-worlds method;
-  - auto-teleport on movement;
-  - `/tpll -p`.
+- **Every upstream feature is ported**, with these differences:
+  - HTTPS goes through the system `curl` (`network.https_command`), since no TLS library is
+    available offline. Without curl, `https://` sources must be mirrored, served over plain HTTP
+    (`network.plain_http_hosts`) or turned off, or the configuration is refused at startup (see
+    [Network](#network));
+  - TIFFs compressed with JPEG or CCITT fax, and CIELab or LogLuv TIFFs, are refused, where
+    upstream decodes them. No upstream configuration uses them;
+  - `parse_tiff` also reads TIFFs that Commons Imaging refuses (unsigned or 8-bit samples, a
+    missing `SampleFormat`). It also reads big-endian BigTIFFs with a single strip correctly,
+    where Commons Imaging misreads the strip offset.
 
 The per-feature status is in [docs/feature-matrix.md](docs/feature-matrix.md).
 
@@ -54,7 +62,7 @@ The per-feature status is in [docs/feature-matrix.md](docs/feature-matrix.md).
 
 | Path | Contents |
 |---|---|
-| `crates/terra-codec` | Bounded DEFLATE, gzip, zlib, PNG and relaxed-JSON decoding |
+| `crates/terra-codec` | Bounded DEFLATE, gzip, zlib, PNG, JPEG, TIFF and relaxed-JSON decoding |
 | `crates/terra-projection` | Geographic projections and their Java-compatible numerics |
 | `crates/terra-elevation` | Elevation dataset configuration, tiles, blending, per-chunk sampling |
 | `crates/terra-acquisition` | HTTP fetching, retry and rate-limit policy, mirrors, disk cache |
@@ -175,8 +183,34 @@ the engine source, not run.
 
 The format is upstream's `config.yml` expressed as JSON5, plus sections for this port: `world`,
 `elevation` (`heights_config`, `tree_cover_config`, `unsupported_layers`), `network`,
-`permissions`, `generation`, `prefix` and `openstreetmap`. Unknown keys
+`permissions`, `generation`, `prefix`, `openstreetmap` and `updates`. Unknown keys
 are errors. See `examples/` and `crates/terra-server/src/config.rs`.
+
+`elevation.unsupported_layers` (`reject` or `skip`) is still accepted, but every layer type of
+upstream loads now, so nothing is ever skipped. An unknown type name is always an error.
+
+### Network
+
+```json5
+"network": {
+    // Program that fetches https:// URLs, with hard limits on time and size. "off" disables
+    // HTTPS: only mirrors, plain http:// and plain_http_hosts remain.
+    "https_command": "curl",
+    // Hosts whose https:// URLs are fetched over plain HTTP instead.
+    "plain_http_hosts": [],
+    // URL prefix -> local directory, served without any request.
+    "mirrors": {},
+    // Requests in flight per host ("<n>: <url>"). Default: upstream's list (8 for
+    // cloud.daporkchop.net and s3.amazonaws.com, 1 for gis-treecover.wri.org and Overpass).
+    "max_concurrent_requests": ["8: https://cloud.daporkchop.net/", "8: https://s3.amazonaws.com/"],
+    // Sent on every request. Default: "Terraplusminus/<version> (Terra--/rust; +<repository>)".
+    "user_agent": "...",
+    // Cached responses expire after this many minutes (upstream's http.cacheTTL); 0 keeps them.
+    "cache_ttl_minutes": 1440,
+}
+```
+
+An expired tile is fetched again and served stale if that fetch fails.
 
 ### OpenStreetMap
 
@@ -196,10 +230,10 @@ water. The section accepts:
 }
 ```
 
-This build has no TLS, so the default HTTPS server cannot be reached. Either serve a copy of the
-tiles over plain HTTP and list its host in `network.plain_http_hosts`, or map the server prefix to
-a local directory with `network.mirrors`, or set `enabled` to `false`; otherwise the server
-refuses the configuration at startup. A chunk whose OSM tile cannot be fetched is retried like
+The default server is HTTPS, fetched through `network.https_command`. Without it, serve a copy
+of the tiles over plain HTTP and list its host in `network.plain_http_hosts`, map the server
+prefix to a local directory with `network.mirrors`, or set `enabled` to `false`; otherwise the
+server refuses the configuration at startup. A chunk whose OSM tile cannot be fetched is retried like
 elevation data. An invalid mapping file stops the server
 from starting rather than generating without features.
 
@@ -213,10 +247,10 @@ and startup logs upstream's deprecation warning. Editing `osm.json5` is the bett
 `generate_trees` is on by default, as upstream. Tree cover comes from upstream's
 `tree_cover.json5` (Hansen tree cover 2000 tiles at
 `https://cloud.daporkchop.net/gis/treecover2000/`), or from the file named by
-`elevation.tree_cover_config`, which uses the same schema. That server is HTTPS-only, so copy
-`tree_cover.json5` from terraminusminus, point its URL at a plain-HTTP or mirrored copy and set
-`tree_cover_config`, or set `generate_trees` to `false`; otherwise the server refuses the
-configuration at startup. With trees off, tree cover is never
+`elevation.tree_cover_config`, which uses the same schema. That server is HTTPS-only: it is
+fetched through `network.https_command`, and without it you can copy `tree_cover.json5` from
+terraminusminus, point its URL at a plain-HTTP or mirrored copy and set `tree_cover_config`, or
+set `generate_trees` to `false`; otherwise the server refuses the configuration at startup. With trees off, tree cover is never
 fetched (upstream fetched it anyway, TerraPlusMinus issue #77).
 
 How it matches upstream:

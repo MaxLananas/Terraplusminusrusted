@@ -5,6 +5,7 @@ use crate::bounds::AxisBounds;
 use crate::condition::DoubleCondition;
 use crate::dataset::{TileFormat, TiledScalarDataset};
 use crate::error::ElevationError;
+use crate::int_format::IntFormat;
 use crate::layered::{LayeredScalarDataset, ScalarLayer};
 use std::sync::Arc;
 use terra_codec::{JsonValue, parse_relaxed_json};
@@ -14,7 +15,12 @@ use terra_projection::{
     SinusoidalProjection, StereographicProjection, SwapAxesTransform, TransverseMercatorProjection, WebMercatorProjection,
 };
 
-/// What to do with layers whose parser or projection this implementation does not know.
+/// What to do with layers of a valid upstream type that this implementation cannot load.
+///
+/// Every projection, condition and (double and integer) scalar parser of TerraMinusMinus'
+/// `GlobalParseRegistries` is ported, so no layer is ever skipped today; the policy stays part of
+/// the API and of the `unsupported_layers` setting so existing configurations keep loading.
+/// Unknown type names are always configuration errors, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedLayerPolicy {
     /// Fail loading: the config cannot be honoured in full.
@@ -45,10 +51,9 @@ pub fn load_tree_cover_config(text: &str, policy: UnsupportedLayerPolicy) -> Res
     load_scalar_config(text, policy, "tree cover", "tree-cover-layer")
 }
 
-/// Why a layer cannot be loaded: a mistake in the file, or a valid upstream type not ported here.
+/// Why a layer cannot be loaded: a mistake in the file.
 enum Problem {
     Invalid(String),
-    Unsupported(String),
 }
 
 impl From<String> for Problem {
@@ -64,10 +69,10 @@ impl From<&str> for Problem {
 }
 
 /// `MultiScalarDataset` configs. `id_prefix` keeps tile cache keys apart between datasets.
-fn load_scalar_config(text: &str, policy: UnsupportedLayerPolicy, kind: &str, id_prefix: &str) -> Result<LoadedLayers, ElevationError> {
+fn load_scalar_config(text: &str, _policy: UnsupportedLayerPolicy, kind: &str, id_prefix: &str) -> Result<LoadedLayers, ElevationError> {
     let document = parse_relaxed_json(text).map_err(|error| invalid(format!("{kind} config: {error}")))?;
     let mut layers = Vec::new();
-    let mut skipped = Vec::new();
+    let skipped = Vec::new();
     for (index, entry) in document.as_array_lenient().iter().enumerate() {
         let context = |message: String| invalid(format!("layer {index}: {message}"));
         let dataset = entry.get("dataset").ok_or_else(|| context("missing `dataset`".into()))?;
@@ -77,13 +82,6 @@ fn load_scalar_config(text: &str, policy: UnsupportedLayerPolicy, kind: &str, id
         let (format, projection) = match parsed {
             Ok(parsed) => parsed,
             Err(Problem::Invalid(message)) => return Err(context(message)),
-            Err(Problem::Unsupported(message)) => match policy {
-                UnsupportedLayerPolicy::Reject => return Err(ElevationError::UnsupportedFormat(format!("layer {index}: {message}"))),
-                UnsupportedLayerPolicy::Skip => {
-                    skipped.push(format!("layer {index} ({}): {message}", urls.first().map_or("", String::as_str)));
-                    continue;
-                }
-            },
         };
         let resolution = required_number(dataset, "resolution").map_err(context)?;
         if resolution.fract() != 0.0 || !(1.0..=f64::from(u32::MAX)).contains(&resolution) {
@@ -164,8 +162,47 @@ fn parse_format(value: &JsonValue, depth: usize) -> Result<TileFormat, Problem> 
         "flip_x" => TileFormat::FlipX(delegate()?),
         "flip_z" => TileFormat::FlipZ(delegate()?),
         "swap_axes" => TileFormat::SwapAxes(delegate()?),
-        "from_int" => return Err(Problem::Unsupported("integer parsers (`from_int`) are not ported".into())),
+        "from_int" => TileFormat::FromInt(int_delegate(name, settings, depth)?),
         other => return Err(format!("unknown parser `{other}`").into()),
+    })
+}
+
+/// A required `delegate` of a `from_int` or integer parser.
+fn int_delegate(name: &str, settings: &JsonValue, depth: usize) -> Result<Box<IntFormat>, Problem> {
+    Ok(Box::new(parse_int_format(settings.get("delegate").ok_or_else(|| format!("`{name}` requires `delegate`"))?, depth + 1)?))
+}
+
+/// A required primitive `int` property as Jackson binds it with its default features: integral
+/// numbers in range as they are, fractions truncated toward zero (`ACCEPT_FLOAT_AS_INT`),
+/// anything outside `int` refused.
+fn required_int(settings: &JsonValue, key: &str) -> Result<i32, String> {
+    let value = required_number(settings, key)?;
+    let truncated = value.trunc();
+    if !truncated.is_finite() || truncated < f64::from(i32::MIN) || truncated > f64::from(i32::MAX) {
+        return Err(format!("`{key}` ({value}) is out of range of int"));
+    }
+    Ok(truncated as i32)
+}
+
+/// Every integer parser of `GlobalParseRegistries.SCALAR_PARSERS_INT`.
+fn parse_int_format(value: &JsonValue, depth: usize) -> Result<IntFormat, Problem> {
+    if depth > MAX_NESTING {
+        return Err("parser nesting too deep".into());
+    }
+    let (name, settings) = single_member(value)?;
+    let delegate = || int_delegate(name, settings, depth);
+    Ok(match name {
+        "parse_png" | "parse_jpg" => IntFormat::Image,
+        "parse_tiff" => IntFormat::Tiff,
+        "add" => IntFormat::Add(delegate()?, required_int(settings, "value")?),
+        "and" => IntFormat::And(delegate()?, required_int(settings, "mask")?),
+        "flip_x" => IntFormat::FlipX(delegate()?),
+        "flip_z" => IntFormat::FlipZ(delegate()?),
+        "swap_axes" => IntFormat::SwapAxes(delegate()?),
+        "grayscale_extract" => IntFormat::GrayscaleExtract(delegate()?),
+        "rgb_extract" => IntFormat::RgbExtract(delegate()?),
+        "require_opaque" => IntFormat::RequireOpaque(delegate()?),
+        other => return Err(format!("unknown integer parser `{other}`").into()),
     })
 }
 
@@ -272,13 +309,47 @@ mod tests {
     }
 
     #[test]
-    fn unported_layers_are_never_silently_dropped() {
-        let config = r#"[{"dataset": {"urls": ["https://example.invalid/${x}/${z}.png"], "projection": {"equirectangular": {}},
-            "resolution": 256, "blend": "NEAR", "parse": {"from_int": {"delegate": {"parse_png": {}}}}}, "bounds": [], "zooms": {"min": 0, "max": 3}}]"#;
-        assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Reject), Err(ElevationError::UnsupportedFormat(_))));
-        assert!(matches!(load_heights_config(config, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
-        let typo = config.replace("from_int", "from_intt");
-        assert!(matches!(load_heights_config(&typo, UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))));
+    fn every_integer_parser_chain_loads() {
+        let layer = |parse: &str| {
+            format!(
+                r#"[{{"dataset": {{"urls": ["https://example.invalid/${{x}}/${{z}}.png"], "projection": {{"equirectangular": {{}}}},
+                "resolution": 256, "blend": "NEAR", "parse": {parse}}}, "bounds": [{{"minX": -1, "maxX": 1, "minZ": -1, "maxZ": 1}}], "zooms": {{"min": 0, "max": 3}}}}]"#
+            )
+        };
+        let format = |parse: &str| {
+            let loaded = load_heights_config(&layer(parse), UnsupportedLayerPolicy::Reject).unwrap_or_else(|error| panic!("{parse}: {error}"));
+            assert!(loaded.skipped.is_empty());
+            loaded.dataset.layers()[0].dataset.format.clone()
+        };
+        let png = || Box::new(IntFormat::Image);
+        assert_eq!(format(r#"{"from_int": {"delegate": {"parse_png": {}}}}"#), TileFormat::FromInt(png()));
+        assert_eq!(format(r#"{"from_int": {"delegate": {"parse_jpg": {}}}}"#), TileFormat::FromInt(png()));
+        assert_eq!(
+            format(r#"{"multiply": {"value": 0.1, "delegate": {"from_int": {"delegate": {"add": {"value": -100000, "delegate": {"rgb_extract": {"delegate": {"parse_tiff": {}}}}}}}}}}"#),
+            TileFormat::Multiply(Box::new(TileFormat::FromInt(Box::new(IntFormat::Add(Box::new(IntFormat::RgbExtract(Box::new(IntFormat::Tiff))), -100000)))), 0.1)
+        );
+        for (name, expected) in [
+            ("flip_x", IntFormat::FlipX(png())),
+            ("flip_z", IntFormat::FlipZ(png())),
+            ("swap_axes", IntFormat::SwapAxes(png())),
+            ("grayscale_extract", IntFormat::GrayscaleExtract(png())),
+            ("rgb_extract", IntFormat::RgbExtract(png())),
+            ("require_opaque", IntFormat::RequireOpaque(png())),
+        ] {
+            assert_eq!(format(&format!(r#"{{"from_int": {{"delegate": {{"{name}": {{"delegate": {{"parse_png": {{}}}}}}}}}}}}"#)), TileFormat::FromInt(Box::new(expected)));
+        }
+        // Jackson's int binding: fractions truncate toward zero, values outside int fail.
+        assert_eq!(format(r#"{"from_int": {"delegate": {"and": {"mask": -1.9, "delegate": {"parse_png": {}}}}}}"#), TileFormat::FromInt(Box::new(IntFormat::And(png(), -1))));
+        for invalid in [
+            r#"{"from_int": {"delegate": {"and": {"mask": 4294967295, "delegate": {"parse_png": {}}}}}}"#,
+            r#"{"from_int": {"delegate": {"add": {"delegate": {"parse_png": {}}}}}}"#,
+            r#"{"from_int": {"delegate": {"rgb_extract": {}}}}"#,
+            r#"{"from_int": {}}"#,
+            r#"{"from_int": {"delegate": {"parse_png_terrarium": {}}}}"#,
+            r#"{"from_intt": {"delegate": {"parse_png": {}}}}"#,
+        ] {
+            assert!(matches!(load_heights_config(&layer(invalid), UnsupportedLayerPolicy::Skip), Err(ElevationError::InvalidConfiguration(_))), "{invalid}");
+        }
     }
 
     #[test]

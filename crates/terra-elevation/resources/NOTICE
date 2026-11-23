@@ -1,6 +1,13 @@
-heights_world.json5 contains the first two (Terrarium) layers of TerraMinusMinus
-(https://github.com/SmylerMC/terraminusminus, commit a1432a9beabd79025e62c8de0d0b1a99e7ea9943,
-src/main/resources/net/buildtheearth/terraminusminus/dataset/scalar/heights.json5), unmodified.
+heights_world.json5 is TerraMinusMinus's
+(https://github.com/SmylerMC/terraminusminus, commit a1432a9beabd79025e62c8de0d0b1a99e7ea9943)
+src/main/resources/net/buildtheearth/terraminusminus/dataset/scalar/heights.json5, byte-identical
+(examples/aws-terrain-tiles/heights.json5 holds its first two layers, unmodified).
+
+heights_ign_lidar_hd.json5 is written for this repository. It points at the IGN Géoplateforme
+WMS-Raster service; the elevation data it fetches at run time is © IGN (Institut national de
+l'information géographique et forestière), LiDAR HD, under the Licence Ouverte Etalab 2.0
+(https://www.etalab.gouv.fr/licence-ouverte-open-licence/): credit "IGN" where the terrain is
+shown.
 tree_cover.json5 is that commit's dataset/scalar/tree_cover.json5, byte-identical.
 
 TerraMinusMinus is distributed under the MIT License:

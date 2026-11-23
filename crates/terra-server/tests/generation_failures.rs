@@ -48,7 +48,7 @@ fn http_stack(name: &str, base: &str, generation: &str) -> (TerraStack, std::pat
     )
     .unwrap();
     let config = parse_server_config(&format!(
-        r#"{{"elevation": {{"heights_config": "heights.json5"}}, "biomes": {{"use_dataset": false}}, "openstreetmap": {{"enabled": false}},
+        r#"{{"elevation": {{"ign_lidar_hd": false, "heights_config": "heights.json5"}}, "biomes": {{"use_dataset": false}}, "openstreetmap": {{"enabled": false}},
             "generate_trees": false, "network": {{"attempts": 1, "connect_timeout_ms": 1000, "io_timeout_ms": 1000, "total_timeout_ms": 2000}},
             "world": {{"min_y": -64, "height": 2096}}, "generation": {{"workers": 1, "wait_timeout_ms": 10000 {generation}}}}}"#
     ))
@@ -145,13 +145,66 @@ fn https_only_sources_are_refused_before_anything_starts() {
     }
     // Elevation over plain HTTP, but OpenStreetMap and trees still on: still refused, naming them.
     let Err(StackError::Unreachable(reason)) = build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"]}}"#) else { panic!() };
-    assert!(reason.contains("OpenStreetMap") && reason.contains("tree cover layer") && !reason.contains("elevation layer"), "{reason}");
+    assert!(reason.contains("OpenStreetMap") && reason.contains("tree cover layer") && !reason.contains("s3.amazonaws.com"), "{reason}");
+    // Upstream's regional layers are grouped per host, so the message stays short and complete.
+    assert!(reason.contains(" elevation layers on cloud.daporkchop.net, e.g. elevation layer layer-"), "{reason}");
+    assert!(reason.len() < 4000, "{} bytes: {reason}", reason.len());
     // Every source reachable (plain HTTP, mirrors) or explicitly off: accepted, no network used.
     std::fs::create_dir_all(directory.join("osm")).unwrap();
     build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"], "mirrors": {"https://cloud.daporkchop.net/gis/": "osm"}}}"#).unwrap();
-    build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"]}, "generate_trees": false, "openstreetmap": {"enabled": false}}"#).unwrap();
+    build(&directory, r#"{"network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"], "mirrors": {"https://cloud.daporkchop.net/gis/dem/": "osm"}}, "generate_trees": false, "openstreetmap": {"enabled": false}}"#).unwrap();
     // With the system curl, the defaults work as upstream's do (nothing is fetched here).
     if terra_acquisition::CurlTransport::probe("curl", "test").is_some() {
         build(&directory, "{}").unwrap();
     }
+}
+
+#[test]
+fn ign_lidar_hd_is_merged_when_routable_and_left_out_otherwise() {
+    let directory = common::scratch("ign-lidar-hd");
+    std::fs::create_dir_all(directory.join("dem")).unwrap();
+    let ign_layers = |stack: &TerraStack| stack.generator().heights().layers().iter().filter(|layer| layer.dataset.id.starts_with("ign-lidar-hd-")).count();
+    let logged = |text: &str| {
+        let messages = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&messages);
+        let stack = TerraStack::build_logged(parse_server_config(text).unwrap(), &directory, Arc::new(move |message: &str| sink.lock().unwrap().push(message.to_owned()))).unwrap();
+        let messages = messages.lock().unwrap().clone();
+        (stack, messages)
+    };
+    let offline = r#""generate_trees": false, "openstreetmap": {"enabled": false}, "reduced_console_messages": false"#;
+    let network = r#""https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"], "mirrors": {"https://cloud.daporkchop.net/gis/dem/": "dem"}"#;
+    // No route to data.geopf.fr: started anyway, without the IGN layers, saying so.
+    let (without, messages) = logged(&format!(r#"{{{offline}, "network": {{{network}}}}}"#));
+    assert_eq!(ign_layers(&without), 0);
+    assert!(messages.iter().any(|message| message.contains("IGN LiDAR HD left out") && message.contains("elevation.ign_lidar_hd")), "{messages:?}");
+    // Routable: merged above upstream's France layer (priority 100), and credited.
+    let routed = r#""https_command": "off", "plain_http_hosts": ["s3.amazonaws.com", "data.geopf.fr"], "mirrors": {"https://cloud.daporkchop.net/gis/dem/": "dem"}"#;
+    let (with, messages) = logged(&format!(r#"{{{offline}, "network": {{{routed}}}}}"#));
+    assert_eq!(ign_layers(&with), 7);
+    assert!(messages.iter().any(|message| message.contains("Etalab 2.0")), "{messages:?}");
+    let paris = terra_elevation::AxisBounds::of(2.35, 2.36, 48.85, 48.86);
+    let over_paris = with.generator().heights().intersecting(&paris);
+    assert!(over_paris[0].dataset.id.starts_with("ign-lidar-hd-") && over_paris[0].optional.is_some());
+    assert!(over_paris[1].dataset.url_templates[0].contains("/gis/dem/earth/fr/17/"));
+    // Worlds generated with and without it are told apart.
+    assert_ne!(with.fingerprint(), without.fingerprint());
+    // Turned off: no IGN layers and no message about them.
+    let (off, messages) = logged(&format!(r#"{{{offline}, "elevation": {{"ign_lidar_hd": false}}, "network": {{{network}}}}}"#));
+    assert_eq!(ign_layers(&off), 0);
+    assert!(!messages.iter().any(|message| message.contains("ign_lidar_hd")), "{messages:?}");
+    assert_eq!(off.fingerprint(), without.fingerprint());
+}
+
+/// The built-in default used to be the two AWS layers alone. Worlds created then must still open
+/// with the documented migration (README, "Existing worlds"): the example file is byte-identical
+/// to that old default, so the fingerprint, recorded below from the old build, still matches.
+#[test]
+fn worlds_from_the_old_aws_only_default_can_migrate() {
+    let directory = common::scratch("old-default-migration");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/aws-terrain-tiles/heights.json5"), directory.join("heights.json5")).unwrap();
+    let text = r#"{"generate_trees": false, "openstreetmap": {"enabled": false}, "elevation": {"heights_config": "heights.json5", "ign_lidar_hd": false},
+        "network": {"https_command": "off", "plain_http_hosts": ["s3.amazonaws.com"]}}"#;
+    let stack = build(&directory, text).unwrap();
+    let recorded = format!("{:?}", stack.fingerprint());
+    assert!(recorded.contains(r#"("heights_config", "ac4e632821efdb74:2101")"#), "{recorded}");
 }

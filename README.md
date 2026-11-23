@@ -253,12 +253,74 @@ the engine source, not run.
 ## Configuration
 
 The format is upstream's `config.yml` expressed as JSON5, plus sections for this port: `world`,
-`elevation` (`heights_config`, `tree_cover_config`, `unsupported_layers`), `network`,
+`elevation` (`heights_config`, `ign_lidar_hd`, `tree_cover_config`, `unsupported_layers`), `network`,
 `permissions`, `generation`, `prefix`, `openstreetmap` and `updates`. Unknown keys
 are errors. See `examples/` and `crates/terra-server/src/config.rs`.
 
 `elevation.unsupported_layers` (`reject` or `skip`) is still accepted, but every layer type of
 upstream loads now, so nothing is ever skipped. An unknown type name is always an error.
+
+### Elevation data and France (IGN LiDAR HD)
+
+Without `elevation.heights_config`, the heights come from upstream's complete default
+`heights.json5`, as in TerraPlusMinus. That is the AWS Terrain Tiles world layers plus about
+1,960 regional DEMs on `cloud.daporkchop.net`. For France the regional layer is IGN RGE ALTI at
+1 m (a June 2021 copy). The two AWS layers alone (about 13 m per pixel at French latitudes) are in
+`examples/aws-terrain-tiles/heights.json5`.
+
+On top of that, `elevation.ign_lidar_hd` (on by default) adds IGN's **LiDAR HD** terrain model
+from the Géoplateforme WMS-Raster service (`data.geopf.fr`, no key). The layers are defined in
+`crates/terra-elevation/resources/heights_ign_lidar_hd.json5`:
+
+- They cover mainland France, Corsica, Guadeloupe, Martinique, La Réunion and Mayotte.
+- The model has a 0.5 m grid and about 30 cm vertical accuracy.
+- It is requested as raw float32 GeoTIFF on the exact pixels of web Mercator zoom 17 (about
+  0.8 m), with `LINEAR` blending.
+- The data is © IGN, under the Licence Ouverte Etalab 2.0, and must be credited as "IGN".
+
+| Point (IGN altimetry service, November 2026) | LiDAR HD | RGE ALTI |
+|---|---|---|
+| Mont Blanc summit (surveyed 4805.59 m in 2021) | 4805.43 m | 4755.64 m |
+| Paris, Hôtel de Ville | 35.19 m | 34.90 m |
+| Pyrenees (0.0743, 42.9091) | 1709.50 m | 1707.99 m |
+
+RGE ALTI is exact where it already came from LiDAR, but in the mountains and under forests it
+falls back on radar and older 25 m data: it reads 2 to 8 m off, and on the Mont Blanc summit
+50 m. LiDAR HD also shows embankments, ditches and riverbanks that 1 m interpolated data
+smooths away.
+
+How it degrades:
+
+- **Not surveyed yet.** Where LiDAR HD is not published (French Guiana is not in the programme;
+  Guadeloupe had nothing published in November 2026), the service answers -9999 or -99999. The
+  `filter` parser turns these values into `NaN` before blending. Those columns, and only those,
+  come from RGE ALTI, then from AWS.
+- **Service failure.** If the service fails (unreachable, an error page instead of a TIFF), the
+  layers are `"optional": true`: they are left out for 60 seconds and the chunk is generated from
+  RGE ALTI instead of failing. Chunks made during an outage therefore differ from their
+  neighbours. Set `ign_lidar_hd` to `false` if every chunk must come from one source.
+- **No route.** Without curl or another route to `data.geopf.fr` (for example an offline setup with
+  mirrors), the layers are left out at startup with a message.
+- **Load on the service.** The service allows 40 requests per second per IP. The default
+  `max_concurrent_requests` keeps 6 requests in flight to `data.geopf.fr`, and 429 answers wait for
+  their `Retry-After`. Use `network.cache_directory` so that each tile is fetched once.
+- **Fingerprint.** The heights config and the IGN file are part of the generation fingerprint.
+
+**Existing worlds.** Before this change the built-in default was the two AWS layers alone. A world
+created with that default is refused after upgrading, because its heights changed. To keep
+extending such a world, copy `examples/aws-terrain-tiles/heights.json5` next to the config. It is
+byte-identical to the old default, so the fingerprint matches. Then set
+`"elevation": {"heights_config": "heights.json5", "ign_lidar_hd": false}`.
+
+The extensions behind this are general. They are not upstream syntax, so such configs do not
+load in TerraPlusMinus:
+
+- `${bbox_3857}` in a URL template is the tile's EPSG:3857 extent, as a WMS `BBOX`. It is
+  allowed only for a plain `web_mercator` projection. For `LINEAR` and `CUBIC` it is shifted half
+  a pixel, so that the value at each pixel centre lands exactly where interpolation reads it.
+- `{"filter": {"condition": ..., "delegate": ...}}` turns values that fail the condition into
+  `NaN`.
+- `"optional": true` on a layer enables the fallback described above.
 
 ### Network
 
@@ -272,7 +334,8 @@ upstream loads now, so nothing is ever skipped. An unknown type name is always a
     // URL prefix -> local directory, served without any request.
     "mirrors": {},
     // Requests in flight per host ("<n>: <url>"). Default: upstream's list (8 for
-    // cloud.daporkchop.net and s3.amazonaws.com, 1 for gis-treecover.wri.org and Overpass).
+    // cloud.daporkchop.net and s3.amazonaws.com, 1 for gis-treecover.wri.org and Overpass),
+    // plus 6 for data.geopf.fr (IGN LiDAR HD).
     "max_concurrent_requests": ["8: https://cloud.daporkchop.net/", "8: https://s3.amazonaws.com/"],
     // Sent on every request. Default: "Terraplusminus/<version> (Terra--/rust; +<repository>)".
     "user_agent": "...",

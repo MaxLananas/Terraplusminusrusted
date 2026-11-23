@@ -42,8 +42,16 @@ struct HostState {
 }
 
 /// TerraMinusMinus' `TerraConfig.http.maxConcurrentRequests`, in its own `"<n>: <url>"` form.
-pub const DEFAULT_HOST_LIMITS: [&str; 5] =
-    ["8: https://cloud.daporkchop.net/", "8: https://s3.amazonaws.com/", "1: http://gis-treecover.wri.org/", "1: https://overpass.kumi.systems/", "1: https://lz4.overpass-api.de/"];
+/// Upstream's `maxConcurrentRequests`, plus the IGN Géoplateforme (40 requests per second per IP
+/// allowed; 6 in flight stays under it at the usual latencies) for `elevation.ign_lidar_hd`.
+pub const DEFAULT_HOST_LIMITS: [&str; 6] = [
+    "8: https://cloud.daporkchop.net/",
+    "8: https://s3.amazonaws.com/",
+    "1: http://gis-treecover.wri.org/",
+    "1: https://overpass.kumi.systems/",
+    "1: https://lz4.overpass-api.de/",
+    "6: https://data.geopf.fr/",
+];
 
 /// One `maxConcurrentRequests` entry, `"<n>: <url>"` (`^(\d+): (.+)$`), as (host, n). Only the
 /// URL's authority counts: an `https://` host fetched over plain HTTP keeps its limit.

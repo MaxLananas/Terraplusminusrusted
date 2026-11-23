@@ -12,7 +12,10 @@ use terra_chunk_generation::{
     verify_or_record,
 };
 use terra_osm::{DEFAULT_OSM_CONFIG, OsmDataset, OsmMapper, OsmSettings};
-use terra_elevation::{CachingTileProvider, DEFAULT_TREE_COVER, DEFAULT_WORLD_HEIGHTS, ElevationError, FetchOutcome, TileFetcher, load_heights_config, load_tree_cover_config};
+use terra_elevation::{
+    CachingTileProvider, DEFAULT_TREE_COVER, DEFAULT_WORLD_HEIGHTS, ElevationError, FetchOutcome, IGN_LIDAR_HD_HEIGHTS, TileFetcher, load_additional_heights_config, load_heights_config,
+    load_tree_cover_config,
+};
 
 #[derive(Debug)]
 pub enum StackError {
@@ -80,26 +83,50 @@ impl TileFetcher for LoggingFetcher {
 
 /// Refuses sources none of whose URLs this build can fetch, naming each with the fixes.
 fn check_sources<T: terra_acquisition::HttpTransport>(routing: &RoutingFetcher<T>, sources: &[(String, Vec<String>)]) -> Result<(), StackError> {
-    let mut problems = Vec::new();
+    // Upstream's default heights config alone has ~2000 layers on two hosts: group the problems
+    // by kind of source and host so that every distinct cause is named.
+    let mut groups: Vec<(String, String, usize, String)> = Vec::new();
+    let mut count = 0;
     for (label, templates) in sources {
         let reasons: Vec<String> = templates.iter().filter_map(|template| routing.check_route(template).err()).collect();
         if reasons.len() == templates.len() {
+            count += 1;
             let reason = if templates.is_empty() { "no URLs configured".to_owned() } else { reasons.join("; ") };
-            problems.push(format!("{label}: {reason}"));
+            let kind = source_kind(label).to_owned();
+            let host = templates.first().map(|template| url_host(template)).unwrap_or_default().to_owned();
+            match groups.iter_mut().find(|group| group.0 == kind && group.1 == host) {
+                Some(group) => group.2 += 1,
+                None => groups.push((kind, host, 1, format!("{label}: {reason}"))),
+            }
         }
     }
-    if problems.is_empty() {
+    if groups.is_empty() {
         return Ok(());
     }
-    let count = problems.len();
-    let shown: Vec<String> = problems.into_iter().take(8).collect();
-    let more = if count > shown.len() { format!(" (and {} more)", count - shown.len()) } else { String::new() };
+    let shown: Vec<String> = groups
+        .iter()
+        .map(|(kind, host, members, example)| if *members == 1 { example.clone() } else { format!("{members} {kind}s on {host}, e.g. {example}") })
+        .collect();
     Err(StackError::Unreachable(format!(
-        "{count} enabled data source(s) cannot be fetched: {}{more}. Fix: install curl (network.https_command), map the URL prefixes to local copies with network.mirrors, \
+        "{count} enabled data source(s) cannot be fetched: {}. Fix: install curl (network.https_command), map the URL prefixes to local copies with network.mirrors, \
          or list the hosts in network.plain_http_hosts (unencrypted, unauthenticated HTTP; only for hosts that serve the same data over HTTP), \
          or turn the feature off (openstreetmap.enabled, generate_trees, elevation.heights_config)",
-        shown.join("; ")
+        shown.join(" | ")
     )))
+}
+
+/// `elevation layer layer-12` -> `elevation layer`; other labels are their own kind.
+fn source_kind(label: &str) -> &str {
+    match label.rsplit_once(' ') {
+        Some((kind, _)) if kind.ends_with(" layer") => kind,
+        _ => label,
+    }
+}
+
+/// The host of a URL template, for grouping messages only.
+fn url_host(template: &str) -> &str {
+    let rest = template.split_once("://").map_or(template, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
 pub struct TerraStack {
@@ -125,6 +152,13 @@ impl TerraStack {
             None => DEFAULT_WORLD_HEIGHTS.to_owned(),
         };
         let mut layers = load_heights_config(&heights_text, config.unsupported_layers).map_err(StackError::Elevation)?;
+        // IGN LiDAR HD over France, above whatever heights config is in use. Its layers get their
+        // own cache ids, and its text joins the fingerprinted heights bytes.
+        let ign = if config.ign_lidar_hd {
+            Some(load_additional_heights_config(IGN_LIDAR_HD_HEIGHTS, config.unsupported_layers, "ign-lidar-hd").map_err(StackError::Elevation)?)
+        } else {
+            None
+        };
         let network = &config.network;
         let limits = TransportLimits { connect_timeout: network.connect_timeout, io_timeout: network.io_timeout, total_timeout: network.total_timeout, ..TransportLimits::default() };
         // One fetch never outlives its attempts plus their backoffs, however the server behaves.
@@ -143,6 +177,30 @@ impl TerraStack {
         let supports_https = transport.supports_https();
         let http = HttpTileFetcher::new(transport, limits, policy).with_host_limits(network.host_limits.clone());
         let routing = RoutingFetcher::new(&mirrors, http, network.plain_http_hosts.clone()).with_https(supports_https);
+        // IGN LiDAR HD is an optional refinement: when it cannot be routed (no curl, an offline
+        // setup with mirrors), it is left out with a message instead of refusing to start.
+        let heights_text = match ign {
+            Some(ign) => {
+                let unroutable = ign.dataset.layers().iter().flat_map(|layer| &layer.dataset.url_templates).find_map(|template| routing.check_route(template).err());
+                match unroutable {
+                    Some(reason) => {
+                        log(&format!("elevation.ign_lidar_hd: IGN LiDAR HD left out ({reason}); France uses the heights config alone. Set elevation.ign_lidar_hd to false to silence this"));
+                        heights_text
+                    }
+                    None => {
+                        let mut merged = layers.dataset.layers().to_vec();
+                        merged.extend(ign.dataset.layers().iter().cloned());
+                        layers.dataset = terra_elevation::LayeredScalarDataset::new(merged);
+                        layers.skipped.extend(ign.skipped);
+                        if !config.reduced_console_messages {
+                            log("elevation.ign_lidar_hd: IGN LiDAR HD (0.5 m, Licence Ouverte Etalab 2.0, source: IGN) over France");
+                        }
+                        format!("{heights_text}\n// elevation.ign_lidar_hd\n{IGN_LIDAR_HD_HEIGHTS}")
+                    }
+                }
+            }
+            None => heights_text,
+        };
         // Every enabled source must be fetchable before anything is registered: generation would
         // otherwise wait on data that can never arrive.
         let mut sources: Vec<(String, Vec<String>)> = layers.dataset.layers().iter().map(|layer| (format!("elevation layer {}", layer.dataset.id), layer.dataset.url_templates.clone())).collect();

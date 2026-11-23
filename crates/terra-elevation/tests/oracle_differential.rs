@@ -50,6 +50,7 @@ fn offline_heights() -> LayeredScalarDataset {
         bounds: AxisBounds::of(-180.0, 180.0, -85.0, 85.0),
         priority: 0.0,
         condition: None,
+        optional: None,
     }])
 }
 

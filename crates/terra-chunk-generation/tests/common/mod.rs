@@ -36,6 +36,7 @@ pub fn generator_with(koppen: bool, wrap: impl FnOnce(Arc<dyn TileProvider>) -> 
         bounds: AxisBounds::of(-180.0, 180.0, -85.0, 85.0),
         priority: 0.0,
         condition: None,
+        optional: None,
     }]);
     let provider = wrap(offline_provider());
     let settings = GeneratorSettings { use_biome_dataset: koppen, ..GeneratorSettings::default() };

@@ -33,6 +33,10 @@ pub enum TileFormat {
     SwapAxes(Box<TileFormat>),
     /// `from_int`: an integer parser chain, [`crate::int_format::NO_DATA`] becoming `NaN`.
     FromInt(Box<crate::int_format::IntFormat>),
+    /// `filter` (this port's extension): values failing the condition become `NaN` before
+    /// blending, so a no-data sentinel (IGN's `-9999` and `-99999`) never leaks into the
+    /// interpolation and lower-priority layers fill the gap instead.
+    Filter(Box<TileFormat>, crate::condition::DoubleCondition),
 }
 
 impl TileFormat {
@@ -54,6 +58,7 @@ impl TileFormat {
             Self::FromInt(inner) => {
                 inner.parse(bytes, resolution)?.into_iter().map(|value| if value != crate::int_format::NO_DATA { f64::from(value) } else { f64::NAN }).collect()
             }
+            Self::Filter(inner, condition) => inner.parse(bytes, resolution)?.into_iter().map(|value| if condition.test(value) { value } else { f64::NAN }).collect(),
         })
     }
 }
@@ -94,7 +99,12 @@ pub struct TiledScalarDataset {
     pub format: TileFormat,
     resolution: u32,
     shift: u32,
+    /// The zoom of a plain `web_mercator` projection, which makes `${bbox_3857}` computable.
+    web_mercator_zoom: Option<u32>,
 }
+
+/// Half the EPSG:3857 world width: `pi * 6378137` metres.
+const WEB_MERCATOR_HALF_WORLD: f64 = std::f64::consts::PI * 6_378_137.0;
 
 impl TiledScalarDataset {
     pub fn new(
@@ -105,25 +115,87 @@ impl TiledScalarDataset {
         blend: BlendMode,
         format: TileFormat,
     ) -> Result<Self, ElevationError> {
+        Self::build(id, url_templates, projection, resolution, blend, format, None)
+    }
+
+    /// As [`TiledScalarDataset::new`] for a plain `web_mercator` projection at `zoom`, whose
+    /// URL templates may also use `${bbox_3857}`.
+    pub fn new_web_mercator(
+        id: String,
+        url_templates: Vec<String>,
+        projection: SharedProjection,
+        zoom: u32,
+        resolution: u32,
+        blend: BlendMode,
+        format: TileFormat,
+    ) -> Result<Self, ElevationError> {
+        Self::build(id, url_templates, projection, resolution, blend, format, Some(zoom))
+    }
+
+    fn build(
+        id: String,
+        url_templates: Vec<String>,
+        projection: SharedProjection,
+        resolution: u32,
+        blend: BlendMode,
+        format: TileFormat,
+        web_mercator_zoom: Option<u32>,
+    ) -> Result<Self, ElevationError> {
         if resolution == 0 || !resolution.is_power_of_two() || resolution > 4096 {
             return Err(ElevationError::InvalidConfiguration(format!("given resolution ({resolution}) is not a power of 2!")));
         }
         for template in &url_templates {
-            validate_template(template)?;
+            validate_template(template, web_mercator_zoom.is_some())?;
         }
-        Ok(Self { id, url_templates, projection, blend, format, resolution, shift: resolution.trailing_zeros() })
+        Ok(Self { id, url_templates, projection, blend, format, resolution, shift: resolution.trailing_zeros(), web_mercator_zoom })
     }
 
     pub fn resolution(&self) -> u32 {
         self.resolution
     }
 
-    /// The tile URLs for `position`, substituting `${x}` and `${z}`.
+    /// The tile URLs for `position`, substituting `${x}`, `${z}` and (web Mercator datasets
+    /// only) `${bbox_3857}`.
     pub fn urls(&self, position: TilePosition) -> Vec<String> {
+        let bbox = self.bbox_3857(position);
         self.url_templates
             .iter()
-            .map(|template| template.replace("${x}", &position.x.to_string()).replace("${z}", &position.z.to_string()))
+            .map(|template| {
+                let url = template.replace("${x}", &position.x.to_string()).replace("${z}", &position.z.to_string());
+                match &bbox {
+                    Some(bbox) => url.replace("${bbox_3857}", bbox),
+                    None => url,
+                }
+            })
             .collect()
+    }
+
+    /// `${bbox_3857}`: the extent to request from a WMS 1.3.0 server in EPSG:3857 metres
+    /// (`minx,miny,maxx,maxy`, easting then northing for this CRS), for `resolution` pixels a
+    /// side. The `web_mercator` projection numbers pixels from the north-west corner of a
+    /// `256 << zoom` pixel world; tile `(x, z)` holds the values for pixel coordinates
+    /// `x * resolution + i` east and `z * resolution + j` south.
+    ///
+    /// Where a value is read depends on the blend: `NEAR` takes value `i` for the whole of
+    /// `[i, i + 1)`, so the request is the tile's own extent (the alignment of GDAL-cut tiles).
+    /// `LINEAR` and `CUBIC` treat value `i` as a sample *at* `i`, so the request is shifted half a
+    /// pixel north-west: a WMS server returns the value at each pixel's centre, and every centre
+    /// then lands exactly on the integer coordinate the interpolation reads it at.
+    fn bbox_3857(&self, position: TilePosition) -> Option<String> {
+        if !self.url_templates.iter().any(|template| template.contains("${bbox_3857}")) {
+            return None;
+        }
+        let zoom = self.web_mercator_zoom?;
+        let metres_per_pixel = 2.0 * WEB_MERCATOR_HALF_WORLD / f64::from(256u32 << zoom);
+        let resolution = f64::from(self.resolution);
+        let tile = resolution * metres_per_pixel;
+        let centring = if self.blend == BlendMode::Near { 0.0 } else { 0.5 };
+        let (x, z) = (f64::from(position.x), f64::from(position.z));
+        // `+ 0.0` turns a negative zero into "0.0000" rather than "-0.0000".
+        let coordinate = |value: f64| format!("{:.4}", value + 0.0);
+        let min_x = (x * resolution - centring) * metres_per_pixel - WEB_MERCATOR_HALF_WORLD;
+        let max_y = WEB_MERCATOR_HALF_WORLD - (z * resolution - centring) * metres_per_pixel;
+        Some(format!("{},{},{},{}", coordinate(min_x), coordinate(max_y - tile), coordinate(min_x + tile), coordinate(max_y)))
     }
 
     /// Stage one of `getAsync(CornerBoundingBox2d, ...)`: project the geographic quadrilateral into
@@ -195,7 +267,7 @@ impl TiledScalarDataset {
     }
 }
 
-fn validate_template(template: &str) -> Result<(), ElevationError> {
+fn validate_template(template: &str, web_mercator: bool) -> Result<(), ElevationError> {
     let mut rest = template;
     while let Some(start) = rest.find("${") {
         let after = &rest[start + 2..];
@@ -203,7 +275,10 @@ fn validate_template(template: &str) -> Result<(), ElevationError> {
             return Err(ElevationError::InvalidConfiguration(format!("unterminated placeholder in {template}")));
         };
         let key = &after[..end];
-        if key != "x" && key != "z" {
+        if key == "bbox_3857" && !web_mercator {
+            return Err(ElevationError::InvalidConfiguration(format!("${{bbox_3857}} needs a plain web_mercator projection, in {template}")));
+        }
+        if key != "x" && key != "z" && key != "bbox_3857" {
             return Err(ElevationError::InvalidConfiguration(format!("unsupported url property \"{key}\" in {template}")));
         }
         rest = &after[end + 1..];
@@ -270,7 +345,7 @@ impl<'a> DenseTiles<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The dense table must answer exactly as the map: same tile, same absence, and a fallback
@@ -301,7 +376,7 @@ mod tests {
 
     /// A minimal little-endian, uncompressed, single-strip float32 TIFF. The no-data text must
     /// be longer than three characters (shorter ASCII values belong inline in the entry).
-    fn float_tiff(size: u32, values: &[f32], nodata: Option<&str>) -> Vec<u8> {
+    pub(crate) fn float_tiff(size: u32, values: &[f32], nodata: Option<&str>) -> Vec<u8> {
         let pixel_offset = 8u32;
         let pixel_bytes = size * size * 4;
         let mut nodata_bytes = nodata.map(|text| format!("{text}\0").into_bytes()).unwrap_or_default();

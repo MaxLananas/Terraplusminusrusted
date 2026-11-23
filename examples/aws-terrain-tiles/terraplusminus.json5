@@ -1,5 +1,7 @@
-// Live AWS Terrain Tiles (the upstream default world layers) fetched over plain HTTP, with no
-// dependency on curl. Tiles are cached on disk under ./tile-cache.
+// Live AWS Terrain Tiles (the two world-wide layers of upstream's default heights.json5, copied
+// in ./heights.json5) fetched over plain HTTP, with no dependency on curl. Tiles are cached on
+// disk under ./tile-cache. The built-in default adds upstream's regional DEMs and IGN LiDAR HD
+// over France, which need HTTPS; this example leaves them out.
 // OpenStreetMap features and trees are off to keep this example free of HTTPS: their default
 // servers (https://cloud.daporkchop.net/gis/osm/0/ and .../gis/treecover2000/) are fetched
 // through network.https_command (the system curl) when enabled. Without curl, point
@@ -7,6 +9,7 @@
 // plain-HTTP or mirrored copy.
 {
     "world": {"min_y": -2032, "height": 4064},
+    "elevation": {"heights_config": "heights.json5", "ign_lidar_hd": false},
     "network": {
         "plain_http_hosts": ["s3.amazonaws.com"],
         "cache_directory": "tile-cache",

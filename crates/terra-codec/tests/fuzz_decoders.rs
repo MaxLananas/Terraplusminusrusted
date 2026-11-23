@@ -415,7 +415,8 @@ fn tiff_argb_survives_mutation() {
 fn json5_survives_mutation_and_pathological_nesting() {
     let seeds: Vec<Vec<u8>> = [
         "crates/terra-osm/resources/osm.json5",
-        "crates/terra-elevation/resources/heights_world.json5",
+        "crates/terra-elevation/resources/heights_ign_lidar_hd.json5",
+        "examples/aws-terrain-tiles/heights.json5",
         "crates/terra-elevation/resources/tree_cover.json5",
         "fixtures/osm/mappings/exhaustive.json5",
         "examples/offline-grand-canyon/terraplusminus.json5",

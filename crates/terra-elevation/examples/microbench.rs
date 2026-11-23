@@ -141,7 +141,7 @@ fn main() {
         }),
     );
 
-    let heights = LayeredScalarDataset::new(vec![ScalarLayer { dataset: Arc::new(dataset), bounds: AxisBounds::of(-180.0, 180.0, -85.0, 85.0), priority: 0.0, condition: None }]);
+    let heights = LayeredScalarDataset::new(vec![ScalarLayer { dataset: Arc::new(dataset), bounds: AxisBounds::of(-180.0, 180.0, -85.0, 85.0), priority: 0.0, condition: None, optional: None }]);
     let provider = CachingTileProvider::new(MirrorFetcher::new().with_mapping(prefix, root), 16);
     report(
         "chunk_full",

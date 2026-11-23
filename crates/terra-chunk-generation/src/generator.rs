@@ -155,6 +155,11 @@ impl TerrainGenerator {
         Self { projection, heights, provider, koppen, osm: None, trees: None, settings }
     }
 
+    /// The elevation layers, highest priority first per area.
+    pub fn heights(&self) -> &LayeredScalarDataset {
+        &self.heights
+    }
+
     /// Draws OpenStreetMap features (water, coastlines, roads, buildings) into chunk data.
     #[must_use]
     pub fn with_openstreetmap(mut self, osm: Arc<OsmDataset>) -> Self {

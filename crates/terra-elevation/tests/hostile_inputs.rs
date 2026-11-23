@@ -8,7 +8,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use terra_elevation::{DEFAULT_TREE_COVER, DEFAULT_WORLD_HEIGHTS, UnsupportedLayerPolicy, load_heights_config, load_tree_cover_config};
+use terra_elevation::{DEFAULT_TREE_COVER, IGN_LIDAR_HD_HEIGHTS, UnsupportedLayerPolicy, load_heights_config, load_tree_cover_config};
 
 struct Rng(u64);
 
@@ -67,7 +67,9 @@ const RICH_CONFIG: &str = r#"[
 
 #[test]
 fn heights_configurations_never_panic() {
-    let seeds = [DEFAULT_WORLD_HEIGHTS.as_bytes().to_vec(), RICH_CONFIG.as_bytes().to_vec(), DEFAULT_TREE_COVER.as_bytes().to_vec()];
+    // Upstream's complete default (773 kB) loads in `config::tests`; the small IGN file covers
+    // this port's `filter`, `optional` and `${bbox_3857}` too.
+    let seeds = [IGN_LIDAR_HD_HEIGHTS.as_bytes().to_vec(), RICH_CONFIG.as_bytes().to_vec(), DEFAULT_TREE_COVER.as_bytes().to_vec()];
     // The seeds are valid, so mutations explore the paths past the first error.
     for seed in &seeds[..2] {
         load_heights_config(std::str::from_utf8(seed).unwrap(), UnsupportedLayerPolicy::Reject).unwrap();

@@ -19,7 +19,9 @@ under `tools/oracle`.
 | File | Source | License notice |
 |---|---|---|
 | `crates/terra-projection/resources/conformal.gz` | terraminusminus | `crates/terra-projection/resources/NOTICE` |
-| `crates/terra-elevation/resources/heights_world.json5` | terraminusminus `heights.json5` (first two layers) | `crates/terra-elevation/resources/NOTICE` |
+| `crates/terra-elevation/resources/heights_world.json5` | terraminusminus `dataset/scalar/heights.json5` (byte-identical, sha256 `046bd2c2dc54339d0440cc1fa49ac955e8927766736d6e4da4b2b239592ac4c9`) | `crates/terra-elevation/resources/NOTICE` |
+| `crates/terra-elevation/resources/heights_ign_lidar_hd.json5` | Written for this repository; describes IGN LiDAR HD WMS-R layers (data © IGN, Licence Ouverte Etalab 2.0, fetched at run time, not bundled) | `crates/terra-elevation/resources/NOTICE` |
+| `examples/aws-terrain-tiles/heights.json5` | terraminusminus `heights.json5` (first two layers) | `crates/terra-elevation/resources/NOTICE` |
 | `crates/terra-osm/resources/osm.json5` | terraminusminus `dataset/osm/osm.json5` (byte-identical) | `crates/terra-osm/resources/NOTICE` |
 | `crates/terra-elevation/resources/tree_cover.json5` | terraminusminus `dataset/scalar/tree_cover.json5` (byte-identical) | `crates/terra-elevation/resources/NOTICE` |
 | `crates/terra-chunk-generation/resources/koppen_map.gz` | TerraPlusMinus (byte-identical) | `crates/terra-chunk-generation/resources/NOTICE` |

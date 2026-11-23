@@ -45,7 +45,7 @@ pub fn config(name: &str, extra: &str) -> (terra_server::ServerConfig, PathBuf) 
     let trees = if extra.contains("\"generate_trees\"") { "" } else { r#""generate_trees": false,"# };
     let generation = if extra.contains("\"generation\"") { r#""config_version": 1"# } else { r#""generation": {"workers": 2}"# };
     let config = parse_server_config(&format!(
-        r#"{{"elevation": {{"heights_config": "heights.json5", "tree_cover_config": "tree_cover.json5"}}, {biomes} {osm} {trees}
+        r#"{{"elevation": {{"ign_lidar_hd": false, "heights_config": "heights.json5", "tree_cover_config": "tree_cover.json5"}}, {biomes} {osm} {trees}
             "network": {{"mirrors": {{"mirror://terrarium/": "{}", "mirror://treecover/": "{}", "https://osm.fixture/": "osm"}}, "cache_directory": "tile-cache"}},
             "world": {{"min_y": -64, "height": 2096}}, {generation} {extra}}}"#,
         fixtures.display(),

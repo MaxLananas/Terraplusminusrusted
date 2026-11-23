@@ -81,6 +81,9 @@ pub struct ServerConfig {
     pub team_bounds: TeamBounds,
     pub linked_worlds: LinkedWorlds,
     pub heights_config: Option<PathBuf>,
+    /// `elevation.ign_lidar_hd`: IGN's LiDAR HD terrain model for France over the heights
+    /// config (see `terra_elevation::IGN_LIDAR_HD_HEIGHTS`). On by default.
+    pub ign_lidar_hd: bool,
     /// Tree-cover dataset config (`tree_cover.json5` schema); the upstream default when unset.
     pub tree_cover_config: Option<PathBuf>,
     pub unsupported_layers: UnsupportedLayerPolicy,
@@ -121,6 +124,7 @@ impl Default for ServerConfig {
             team_bounds: TeamBounds { min_latitude: 0.0, max_latitude: 0.0, min_longitude: 0.0, max_longitude: 0.0 },
             linked_worlds: LinkedWorlds { enabled: false, method: LinkedWorldsMethod::Levels, worlds: Vec::new() },
             heights_config: None,
+            ign_lidar_hd: true,
             tree_cover_config: None,
             unsupported_layers: UnsupportedLayerPolicy::Reject,
             network: NetworkConfig {
@@ -453,8 +457,9 @@ pub fn parse_server_config(text: &str) -> Result<ServerConfig, ConfigError> {
         }
         config.world = world;
     }
-    if let Some(elevation) = root.section("elevation", &["heights_config", "tree_cover_config", "unsupported_layers"])? {
+    if let Some(elevation) = root.section("elevation", &["heights_config", "tree_cover_config", "unsupported_layers", "ign_lidar_hd"])? {
         config.heights_config = elevation.string("heights_config")?.map(PathBuf::from);
+        config.ign_lidar_hd = elevation.boolean("ign_lidar_hd", true)?;
         config.tree_cover_config = elevation.string("tree_cover_config")?.map(PathBuf::from);
         config.unsupported_layers = match elevation.string("unsupported_layers")? {
             None | Some("reject") => UnsupportedLayerPolicy::Reject,

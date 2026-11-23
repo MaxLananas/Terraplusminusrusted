@@ -162,6 +162,22 @@ Each step prints PASS, FAIL or NOT RUN, and the script exits non-zero on any fai
 commands, toolchain versions and upstream revisions go to `artifacts/verify/<timestamp>/`, which
 git ignores. Set `CARGO_COMMAND` to run cargo through a wrapper.
 
+`tools/bench/run.sh [warm-up s] [measured s]` times the same tile decodes and projections in
+upstream's Java classes (from the oracle build) and in this port. Measured on 2 cores (JDK 25 vs
+rustc 1.92 release), median per call:
+
+| Workload | Java | Rust |
+|---|---|---|
+| Terrarium PNG 256² (`parse_png_terrarium`) | 5.0 ms | 3.2 ms |
+| JPEG 256² (`parse_jpg`) | 2.8 ms | 2.3 ms |
+| GeoTIFF float32 Deflate 1024² (`parse_tiff`) | 35.7 ms | 45.2 ms |
+| GeoTIFF int16 Deflate + predictor 512² | 3.5 ms | 2.7 ms |
+| BTE `fromGeo` ×100k | 45.0 ms | 43.4 ms |
+| BTE `toGeo` ×100k | 33.8 ms | 31.0 ms |
+
+The port's Deflate decoder is pure Rust and about 1.8× slower than the native zlib Java calls,
+which is why the large Deflate TIFF is slower.
+
 ## Release build
 
 ```sh

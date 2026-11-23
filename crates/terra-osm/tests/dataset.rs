@@ -283,3 +283,30 @@ fn negative_chunks_use_floor_tile_coordinates() {
     assert!(!target.water.contains_key(&(0, 5)));
     assert!(server.fetches("tile/-2/-1.json") > 0 && server.fetches("tile/1/2.json") > 0, "tiles -2..=1 by -1..=2");
 }
+
+/// A hostile server multiplying elements through references (each resource referencing the next
+/// one 8 times, 8 levels deep: 8^8 copies of one element) is refused once a resource would hold
+/// more than `MAX_ELEMENTS_PER_RESOURCE`, quickly and without exhausting memory.
+#[test]
+fn reference_amplification_is_bounded() {
+    let server = Arc::new(FakeServer::default());
+    server.put("level/8.json", &[line_feature("way/1", r#""highway":"primary""#, &[(0.0, 0.0), (8.0, 8.0)])]);
+    for level in 0..8 {
+        server.put(&format!("level/{level}.json"), &vec![reference(&format!("level/{}.json", level + 1)); 8]);
+    }
+    server.put("tile/0/0.json", &[reference("level/0.json")]);
+    let started = std::time::Instant::now();
+    match dataset(&server).chunk_elements(0, 0) {
+        Err(OsmError::Malformed { reason, .. }) => assert!(reason.contains("elements"), "{reason}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    // Below the cap, shared references still work (8^5 = 32768 copies of the line).
+    let server = Arc::new(FakeServer::default());
+    server.put("level/5.json", &[line_feature("way/1", r#""highway":"primary""#, &[(0.0, 0.0), (8.0, 8.0)])]);
+    for level in 0..5 {
+        server.put(&format!("level/{level}.json"), &vec![reference(&format!("level/{}.json", level + 1)); 8]);
+    }
+    server.put("tile/0/0.json", &[reference("level/0.json")]);
+    assert!(dataset(&server).chunk_elements(0, 0).is_ok());
+}

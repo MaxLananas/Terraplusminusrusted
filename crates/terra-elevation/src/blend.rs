@@ -27,12 +27,12 @@ impl BlendMode {
         }
     }
 
-    /// Accepts the upstream names, including the legacy alias `SMOOTH` for `CUBIC`.
+    /// Upstream's enum constant names (`BlendMode.valueOf`): `NEAR`, `LINEAR`, `CUBIC`, exactly.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "NEAR" => Some(Self::Near),
             "LINEAR" => Some(Self::Linear),
-            "CUBIC" | "SMOOTH" => Some(Self::Cubic),
+            "CUBIC" => Some(Self::Cubic),
             _ => None,
         }
     }

@@ -8,13 +8,12 @@ pub enum ElevationError {
     /// A projection failure inside a multi-layer merge, which upstream reports as a failed load.
     LayerOutOfProjectionBounds,
     InvalidConfiguration(String),
-    UnsupportedFormat(String),
     RequestTooLarge { tiles: u64 },
     Decode { url: String, error: DecodeError },
     TileDecode(DecodeError),
     Fetch { url: String, reason: String },
-    /// The URL cannot be fetched by this build's configuration at all (no TLS, no mirror, an
-    /// unsupported scheme): retrying cannot help.
+    /// The URL cannot be fetched by this build's configuration at all (HTTPS without curl, no
+    /// mirror, an unsupported scheme): retrying cannot help.
     Unreachable { url: String, reason: String },
     /// Every URL failed for a tile (`Http.getFirst` "All URLs completed exceptionally!").
     AllSourcesFailed { dataset: String, failures: Vec<String> },
@@ -28,7 +27,6 @@ impl fmt::Display for ElevationError {
             Self::OutOfProjectionBounds => f.write_str("coordinates are outside the dataset projection"),
             Self::LayerOutOfProjectionBounds => f.write_str("a dataset layer rejected the area's coordinates"),
             Self::InvalidConfiguration(reason) => write!(f, "invalid dataset configuration: {reason}"),
-            Self::UnsupportedFormat(name) => write!(f, "tile format {name} is not supported"),
             Self::RequestTooLarge { tiles } => write!(f, "request touches {tiles} tiles, above the safety limit"),
             Self::Decode { url, error } => write!(f, "failed to decode {url}: {error}"),
             Self::TileDecode(error) => write!(f, "failed to decode tile: {error}"),
@@ -46,12 +44,11 @@ impl fmt::Display for ElevationError {
 impl std::error::Error for ElevationError {}
 
 impl ElevationError {
-    /// Whether retrying the same request can succeed. Configuration errors, unsupported formats,
-    /// malformed tile content and unreachable URLs are permanent; network failures, overload and
+    /// Whether retrying the same request can succeed. Configuration errors, malformed tile content and unreachable URLs are permanent; network failures, overload and
     /// cancellation are not. Missing tiles are not errors (they are ocean).
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::InvalidConfiguration(_) | Self::UnsupportedFormat(_) | Self::RequestTooLarge { .. } | Self::Decode { .. } | Self::TileDecode(_) | Self::Unreachable { .. } => true,
+            Self::InvalidConfiguration(_) | Self::RequestTooLarge { .. } | Self::Decode { .. } | Self::TileDecode(_) | Self::Unreachable { .. } => true,
             Self::OutOfProjectionBounds | Self::LayerOutOfProjectionBounds => true,
             Self::AllSourcesFailed { .. } | Self::Fetch { .. } | Self::Cancelled | Self::Overloaded => false,
         }
@@ -84,11 +81,10 @@ mod tests {
             (ElevationError::OutOfProjectionBounds, true),
             (ElevationError::LayerOutOfProjectionBounds, true),
             (ElevationError::InvalidConfiguration("x".into()), true),
-            (ElevationError::UnsupportedFormat("x".into()), true),
             (ElevationError::RequestTooLarge { tiles: 9 }, true),
             (ElevationError::Decode { url: url(), error: DecodeError::Truncated }, true),
             (ElevationError::TileDecode(DecodeError::Truncated), true),
-            (ElevationError::Unreachable { url: url(), reason: "no TLS".into() }, true),
+            (ElevationError::Unreachable { url: url(), reason: "no curl for HTTPS".into() }, true),
             (ElevationError::Fetch { url: url(), reason: "reset".into() }, false),
             (ElevationError::AllSourcesFailed { dataset: "d".into(), failures: vec!["reset".into()] }, false),
             (ElevationError::Cancelled, false),
@@ -100,7 +96,6 @@ mod tests {
                 ElevationError::OutOfProjectionBounds
                 | ElevationError::LayerOutOfProjectionBounds
                 | ElevationError::InvalidConfiguration(_)
-                | ElevationError::UnsupportedFormat(_)
                 | ElevationError::RequestTooLarge { .. }
                 | ElevationError::Decode { .. }
                 | ElevationError::TileDecode(_)

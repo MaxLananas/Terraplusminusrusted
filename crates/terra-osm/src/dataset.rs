@@ -25,6 +25,11 @@ pub const TILES_PER_DEGREE: f64 = 64.0;
 pub const MAX_TILES_PER_CHUNK: usize = 1024;
 const MAX_REFERENCE_DEPTH: usize = 16;
 const MAX_KEY_LENGTH: usize = 256;
+/// Elements one resource may hold, its references included. References share elements by
+/// pointer, but a resource referencing the same file a thousand times, or a chain of resources
+/// each referencing the next twice, multiplies them; upstream would run out of memory. Dense
+/// city tiles hold tens of thousands of elements.
+pub const MAX_ELEMENTS_PER_RESOURCE: usize = 1 << 21;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OsmError {
@@ -192,6 +197,10 @@ impl OsmDataset {
                         return Err(OsmError::InvalidReference { key: key.to_owned(), location: location.clone() });
                     }
                     match self.resolve(location, chain) {
+                        Ok(resolved) if elements.len() + resolved.len() > MAX_ELEMENTS_PER_RESOURCE => {
+                            chain.pop();
+                            return Err(too_many_elements(key));
+                        }
                         Ok(resolved) => elements.extend(resolved.iter().cloned()),
                         Err(error) => {
                             chain.pop();
@@ -205,6 +214,9 @@ impl OsmDataset {
         chain.pop();
         for object in local {
             self.convert_object(None, &NO_TAGS, object, &mut elements).map_err(|error| OsmError::Malformed { key: key.to_owned(), reason: error.to_string() })?;
+            if elements.len() > MAX_ELEMENTS_PER_RESOURCE {
+                return Err(too_many_elements(key));
+            }
         }
         let elements: Elements = elements.into();
         self.resources.insert(key.to_owned(), Arc::clone(&elements));
@@ -294,6 +306,10 @@ pub fn apply_elements(elements: &[Arc<VectorGeometry>], target: &mut dyn DrawTar
 }
 
 /// Resource keys come from remote data; only plain relative paths are followed.
+fn too_many_elements(key: &str) -> OsmError {
+    OsmError::Malformed { key: key.to_owned(), reason: format!("more than {MAX_ELEMENTS_PER_RESOURCE} elements, references included") }
+}
+
 fn is_valid_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_KEY_LENGTH
@@ -365,7 +381,7 @@ mod tests {
         let cases = [
             (OsmError::Missing { key: key() }, false),
             (OsmError::Unavailable { key: key(), reasons: "reset".into(), permanent: false }, false),
-            (OsmError::Unavailable { key: key(), reasons: "no TLS".into(), permanent: true }, true),
+            (OsmError::Unavailable { key: key(), reasons: "no curl for HTTPS".into(), permanent: true }, true),
             (OsmError::Malformed { key: key(), reason: "x".into() }, true),
             (OsmError::InvalidReference { key: key(), location: "../x".into() }, true),
             (OsmError::ReferenceCycle { location: "a.json".into() }, true),

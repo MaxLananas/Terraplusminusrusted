@@ -9,7 +9,7 @@
 //! The decisions live in `terra_server::{bridge, autoteleport, updates}`; this is the glue to
 //! Horizon's hooks, raw payload channels and handles.
 
-use super::{HostWorld, LevelRegions, Shared, chat_text, log};
+use super::{HostWorld, LevelRegions, Shared, chat_text, lock, log};
 use mod_api::{
     BlockKey, Host, IPayloadContext, IPayloadHandler, PayloadBytes, PayloadContextError, PayloadHandleError, PayloadId, PayloadWork, PermissionLevel, PlayerRef, ServerHost, Text,
     TextStyle,
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use terra_chunk_generation::{ChunkTicket, WorldHeight};
 use terra_server::autoteleport::{self, AutoTeleports, Transition, TransitionEnd};
-use terra_server::bridge::{self, BridgeDelivery, PendingArrivals};
+use terra_server::bridge::{self, BridgeDelivery, DeliveryDecision, PendingArrivals, ServerName, ServerNameAnswer};
 use terra_server::messages::ChatMessage;
 use terra_server::updates::{UpdateChecker, UpdateStatus, notification_spans};
 use terra_server::{LinkedWorldsMethod, TeleportWorld, parse_tpll_arguments};
@@ -30,16 +30,10 @@ const ARRIVAL_LIFETIME: Duration = Duration::from_secs(120);
 /// Ticks after a level change during which the landing spot is checked and motion restored.
 const SETTLE_TICKS: u64 = 40;
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Method SERVER state, shared with the payload handlers Horizon owns.
 pub struct ProxyBridge {
-    /// This server's name, from the proxy's `GetServer` answer (set once, as upstream).
-    proxy_name: Mutex<Option<String>>,
-    /// `linked_worlds.server_name`, known before the proxy answers.
-    configured_name: Mutex<Option<String>>,
+    /// This server's name: `linked_worlds.server_name`, else the proxy's `GetServer` answer.
+    name: Mutex<ServerName>,
     arrivals: Mutex<PendingArrivals>,
     /// Players to ask the proxy about, with the tick to do it at.
     get_server_due: Mutex<Vec<(u128, u64)>>,
@@ -47,26 +41,28 @@ pub struct ProxyBridge {
 
 impl Default for ProxyBridge {
     fn default() -> Self {
-        Self { proxy_name: Mutex::new(None), configured_name: Mutex::new(None), arrivals: Mutex::new(PendingArrivals::new(MAX_ARRIVALS, ARRIVAL_LIFETIME)), get_server_due: Mutex::default() }
+        Self { name: Mutex::default(), arrivals: Mutex::new(PendingArrivals::new(MAX_ARRIVALS, ARRIVAL_LIFETIME)), get_server_due: Mutex::default() }
     }
 }
 
 impl ProxyBridge {
     pub fn configure(&self, configured: Option<String>) {
-        *lock(&self.configured_name) = configured;
+        lock(&self.name).configure(configured);
     }
 
-    /// `Terraplusminus.getRegisteredServerName`, with the configured name until the proxy answers.
+    /// `Terraplusminus.getRegisteredServerName`: the configured name, else the proxy's answer.
     pub fn server_name(&self) -> Option<String> {
-        lock(&self.proxy_name).clone().or_else(|| lock(&self.configured_name).clone())
+        lock(&self.name).name().map(str::to_owned)
     }
 
     pub fn status_line(&self) -> String {
-        let proxy = lock(&self.proxy_name).clone();
-        let configured = lock(&self.configured_name).clone();
+        let (current, proxy, configured) = {
+            let name = lock(&self.name);
+            (name.name().map(str::to_owned), name.proxy().map(str::to_owned), name.configured().map(str::to_owned))
+        };
         format!(
             "linked server: {} (proxy: {}, configured: {}), {} arrival(s) waiting",
-            self.server_name().unwrap_or_else(|| "unknown".into()),
+            current.unwrap_or_else(|| "unknown".into()),
             proxy.unwrap_or_else(|| "no answer yet".into()),
             configured.unwrap_or_else(|| "none".into()),
             lock(&self.arrivals).len()
@@ -76,8 +72,11 @@ impl ProxyBridge {
     /// `PlayerJoinEvent`: ask for the server name 20 ticks later while it is unknown, and run a
     /// `/tpll` the proxy announced before the player arrived.
     pub fn joined(&self, host: &mut dyn ServerHost, uuid: u128, tick: u64) {
-        if lock(&self.proxy_name).is_none() {
-            lock(&self.get_server_due).push((uuid, tick + bridge::GET_SERVER_DELAY_TICKS));
+        if lock(&self.name).wanted() {
+            let mut due = lock(&self.get_server_due);
+            if !due.iter().any(|(player, _)| *player == uuid) {
+                due.push((uuid, tick + bridge::GET_SERVER_DELAY_TICKS));
+            }
         }
         let parked = lock(&self.arrivals).take(uuid, Instant::now());
         if let Some(coordinates) = parked {
@@ -87,6 +86,7 @@ impl ProxyBridge {
 
     pub fn left(&self, uuid: u128) {
         lock(&self.get_server_due).retain(|(player, _)| *player != uuid);
+        lock(&self.name).forget(uuid);
     }
 
     /// Sends the due `GetServer` requests (`Bukkit.getScheduler().runTaskLater(..., 20)`).
@@ -101,45 +101,69 @@ impl ProxyBridge {
             due.into_iter().map(|(uuid, _)| uuid).collect()
         };
         for uuid in due {
-            if lock(&self.proxy_name).is_some() {
+            if !lock(&self.name).wanted() {
                 return;
             }
             let Some(player) = host.player(uuid) else { continue };
             log("Sending plugin message to BungeeCord to get server name.");
-            if let Err(error) = player.send_payload(host, &PayloadId(bridge::BUNGEECORD_CHANNEL.into()), PayloadBytes(bridge::get_server_request())) {
-                log(&format!("could not ask the proxy for this server's name: {error:?}"));
+            match player.send_payload(host, &PayloadId(bridge::BUNGEECORD_CHANNEL.into()), PayloadBytes(bridge::get_server_request())) {
+                Ok(_) => lock(&self.name).asked(uuid),
+                Err(error) => log(&format!("could not ask the proxy for this server's name: {error:?}")),
             }
         }
     }
 
-    fn deliver(&self, host: &mut dyn ServerHost, delivery: BridgeDelivery) {
-        // Anyone connected can write on a raw channel, so only plain coordinates are accepted:
-        // never `-p` or a selector, which would run as the target player.
+    /// A teleport announced on the bridge channel, carried by `carrier`'s connection. Anyone
+    /// connected can write on a raw channel (see `terra_server::bridge`, "Trust").
+    fn deliver(&self, host: &mut dyn ServerHost, delivery: BridgeDelivery, carrier: Option<u128>) {
+        // Only plain coordinates: never `-p` or a selector, which would run as the target player.
         let coordinates = delivery.coordinates.trim();
-        if coordinates.starts_with('-') || coordinates.chars().any(char::is_control) || parse_tpll_arguments(coordinates).is_none() {
-            return log(&format!("ignored a teleport bridge message with invalid coordinates `{}`", delivery.coordinates.escape_debug()));
+        if coordinates.len() > MAX_COORDINATES_LENGTH || coordinates.starts_with('-') || coordinates.chars().any(char::is_control) || parse_tpll_arguments(coordinates).is_none() {
+            return log(&format!("ignored a teleport bridge message with invalid coordinates `{}`", truncate_for_log(&delivery.coordinates)));
         }
-        if host.player(delivery.uuid).is_some() {
-            run_tpll_as(host, delivery.uuid, coordinates);
-        } else {
-            // The proxy sends this as it hands the player over; they usually are not here yet.
-            lock(&self.arrivals).park(delivery.uuid, coordinates.to_owned(), Instant::now());
+        match bridge::decide_delivery(delivery.uuid, host.player(delivery.uuid).is_some(), carrier) {
+            DeliveryDecision::RunNow => run_tpll_as(host, delivery.uuid, coordinates),
+            DeliveryDecision::Park => {
+                // The proxy sends this as it hands the player over; they usually are not here yet.
+                if !lock(&self.arrivals).park(delivery.uuid, coordinates.to_owned(), carrier, Instant::now()) {
+                    log("ignored a teleport bridge message: its connection has too many announcements waiting");
+                }
+            }
+            DeliveryDecision::Reject(reason) => log(&format!("ignored a teleport bridge message: {reason}")),
         }
     }
 
-    fn registered(&self, name: String) {
-        let mut proxy = lock(&self.proxy_name);
-        if proxy.is_some() {
-            return;
+    fn registered(&self, name: String, carrier: Option<u128>) {
+        if name.len() > MAX_SERVER_NAME_LENGTH || name.chars().any(char::is_control) {
+            return log(&format!("ignored a GetServer answer with an invalid name `{}`", truncate_for_log(&name)));
         }
-        if let Some(configured) = lock(&self.configured_name).as_ref()
-            && !configured.eq_ignore_ascii_case(&name)
-        {
-            log(&format!("the proxy calls this server `{name}`, not `{configured}` (linked_worlds.server_name); using the proxy's name"));
+        let answer = lock(&self.name).answer(name, carrier);
+        match answer {
+            ServerNameAnswer::Registered(name) => log(&format!("Registered server name: {name}")),
+            ServerNameAnswer::Mismatch { proxy, configured } => {
+                log(&format!("the proxy calls this server `{proxy}`, not `{configured}` (linked_worlds.server_name); keeping the configured name"));
+            }
+            ServerNameAnswer::Ignored => {}
+            ServerNameAnswer::Unsolicited => log("ignored a GetServer answer that was not asked for on that connection"),
         }
-        log(&format!("Registered server name: {name}"));
-        *proxy = Some(name);
     }
+}
+
+/// `<lat> <lng> [height]` never needs more; longer bridge payloads are refused unparsed.
+const MAX_COORDINATES_LENGTH: usize = 256;
+/// Proxy server names are short identifiers.
+const MAX_SERVER_NAME_LENGTH: usize = 128;
+
+/// Untrusted text for a log line: escaped and at most 80 characters.
+fn truncate_for_log(text: &str) -> String {
+    let shown: String = text.chars().take(80).collect();
+    let more = if text.chars().count() > 80 { "..." } else { "" };
+    format!("{}{more}", shown.escape_debug())
+}
+
+/// The UUID of the player whose connection carried a payload, on the main thread.
+fn carrier_uuid(host: &mut dyn ServerHost, carrier: Option<PlayerRef>) -> Option<u128> {
+    carrier.and_then(|player| player.entity().uuid(host))
 }
 
 /// `player.performCommand("tpll " + coordinates)`: the player runs it with their own rights.
@@ -183,8 +207,15 @@ impl IPayloadHandler for TeleportBridgeHandler {
             log("Failed to read plugin message on terraplusminus:teleportbridge");
             return Ok(());
         };
+        let carrier = context.player().ok();
         let state = Arc::clone(&self.0);
-        on_main_thread(context, Arc::new(move |host| state.deliver(host, delivery.clone())))
+        on_main_thread(
+            context,
+            Arc::new(move |host| {
+                let carrier = carrier_uuid(host, carrier);
+                state.deliver(host, delivery.clone(), carrier)
+            }),
+        )
     }
 }
 
@@ -192,11 +223,17 @@ impl IPayloadHandler for TeleportBridgeHandler {
 pub struct BungeeCordHandler(pub Arc<ProxyBridge>);
 
 impl IPayloadHandler for BungeeCordHandler {
-    fn handle(&self, payload: PayloadBytes, _: &mut dyn IPayloadContext) -> Result<(), PayloadHandleError> {
-        if let Some(name) = bridge::parse_get_server(&payload.0) {
-            self.0.registered(name);
-        }
-        Ok(())
+    fn handle(&self, payload: PayloadBytes, context: &mut dyn IPayloadContext) -> Result<(), PayloadHandleError> {
+        let Some(name) = bridge::parse_get_server(&payload.0) else { return Ok(()) };
+        let carrier = context.player().ok();
+        let state = Arc::clone(&self.0);
+        on_main_thread(
+            context,
+            Arc::new(move |host| {
+                let carrier = carrier_uuid(host, carrier);
+                state.registered(name.clone(), carrier)
+            }),
+        )
     }
 }
 
@@ -299,7 +336,9 @@ impl LevelTransitions {
     /// teleport to the next tick so the move being validated is not disturbed.
     pub fn on_move(&mut self, host: &mut dyn ServerHost, shared: &Shared, uuid: u128, to: [f64; 3], rotation: [f32; 2]) {
         let config = shared.stack.config();
-        if !config.linked_worlds.levels_active() || self.active.contains_key(&uuid) {
+        // A move to a non-finite spot (a broken client or engine bug) never starts a transition:
+        // the destination would carry the NaN over to the other level.
+        if !config.linked_worlds.levels_active() || self.active.contains_key(&uuid) || !to.iter().all(|axis| axis.is_finite()) || !rotation.iter().all(|angle| angle.is_finite()) {
             return;
         }
         let Some(player) = host.player(uuid) else { return };

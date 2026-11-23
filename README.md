@@ -15,7 +15,8 @@ What works and is tested here:
 
 - Projections (BTE conformal Dymaxion, Dymaxion, Web Mercator, transforms) and Tissot's
   indicatrix, compared against the Java oracle.
-- Elevation datasets, terrarium decoding and all four blend modes, matching upstream bit for bit
+- Elevation datasets, terrarium decoding and the three blend modes (`NEAR`, `LINEAR`,
+  `CUBIC`; upstream has no other), matching upstream bit for bit
   on the recorded fixtures.
 - GeoTIFF layers (classic TIFF and BigTIFF; none, LZW, Deflate and PackBits compression;
   predictors 2 and 3) and upstream's parser chain (`add`, `multiply`, `divide`, flips, axis swap)
@@ -57,6 +58,60 @@ What is not done:
     where Commons Imaging misreads the strip offset.
 
 The per-feature status is in [docs/feature-matrix.md](docs/feature-matrix.md).
+
+## Security and robustness
+
+Everything that comes from outside the server is treated as hostile: tile servers, mirrors, the
+release feed, proxy messages, player commands and the configuration file. None of it can crash
+the server, make it allocate without bound, block it forever or run a command. The rules:
+
+- **Decoders** (PNG, JPEG, TIFF/BigTIFF, Deflate/gzip/zlib, relaxed JSON, GeoJSON) bound every
+  allocation before making it. PNG and JPEG images are at most 4096 × 4096 pixels. TIFFs are
+  capped in pixels, strips, field sizes and decoded bytes (`TiffLimits`). Tiles are at most
+  16 MiB (`MAX_TILE_BYTES`). Inflated output and JSON nesting are capped. Any arithmetic on decoded samples
+  wraps the way Java's `int` does instead of overflowing.
+- **Network.** The plain HTTP client accepts only `http://host[:port]/path` with a strictly
+  checked host, port and path, so no URL can inject a header or split the request line. Every
+  request has a total deadline, which a slow ("dripping") server cannot extend, and caps on
+  header and body size. `https://` goes through `curl` with `-q` (no `.curlrc`), no shell,
+  `--proto =https --proto-redir =https`, at most 5 redirects, `--max-time` and `--max-filesize`.
+  curl itself runs under a watchdog that kills it on timeout or when its output passes the cap
+  (`run_bounded`). The `User-Agent` must be printable ASCII.
+- **Disk cache.** Entries are size-capped on read and on write. Symlinks and anything that is not
+  a regular file are deleted as corrupt, and partial files are created exclusively.
+- **OpenStreetMap.** Reference keys are whitelisted (no `..`, no absolute paths), reference
+  chains are cut at 16 levels and on cycles. A resource holds at most
+  `MAX_ELEMENTS_PER_RESOURCE` elements, its references included, so a tile that references the
+  same file thousands of times cannot exhaust memory.
+- **Proxy bridge (linked worlds).** A teleport delivered by the proxy runs only when it arrives
+  through the target player's own connection. For a player not online yet it is parked, at most
+  16 per carrying connection. Coordinates are at most 256 characters with no control characters
+  and must parse. A server-name answer counts only from a connection that was asked, only the
+  first one, at most 128 characters; a configured `linked_worlds.server_name` always wins.
+- **`/tpll`.** A non-finite height is a usage error. A point that projects to NaN or farther than
+  30,000,000 blocks is "outside the projection". Upstream's acceptance of a presumed swapped
+  pair (latitude up to 180) is kept, and the projection then rejects it.
+- **Auto-teleport.** Non-finite positions, rotations and velocities never start or carry over a
+  transition. Speed is capped.
+- **Update check.** URLs with whitespace or control characters are refused. `file://` reads are
+  size-capped, and the tag shown in chat must be at most 64 characters of `[A-Za-z0-9._+-]`.
+- **Code.** `unsafe` is forbidden, and `unwrap`, `expect` and `panic!` are denied outside tests,
+  in the mod as well as the crates.
+
+The tests that hold these rules:
+
+- `crates/terra-codec/tests/fuzz_decoders.rs` mutates valid seeds through every decoder.
+  `TERRA_FUZZ_SCALE=<n>` multiplies the case counts (the default runs in seconds; `400` runs
+  millions of cases). `TERRA_FUZZ_DUMP=<dir>` writes each crashing input there.
+- Every input that ever crashed a decoder is kept in `crates/terra-codec/tests/regressions/`
+  (listed in its `README.md`) and replayed through every decoder by `tests/regressions.rs`.
+- `crates/terra-server/tests/hostile_inputs.rs` covers bridge payloads, `/tpll` arguments,
+  release documents and configuration text.
+- `crates/terra-elevation/tests/hostile_inputs.rs` covers dataset configurations and tiles through
+  every parser chain.
+- `crates/terra-osm/tests/fuzz_pipeline.rs` covers the GeoJSON and mapping pipeline.
+- The HTTP and curl response parsers are tested in-module.
+- `crates/terra-acquisition/tests/loopback_http.rs` runs against misbehaving local servers.
 
 ## Repository layout
 

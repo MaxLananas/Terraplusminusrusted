@@ -89,23 +89,61 @@ pub struct PlainHttpTransport {
 }
 
 struct ParsedUrl<'a> {
+    /// As written in the URL, brackets included for IPv6: what the `Host` header carries.
     host: &'a str,
+    /// What to resolve or connect to: `host` without IPv6 brackets.
+    address: &'a str,
     port: u16,
     path: &'a str,
 }
 
+/// `http://host[:port][/path]`, nothing else. Everything written into the request line or the
+/// `Host` header is checked here, so a configured or redirected URL cannot smuggle a header
+/// (CR, LF), split the request line (space) or address another host than it shows (`@`,
+/// unbracketed IPv6, a fragment or query in the authority).
 fn parse_http_url(url: &str) -> Result<ParsedUrl<'_>, TransportError> {
     let unsupported = || TransportError::UnsupportedUrl(url.to_owned());
     let rest = url.strip_prefix("http://").ok_or_else(unsupported)?;
     let (authority, path) = rest.find('/').map_or((rest, "/"), |index| (&rest[..index], &rest[index..]));
-    if authority.is_empty() || authority.contains('@') || path.bytes().any(|b| b <= b' ' || b == 0x7F) {
+    if !path.bytes().all(|b| b.is_ascii_graphic()) || path.contains('#') {
         return Err(unsupported());
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.contains(']') || host.ends_with(']') => (host, port.parse().map_err(|_| unsupported())?),
-        _ => (authority, 80),
+    let (host, address, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port`, and the address must really be IPv6.
+        let (inner, after) = bracketed.split_once(']').ok_or_else(unsupported)?;
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(unsupported());
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':').ok_or_else(unsupported)?),
+        };
+        (&authority[..inner.len() + 2], inner, port)
+    } else {
+        let (host, port) = authority.split_once(':').map_or((authority, None), |(host, port)| (host, Some(port)));
+        // A registered name or IPv4 literal: letters, digits, `-`, `.` and `_` only.
+        if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_')) {
+            return Err(unsupported());
+        }
+        (host, host, port)
     };
-    Ok(ParsedUrl { host, port, path })
+    let port = match port {
+        None => 80,
+        Some(digits) if !digits.is_empty() && digits.len() <= 5 && digits.bytes().all(|b| b.is_ascii_digit()) => match digits.parse::<u16>() {
+            Ok(0) | Err(_) => return Err(unsupported()),
+            Ok(port) => port,
+        },
+        Some(_) => return Err(unsupported()),
+    };
+    Ok(ParsedUrl { host, address, port, path })
+}
+
+/// The `User-Agent` actually sent: the configured one when it is a valid header value (visible
+/// ASCII and spaces, at most 256 bytes), else the default. The configuration already refuses
+/// bad values; this keeps a transport built directly from code from writing a header break.
+pub(crate) fn effective_user_agent(configured: &str) -> &str {
+    let valid = !configured.trim().is_empty() && configured.len() <= 256 && configured.bytes().all(|b| b == b' ' || b.is_ascii_graphic());
+    if valid { configured } else { DEFAULT_USER_AGENT }
 }
 
 /// Time left before `deadline`, or `Timeout` when none is.
@@ -184,7 +222,7 @@ impl HttpTransport for PlainHttpTransport {
     fn get(&self, url: &str, limits: &TransportLimits) -> Result<HttpResponse, TransportError> {
         let parsed = parse_http_url(url)?;
         let deadline = Instant::now() + limits.total_timeout;
-        let addresses = resolve(parsed.host.trim_start_matches('[').trim_end_matches(']'), parsed.port, deadline)?;
+        let addresses = resolve(parsed.address, parsed.port, deadline)?;
         let mut last_error = TransportError::Connect(format!("no address for {}", parsed.host));
         let mut stream = None;
         for address in addresses {
@@ -198,7 +236,7 @@ impl HttpTransport for PlainHttpTransport {
             }
         }
         let mut stream = DeadlineStream { inner: stream.ok_or(last_error)?, deadline, io_timeout: limits.io_timeout };
-        let agent = if self.user_agent.is_empty() { DEFAULT_USER_AGENT } else { &self.user_agent };
+        let agent = effective_user_agent(&self.user_agent);
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
             parsed.path,
@@ -309,6 +347,56 @@ fn read_body(reader: &mut impl BufRead, headers: &[(String, String)], limit: u64
 mod tests {
     use super::*;
 
+    /// Hostile servers: mutated responses (status lines, header sizes, chunk sizes, lengths,
+    /// truncation) must give a response or an error within the limits, never a panic or a body
+    /// over the limit, and curl's output parser likewise.
+    #[test]
+    fn mutated_responses_never_panic_or_exceed_limits() {
+        let seeds: [&[u8]; 5] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nRetry-After: 3\r\n\r\nhello",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;x=y\r\nde\r\n0\r\nTrailer: 1\r\n\r\n",
+            b"HTTP/1.0 404 Not Found\r\n\r\n",
+            b"HTTP/1.1 503 Busy\r\nRetry-After: 120\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\nuntil the end",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..30_000 {
+            let mut bytes = seeds[case % seeds.len()].to_vec();
+            for _ in 0..1 + next() % 6 {
+                let at = (next() as usize) % bytes.len().max(1);
+                match next() % 6 {
+                    0 if !bytes.is_empty() => bytes[at] ^= 1 << (next() % 8),
+                    1 if !bytes.is_empty() => bytes[at] = b"0f9\r\n: ;-x"[(next() % 10) as usize],
+                    2 if !bytes.is_empty() => {
+                        bytes.remove(at);
+                    }
+                    3 => bytes.insert(at.min(bytes.len()), next() as u8),
+                    4 => bytes.truncate(at),
+                    _ => {
+                        let digits = format!("{:x}", next() >> (next() % 64));
+                        bytes.splice(at.min(bytes.len())..at.min(bytes.len()), digits.bytes());
+                    }
+                }
+            }
+            let mut reader = bytes.as_slice();
+            if let Ok((_, headers)) = read_head(&mut reader, 256)
+                && let Ok(body) = read_body(&mut reader, &headers, 64)
+            {
+                assert!(body.len() <= 64, "case {case}: {} bytes", body.len());
+            }
+            // The same bytes as curl output with an arbitrary size trailer.
+            let mut curl = bytes.clone();
+            curl.extend_from_slice(format!("\n{} {}", next() % 200, next() % 200).as_bytes());
+            let _ = crate::external::parse_curl_output(&curl, 256);
+        }
+    }
+
     #[test]
     fn parses_urls_and_refuses_others() {
         let parsed = parse_http_url("http://127.0.0.1:8080/a/b.png").unwrap();
@@ -316,6 +404,51 @@ mod tests {
         assert_eq!(parse_http_url("http://example.org").unwrap().path, "/");
         for url in ["https://example.org/x", "http://user@host/x", "http://host/a b", "ftp://x", "http:///x"] {
             assert!(parse_http_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn hostile_authorities_are_refused() {
+        let ipv6 = parse_http_url("http://[::1]:8080/t.png").unwrap();
+        assert_eq!((ipv6.host, ipv6.address, ipv6.port, ipv6.path), ("[::1]", "::1", 8080, "/t.png"));
+        let ipv6 = parse_http_url("http://[2001:db8::7]").unwrap();
+        assert_eq!((ipv6.host, ipv6.address, ipv6.port), ("[2001:db8::7]", "2001:db8::7", 80));
+        assert_eq!(parse_http_url("http://tiles.example-1.org:81/a?x=1").unwrap().port, 81);
+        for url in [
+            "http://host\r\nX-Injected: 1/x",
+            "http://host\n/x",
+            "http://ho st/x",
+            "http://host:80\r\n/x",
+            "http://host/x\r\nX: y",
+            "http://host/x\ty",
+            "http://host/x#frag",
+            "http://host/caf\u{e9}",
+            "http://h\u{f6}st/x",
+            "http://host?x=1",
+            "http://host#x",
+            "http://::1/x",
+            "http://[::1/x",
+            "http://[::1]x/x",
+            "http://[::1]:/x",
+            "http://[example.org]/x",
+            "http://host:/x",
+            "http://host:0/x",
+            "http://host:65536/x",
+            "http://host:+80/x",
+            "http://host:080080/x",
+            "http://host:1:2/x",
+            "http://:80/x",
+            "http://a@b/x",
+        ] {
+            assert!(parse_http_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn user_agents_that_would_break_the_header_fall_back_to_the_default() {
+        assert_eq!(effective_user_agent("Agent/1 (+https://x)"), "Agent/1 (+https://x)");
+        for bad in ["", "   ", "a\r\nX-Injected: 1", "a\nb", "tab\there", "caf\u{e9}", &"x".repeat(257)] {
+            assert_eq!(effective_user_agent(bad), DEFAULT_USER_AGENT, "{bad:?}");
         }
     }
 

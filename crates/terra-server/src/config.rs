@@ -13,7 +13,7 @@ use terra_elevation::UnsupportedLayerPolicy;
 pub struct NetworkConfig {
     /// URL prefix to local directory; checked before any network access.
     pub mirrors: Vec<(String, PathBuf)>,
-    /// Hosts whose `https://` URLs may be fetched over plain HTTP (no TLS transport is built in).
+    /// Hosts whose `https://` URLs are fetched over plain HTTP instead of through curl.
     pub plain_http_hosts: Vec<String>,
     pub cache_directory: Option<PathBuf>,
     pub cache_max_bytes: u64,

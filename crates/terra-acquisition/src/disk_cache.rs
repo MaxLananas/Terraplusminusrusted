@@ -15,6 +15,8 @@ use terra_elevation::{ElevationError, FetchOutcome, TileFetcher};
 pub const CACHE_FORMAT_VERSION: &str = "v1";
 const MAGIC: &[u8; 6] = b"TPMC1\n";
 const ENTRY_EXTENSION: &str = "tile";
+/// The largest entry `put` writes: a tile at the transport limit, a long URL and the framing.
+const MAX_ENTRY_BYTES: u64 = terra_elevation::provider::MAX_TILE_BYTES + (64 << 10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskCacheLimits {
@@ -240,13 +242,18 @@ impl DiskCache {
         }
     }
 
-    /// Reads at most the byte budget: a larger file was not written by this cache and is
-    /// returned truncated, which fails its CRC and is discarded as corrupt.
+    /// Reads at most the largest entry this cache writes (one tile, its URL and the framing,
+    /// within the byte budget): a larger file was not written by this cache and is returned
+    /// truncated, which fails its CRC and is discarded as corrupt. A symbolic link or anything
+    /// but a regular file reads as corrupt too.
     fn read_entry(&self, path: &Path) -> Option<Vec<u8>> {
         use std::io::Read;
+        if !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return Some(Vec::new());
+        }
         let file = fs::File::open(path).ok()?;
         let mut bytes = Vec::new();
-        file.take(self.limits.max_bytes.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+        file.take(MAX_ENTRY_BYTES.min(self.limits.max_bytes).saturating_add(1)).read_to_end(&mut bytes).ok()?;
         Some(bytes)
     }
 
@@ -263,12 +270,13 @@ impl DiskCache {
     pub fn put(&self, url: &str, outcome: &FetchOutcome) -> std::io::Result<()> {
         let key = cache_key(url);
         let bytes = encode_entry(url, outcome);
-        if bytes.len() as u64 > self.limits.max_bytes {
+        if bytes.len() as u64 > self.limits.max_bytes.min(MAX_ENTRY_BYTES) {
             return Ok(());
         }
         let partial = self.directory.join("partial").join(format!("{key}.{}.{}", std::process::id(), self.temp_counter.fetch_add(1, Ordering::Relaxed)));
         let result = (|| {
-            let mut file = fs::File::create(&partial)?;
+            // `create_new`: never through a link or file planted at the temporary name.
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&partial)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             let target = self.entry_path(&key);
@@ -473,6 +481,29 @@ mod tests {
         assert_eq!(cache.get("http://a/1"), None);
         assert_eq!(cache.statistics().corrupt_entries, 1);
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A link planted at an entry's path (pointing at a file outside the cache) is neither read
+    /// nor followed when the entry is discarded: only the link goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_in_place_of_an_entry_is_discarded_not_followed() {
+        let root = scratch("symlink");
+        let cache = DiskCache::open(&root, DiskCacheLimits::default()).unwrap();
+        cache.put("http://a/1", &FetchOutcome::Found(vec![1; 10])).unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, encode_entry("http://a/1", &FetchOutcome::Found(b"planted".to_vec()))).unwrap();
+        let path = cache.entry_path(&cache_key("http://a/1"));
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert_eq!(cache.get("http://a/1"), None, "the planted entry must not be served");
+        assert!(fs::symlink_metadata(&path).is_err(), "the link is removed");
+        assert!(outside.exists(), "its target is untouched");
+        // Reopening skips links too.
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let reopened = DiskCache::open(&root, DiskCacheLimits::default()).unwrap();
+        assert_eq!(reopened.statistics().entries, 0);
         fs::remove_dir_all(root).unwrap();
     }
 

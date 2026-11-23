@@ -264,10 +264,7 @@ fn parse_projection(value: &JsonValue, depth: usize) -> Result<SharedProjection,
 
 fn parse_blend(dataset: &JsonValue) -> Result<BlendMode, String> {
     match dataset.get("blend").and_then(JsonValue::as_str) {
-        Some("NEAR") => Ok(BlendMode::Near),
-        Some("LINEAR") => Ok(BlendMode::Linear),
-        Some("CUBIC") => Ok(BlendMode::Cubic),
-        Some(other) => Err(format!("unknown blend mode `{other}`")),
+        Some(name) => BlendMode::from_name(name).ok_or_else(|| format!("unknown blend mode `{name}`")),
         None => Err("missing `blend`".into()),
     }
 }

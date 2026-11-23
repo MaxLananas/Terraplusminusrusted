@@ -72,11 +72,11 @@ const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_GDAL_NODATA: u16 = 42113;
 
-fn invalid(reason: &'static str) -> DecodeError {
+pub(crate) fn invalid(reason: &'static str) -> DecodeError {
     DecodeError::InvalidTiff(reason)
 }
 
-fn unsupported(reason: impl Into<String>) -> DecodeError {
+pub(crate) fn unsupported(reason: impl Into<String>) -> DecodeError {
     DecodeError::UnsupportedTiff(reason.into())
 }
 

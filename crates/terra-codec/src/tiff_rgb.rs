@@ -20,7 +20,7 @@
 
 use crate::error::DecodeError;
 use crate::png::PngImage;
-use crate::tiff::{Directory, Reader, TiffLimits, decompress, limit_exceeded, read_directories_limited};
+use crate::tiff::{Directory, Reader, TiffLimits, decompress, invalid, limit_exceeded, read_directories_limited, unsupported};
 
 const TAG_WIDTH: u16 = 256;
 const TAG_HEIGHT: u16 = 257;
@@ -41,14 +41,6 @@ const TAG_TILE_OFFSETS: u16 = 324;
 const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
-
-fn invalid(reason: &'static str) -> DecodeError {
-    DecodeError::InvalidTiff(reason)
-}
-
-fn unsupported(reason: impl Into<String>) -> DecodeError {
-    DecodeError::UnsupportedTiff(reason.into())
-}
 
 /// `PhotometricInterpreter*`: one pixel's samples (already narrowed to bytes) to ARGB.
 enum Interpreter {
@@ -73,7 +65,8 @@ impl Interpreter {
     fn pixel(&self, samples: &[i32]) -> u32 {
         match self {
             Self::Gray { invert } => {
-                let sample = if *invert { 255 - samples[0] } else { samples[0] };
+                // Java `int` arithmetic: a sample wrapped by the predictor wraps here too.
+                let sample = if *invert { 255i32.wrapping_sub(samples[0]) } else { samples[0] };
                 (0xFF_i32 << 24 | sample.wrapping_shl(16) | sample.wrapping_shl(8) | sample) as u32
             }
             Self::Rgb => (0xFF_i32 << 24 | samples[0].wrapping_shl(16) | samples[1].wrapping_shl(8) | samples[2]) as u32,

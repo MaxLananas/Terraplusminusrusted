@@ -107,15 +107,25 @@ pub const MAX_TILE_BYTES: u64 = 16 << 20;
 
 impl TileFetcher for MirrorFetcher {
     fn fetch(&self, url: &str) -> Result<FetchOutcome, ElevationError> {
+        use std::io::Read;
         let path = self.resolve(url)?;
         let failed = |reason: String| ElevationError::Fetch { url: url.to_owned(), reason };
-        match std::fs::metadata(&path) {
+        let file = match std::fs::File::open(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(FetchOutcome::Missing),
             Err(error) => return Err(failed(error.to_string())),
-            Ok(metadata) if metadata.len() > MAX_TILE_BYTES => return Err(failed(format!("{} bytes exceeds limit", metadata.len()))),
-            Ok(_) => {}
+            Ok(file) => file,
+        };
+        if !file.metadata().map_err(|error| failed(error.to_string()))?.is_file() {
+            return Err(failed("not a regular file".into()));
         }
-        std::fs::read(&path).map(FetchOutcome::Found).map_err(|error| failed(error.to_string()))
+        // The size is enforced on what is read, not on what the file claimed when opened: a file
+        // growing meanwhile (or a device) cannot exceed the limit.
+        let mut bytes = Vec::new();
+        file.take(MAX_TILE_BYTES + 1).read_to_end(&mut bytes).map_err(|error| failed(error.to_string()))?;
+        if bytes.len() as u64 > MAX_TILE_BYTES {
+            return Err(failed(format!("more than {MAX_TILE_BYTES} bytes exceeds limit")));
+        }
+        Ok(FetchOutcome::Found(bytes))
     }
 }
 

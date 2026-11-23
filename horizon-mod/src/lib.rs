@@ -14,7 +14,10 @@
 //! nothing, and the chunk is neither published nor saved, so a later run generates it properly.
 //! Returning normally would publish whatever the chunk holds, and an engine-side terrain error
 //! is turned into an empty chunk, so neither is used.
-#![deny(unsafe_code)]
+// The workspace's lints, which this package (outside the workspace) does not inherit: no unsafe
+// code, and no way to panic by accident in a hook that runs on the server tick.
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo, clippy::unimplemented, clippy::dbg_macro)]
 
 mod linked;
 
@@ -310,6 +313,8 @@ fn player_level(host: &dyn Host, levels: &[LevelPlan], player: PlayerRef) -> Opt
         .map(|level| level.id.clone())
 }
 
+/// A poisoned lock still guards consistent state here (every critical section is a plain
+/// read or replace), so a panic elsewhere must not take the whole mod down with it.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

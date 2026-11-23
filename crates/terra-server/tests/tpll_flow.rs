@@ -127,3 +127,43 @@ fn the_exclusive_top_of_the_world_is_a_valid_feet_position() {
     let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 -63", PLAYER, &world).1 else { panic!() };
     assert_eq!(y, -63.0);
 }
+
+/// Java parses `NaN` and `Infinity`; teleporting to them would corrupt the player's position.
+#[test]
+fn non_finite_heights_are_usage_errors() {
+    let linked = r#", "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "terraplusminus:earth", "offset": 0}, {"name": "Terraplusminus:Sky", "offset": -2032}]}"#;
+    let (stack, _) = stack("nonfinite", linked);
+    let world = world(&[(EARTH, 64, 2032), (SKY, 64, 2032)]);
+    for height in ["NaN", "Infinity", "-Infinity", "1e400"] {
+        assert_eq!(start(&stack, &format!("35.995 -113.247 {height}"), PLAYER, &world).1, TpllStep::Usage, "{height}");
+    }
+}
+
+/// A projection that answers NaN (some do outside their outline) or a point past the world's
+/// edge must not become a teleport.
+#[test]
+fn projections_answering_nan_or_far_points_are_outside() {
+    use terra_projection::{GeoCoordinate, GeographicProjection, ProjectedCoordinate, ProjectionResult};
+    #[derive(Debug)]
+    struct Answering(f64);
+    impl GeographicProjection for Answering {
+        fn to_geo(&self, _: ProjectedCoordinate) -> ProjectionResult<GeoCoordinate> {
+            Ok(GeoCoordinate::new(0.0, 0.0))
+        }
+        fn from_geo(&self, _: GeoCoordinate) -> ProjectionResult<ProjectedCoordinate> {
+            Ok(ProjectedCoordinate { x: self.0, y: 0.0 })
+        }
+        fn meters_per_unit(&self) -> f64 {
+            1.0
+        }
+    }
+    let (stack, _) = stack("nanprojection", "");
+    let config = stack.config();
+    let world = world(&[(EARTH, -64, 2032)]);
+    for x in [f64::NAN, f64::INFINITY, 3.1e7, -1e300] {
+        let step = TpllRequest::start("1 2 100", EARTH, &Answering(x), &config.team_bounds, PLAYER, &config.linked_worlds, config.generator.y_offset, &world).1;
+        assert_eq!(step, TpllStep::OutsideProjection, "{x}");
+    }
+    let step = TpllRequest::start("1 2 100", EARTH, &Answering(12.5), &config.team_bounds, PLAYER, &config.linked_worlds, config.generator.y_offset, &world).1;
+    assert!(matches!(step, TpllStep::Teleport { x: 12.5, .. }), "{step:?}");
+}

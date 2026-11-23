@@ -1,7 +1,8 @@
 //! Every decoder on hostile input: byte mutations of real inputs (PNG tiles, gzip/zlib/DEFLATE
 //! streams, TIFF rasters, JSON5 configuration) and synthetic pathological cases. Each call must
 //! return (a value or an error) without panicking, within a time bound and within its output
-//! limit. Seeds are fixed, so failures reproduce.
+//! limit. Seeds are fixed, so failures reproduce. `TERRA_FUZZ_SCALE=<n>` runs n times as many
+//! cases.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -9,8 +10,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use terra_codec::{
-    PngLimits, crc32, TiffLimits, adler32, decode_png, decode_tiff_scalar_limited, gunzip, gunzip_streaming, inflate, inflate_streaming, parse_java_double, parse_relaxed_json,
-    zlib_decompress,
+    JpegLimits, PngLimits, TiffLimits, adler32, crc32, decode_jpeg, decode_png, decode_tiff_argb, decode_tiff_scalar_limited, gunzip, gunzip_streaming, inflate, inflate_streaming,
+    parse_java_double, parse_relaxed_json, zlib_decompress,
 };
 
 const LIMIT: usize = 8 << 20;
@@ -65,8 +66,14 @@ fn mutate(rng: &mut Rng, input: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// `TERRA_FUZZ_SCALE=<n>` multiplies every case count, for a deeper run than the default one.
+fn scale() -> usize {
+    std::env::var("TERRA_FUZZ_SCALE").ok().and_then(|value| value.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
+}
+
 /// Runs `decode` over every mutated case and reports panics and slow cases with their seeds.
 fn fuzz(name: &str, seeds: &[Vec<u8>], cases: usize, seed: u64, decode: impl Fn(&[u8]) -> usize) {
+    let cases = cases * scale();
     let mut rng = Rng(seed);
     let mut failures = Vec::new();
     let mut produced = 0usize;
@@ -79,6 +86,10 @@ fn fuzz(name: &str, seeds: &[Vec<u8>], cases: usize, seed: u64, decode: impl Fn(
             Err(payload) => {
                 let message = payload.downcast_ref::<String>().cloned().or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned())).unwrap_or_default();
                 failures.push(format!("case {case}: panic: {message} (input {} bytes, starts {:02x?})", input.len(), &input[..input.len().min(24)]));
+                // `TERRA_FUZZ_DUMP=<directory>` keeps failing inputs, to turn them into regression tests.
+                if let Ok(directory) = std::env::var("TERRA_FUZZ_DUMP") {
+                    let _ = std::fs::write(PathBuf::from(directory).join(format!("{}-{case}.bin", name.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))), &input);
+                }
             }
         }
         let elapsed = started.elapsed();
@@ -352,6 +363,48 @@ fn tiff_survives_mutation() {
     fuzz("tiff", &seeds, 3000, 0x0bad_c0de_0bad_c0de, |input| match decode_tiff_scalar_limited(input, &limits) {
         Ok(raster) => {
             assert!((raster.width as u64) * (raster.height as u64) <= limits.max_pixels);
+            1
+        }
+        Err(_) => 0,
+    });
+}
+
+/// The oracle's image fixtures (`fixtures/images/input`) whose name ends with one of `extensions`.
+fn image_fixtures(extensions: &[&str]) -> Vec<Vec<u8>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(repository("fixtures/images/input"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.contains(&e)))
+        .collect();
+    paths.sort();
+    paths.into_iter().map(|path| std::fs::read(path).unwrap()).collect()
+}
+
+#[test]
+fn jpeg_survives_mutation() {
+    let seeds = image_fixtures(&["jpg", "jpeg"]);
+    assert!(seeds.len() >= 5, "{} JPEG seeds", seeds.len());
+    let limits = JpegLimits { max_width: 512, max_height: 512 };
+    fuzz("jpeg", &seeds, 4000, 0x1bad_b002_5eed_0001, |input| match decode_jpeg(input, &limits) {
+        Ok(image) => {
+            assert!(image.width <= limits.max_width && image.height <= limits.max_height);
+            assert_eq!(image.argb.len(), image.width as usize * image.height as usize);
+            1
+        }
+        Err(_) => 0,
+    });
+}
+
+#[test]
+fn tiff_argb_survives_mutation() {
+    let mut seeds = image_fixtures(&["tif", "tiff"]);
+    seeds.extend(std::fs::read_dir(repository("fixtures/tiff/cases")).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|e| e == "tif")).map(|path| std::fs::read(path).unwrap()));
+    assert!(seeds.len() >= 40, "{} TIFF seeds", seeds.len());
+    let limits = TiffLimits::for_pixels(256 * 256);
+    fuzz("tiff (ARGB)", &seeds, 6000, 0x7aff_a0eb_0000_0001, |input| match decode_tiff_argb(input, &limits) {
+        Ok(image) => {
+            assert!(u64::from(image.width) * u64::from(image.height) <= limits.max_pixels);
+            assert_eq!(image.argb.len(), image.width as usize * image.height as usize);
             1
         }
         Err(_) => 0,

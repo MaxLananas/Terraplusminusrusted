@@ -28,7 +28,9 @@ fn java_split_space(text: &str) -> Vec<&str> {
 pub fn parse_tpll_arguments(arguments: &str) -> Option<TpllTarget> {
     let parts = java_split_space(arguments);
     if parts.len() >= 3
-        && let Some(height) = parts.last().and_then(|last| parse_java_double(last))
+        // Java parses `NaN` and `Infinity` too; Bukkit then refuses the teleport. A non-finite
+        // height is not a height here either, so the text is read as coordinates only (and fails).
+        && let Some(height) = parts.last().and_then(|last| parse_java_double(last)).filter(|height| height.is_finite())
         && let Some(position) = parse_coordinates(&parts[..parts.len() - 1].join(" "))
     {
         return Some(TpllTarget { position, height: Some(height) });
@@ -151,6 +153,9 @@ fn chunk_of(block: i32) -> i32 {
     block >> 4
 }
 
+/// Minecraft's hard horizontal limit (`Level.MAX_LEVEL_SIZE`); no teleport goes beyond it.
+pub const MAX_HORIZONTAL_BLOCKS: f64 = 30_000_000.0;
+
 impl TpllRequest {
     /// Runs `/tpll` up to the first step needing data or a final decision.
     #[allow(clippy::too_many_arguments)]
@@ -165,8 +170,11 @@ impl TpllRequest {
         world: &dyn TeleportWorld,
     ) -> (Option<Self>, TpllStep) {
         let Some(target) = parse_tpll_arguments(arguments) else { return (None, TpllStep::Usage) };
-        let Ok(block) = projection.from_geo(GeoCoordinate::new(target.position.longitude, target.position.latitude)) else {
-            return (None, TpllStep::OutsideProjection);
+        // Some projections give NaN outside their outline instead of an error (as upstream); a
+        // teleport to NaN or past the world's edge must never be issued.
+        let block = match projection.from_geo(GeoCoordinate::new(target.position.longitude, target.position.latitude)) {
+            Ok(block) if block.x.abs() <= MAX_HORIZONTAL_BLOCKS && block.y.abs() <= MAX_HORIZONTAL_BLOCKS => block,
+            _ => return (None, TpllStep::OutsideProjection),
         };
         let (x, z) = (block.x, block.y);
         if authorization.sender_is_target && !authorization.admin && team_bounds.excludes(target.position) {

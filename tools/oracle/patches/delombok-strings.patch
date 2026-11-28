@@ -1,0 +1,24 @@
+diff -ru a/net/buildtheearth/terraminusminus/util/Strings.java b/net/buildtheearth/terraminusminus/util/Strings.java
+--- a/net/buildtheearth/terraminusminus/util/Strings.java
++++ b/net/buildtheearth/terraminusminus/util/Strings.java
+@@ -10,9 +10,9 @@
+  * @author Smyler
+  */
+ @UtilityClass
+-public class Strings {
++public final class Strings {
+ 
+-    public String[] EMPTY_STRING_ARRAY = new String[0];
++    public static final String[] EMPTY_STRING_ARRAY = new String[0];
+ 
+     /**
+      * Tests whether a {@link String string} is null or empty.
+@@ -20,7 +20,7 @@
+      * @param string a string to test
+      * @return true if the string is either null or the empty string, false otherwise
+      */
+-    public boolean isNullOrEmpty(@Nullable String string) {
++    public static boolean isNullOrEmpty(@Nullable String string) {
+         return string == null || string.isEmpty();
+     }
+ 

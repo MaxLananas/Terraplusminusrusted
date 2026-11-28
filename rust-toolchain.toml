@@ -1,0 +1,6 @@
+# The toolchain this workspace is built and tested with (rustc 1.92.0-nightly caccb4d03 2025-09-24).
+# The Horizon adapter additionally requires the toolchain pinned by the Horizon engine itself.
+[toolchain]
+channel = "nightly-2025-09-25"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

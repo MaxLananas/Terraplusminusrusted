@@ -1,0 +1,11 @@
+[package]
+name = "horizon-mod-api"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "mod_api"
+
+[dependencies]
+horizon-mod-api-stub-macros = { path = "../macros" }

@@ -1,0 +1,453 @@
+//! `DoubleTiledDataset` / `ConfigurableDoubleTiledDataset`: scalar rasters cut into square tiles.
+
+use crate::blend::BlendMode;
+use crate::bounds::{CornerBounds, TilePosition};
+use crate::error::ElevationError;
+use std::collections::HashMap;
+use std::sync::Arc;
+use terra_projection::SharedProjection;
+
+/// Hard ceiling on tiles touched by one grid request. A 16x16 chunk needs at most four tiles at
+/// any supported zoom; anything far larger indicates a degenerate quadrilateral.
+pub const MAX_TILES_PER_REQUEST: u64 = 64;
+
+/// A `DoubleScalarParser` chain: a decoder, optionally wrapped by arithmetic and axis operators.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TileFormat {
+    /// `parse_png_terrarium`.
+    TerrariumPng,
+    /// `parse_tiff` (and the deprecated `parse_tiff_auto`, `parse_tiff_fp`, `parse_tiff_int`):
+    /// single-channel TIFF, values widened from `f32`, the GDAL no-data value becoming `NaN`.
+    Tiff,
+    /// `add`.
+    Add(Box<TileFormat>, f64),
+    /// `multiply`.
+    Multiply(Box<TileFormat>, f64),
+    /// `divide`: multiplies by `1.0 / value`, as upstream.
+    Divide(Box<TileFormat>, f64),
+    /// `flip_x`.
+    FlipX(Box<TileFormat>),
+    /// `flip_z`.
+    FlipZ(Box<TileFormat>),
+    /// `swap_axes`.
+    SwapAxes(Box<TileFormat>),
+    /// `from_int`: an integer parser chain, [`crate::int_format::NO_DATA`] becoming `NaN`.
+    FromInt(Box<crate::int_format::IntFormat>),
+    /// `filter` (this port's extension): values failing the condition become `NaN` before
+    /// blending, so a no-data sentinel (IGN's `-9999` and `-99999`) never leaks into the
+    /// interpolation and lower-priority layers fill the gap instead.
+    Filter(Box<TileFormat>, crate::condition::DoubleCondition),
+}
+
+impl TileFormat {
+    /// `DoubleScalarParser.parse`: a square `resolution` raster, `z * resolution + x`.
+    pub fn parse(&self, bytes: &[u8], resolution: u32) -> Result<Vec<f64>, ElevationError> {
+        let size = resolution as usize;
+        Ok(match self {
+            Self::TerrariumPng => crate::terrarium::decode_terrarium_png(bytes, resolution)?,
+            Self::Tiff => decode_tiff(bytes, resolution)?,
+            Self::Add(inner, value) => inner.parse(bytes, resolution)?.into_iter().map(|sample| sample + value).collect(),
+            Self::Multiply(inner, value) => inner.parse(bytes, resolution)?.into_iter().map(|sample| sample * value).collect(),
+            Self::Divide(inner, value) => {
+                let factor = 1.0 / value;
+                inner.parse(bytes, resolution)?.into_iter().map(|sample| sample * factor).collect()
+            }
+            Self::FlipX(inner) => crate::int_format::flip_x(inner.parse(bytes, resolution)?, size),
+            Self::FlipZ(inner) => crate::int_format::flip_z(inner.parse(bytes, resolution)?, size),
+            Self::SwapAxes(inner) => crate::int_format::swap_axes(inner.parse(bytes, resolution)?, size),
+            Self::FromInt(inner) => {
+                inner.parse(bytes, resolution)?.into_iter().map(|value| if value != crate::int_format::NO_DATA { f64::from(value) } else { f64::NAN }).collect()
+            }
+            Self::Filter(inner, condition) => inner.parse(bytes, resolution)?.into_iter().map(|value| if condition.test(value) { value } else { f64::NAN }).collect(),
+        })
+    }
+}
+
+/// `ParseTiffDSP.parse` and `postProcess`.
+fn decode_tiff(bytes: &[u8], resolution: u32) -> Result<Vec<f64>, ElevationError> {
+    let pixels = u64::from(resolution) * u64::from(resolution);
+    let raster = terra_codec::decode_tiff_scalar(bytes, pixels)?;
+    if raster.width != resolution || raster.height != resolution {
+        return Err(ElevationError::TileDecode(terra_codec::DecodeError::UnsupportedTiff(format!(
+            "invalid image resolution: {}x{} (expected: {resolution}x{resolution})",
+            raster.width, raster.height
+        ))));
+    }
+    let mut values: Vec<f64> = raster.data.iter().map(|&sample| f64::from(sample)).collect();
+    if let Some(text) = &raster.gdal_nodata {
+        // `Double.parseDouble(nodataField.getStringValue())`, compared against the widened floats.
+        let nodata = terra_codec::parse_java_double(text)
+            .ok_or(ElevationError::TileDecode(terra_codec::DecodeError::InvalidTiff("GDAL_NODATA is not a number")))?;
+        for value in &mut values {
+            if *value == nodata {
+                *value = f64::NAN;
+            }
+        }
+    }
+    Ok(values)
+}
+
+pub type Tile = Arc<[f64]>;
+
+#[derive(Debug, Clone)]
+pub struct TiledScalarDataset {
+    /// Stable identifier used in cache keys and diagnostics.
+    pub id: String,
+    pub url_templates: Vec<String>,
+    pub projection: SharedProjection,
+    pub blend: BlendMode,
+    pub format: TileFormat,
+    resolution: u32,
+    shift: u32,
+    /// The zoom of a plain `web_mercator` projection, which makes `${bbox_3857}` computable.
+    web_mercator_zoom: Option<u32>,
+}
+
+/// Half the EPSG:3857 world width: `pi * 6378137` metres.
+const WEB_MERCATOR_HALF_WORLD: f64 = std::f64::consts::PI * 6_378_137.0;
+
+impl TiledScalarDataset {
+    pub fn new(
+        id: String,
+        url_templates: Vec<String>,
+        projection: SharedProjection,
+        resolution: u32,
+        blend: BlendMode,
+        format: TileFormat,
+    ) -> Result<Self, ElevationError> {
+        Self::build(id, url_templates, projection, resolution, blend, format, None)
+    }
+
+    /// As [`TiledScalarDataset::new`] for a plain `web_mercator` projection at `zoom`, whose
+    /// URL templates may also use `${bbox_3857}`.
+    pub fn new_web_mercator(
+        id: String,
+        url_templates: Vec<String>,
+        projection: SharedProjection,
+        zoom: u32,
+        resolution: u32,
+        blend: BlendMode,
+        format: TileFormat,
+    ) -> Result<Self, ElevationError> {
+        Self::build(id, url_templates, projection, resolution, blend, format, Some(zoom))
+    }
+
+    fn build(
+        id: String,
+        url_templates: Vec<String>,
+        projection: SharedProjection,
+        resolution: u32,
+        blend: BlendMode,
+        format: TileFormat,
+        web_mercator_zoom: Option<u32>,
+    ) -> Result<Self, ElevationError> {
+        if resolution == 0 || !resolution.is_power_of_two() || resolution > 4096 {
+            return Err(ElevationError::InvalidConfiguration(format!("given resolution ({resolution}) is not a power of 2!")));
+        }
+        for template in &url_templates {
+            validate_template(template, web_mercator_zoom.is_some())?;
+        }
+        Ok(Self { id, url_templates, projection, blend, format, resolution, shift: resolution.trailing_zeros(), web_mercator_zoom })
+    }
+
+    pub fn resolution(&self) -> u32 {
+        self.resolution
+    }
+
+    /// The tile URLs for `position`, substituting `${x}`, `${z}` and (web Mercator datasets
+    /// only) `${bbox_3857}`.
+    pub fn urls(&self, position: TilePosition) -> Vec<String> {
+        let bbox = self.bbox_3857(position);
+        self.url_templates
+            .iter()
+            .map(|template| {
+                let url = template.replace("${x}", &position.x.to_string()).replace("${z}", &position.z.to_string());
+                match &bbox {
+                    Some(bbox) => url.replace("${bbox_3857}", bbox),
+                    None => url,
+                }
+            })
+            .collect()
+    }
+
+    /// `${bbox_3857}`: the extent to request from a WMS 1.3.0 server in EPSG:3857 metres
+    /// (`minx,miny,maxx,maxy`, easting then northing for this CRS), for `resolution` pixels a
+    /// side. The `web_mercator` projection numbers pixels from the north-west corner of a
+    /// `256 << zoom` pixel world; tile `(x, z)` holds the values for pixel coordinates
+    /// `x * resolution + i` east and `z * resolution + j` south.
+    ///
+    /// Where a value is read depends on the blend: `NEAR` takes value `i` for the whole of
+    /// `[i, i + 1)`, so the request is the tile's own extent (the alignment of GDAL-cut tiles).
+    /// `LINEAR` and `CUBIC` treat value `i` as a sample *at* `i`, so the request is shifted half a
+    /// pixel north-west: a WMS server returns the value at each pixel's centre, and every centre
+    /// then lands exactly on the integer coordinate the interpolation reads it at.
+    fn bbox_3857(&self, position: TilePosition) -> Option<String> {
+        if !self.url_templates.iter().any(|template| template.contains("${bbox_3857}")) {
+            return None;
+        }
+        let zoom = self.web_mercator_zoom?;
+        let metres_per_pixel = 2.0 * WEB_MERCATOR_HALF_WORLD / f64::from(256u32 << zoom);
+        let resolution = f64::from(self.resolution);
+        let tile = resolution * metres_per_pixel;
+        let centring = if self.blend == BlendMode::Near { 0.0 } else { 0.5 };
+        let (x, z) = (f64::from(position.x), f64::from(position.z));
+        // `+ 0.0` turns a negative zero into "0.0000" rather than "-0.0000".
+        let coordinate = |value: f64| format!("{:.4}", value + 0.0);
+        let min_x = (x * resolution - centring) * metres_per_pixel - WEB_MERCATOR_HALF_WORLD;
+        let max_y = WEB_MERCATOR_HALF_WORLD - (z * resolution - centring) * metres_per_pixel;
+        Some(format!("{},{},{},{}", coordinate(min_x), coordinate(max_y - tile), coordinate(min_x + tile), coordinate(max_y)))
+    }
+
+    /// Stage one of `getAsync(CornerBoundingBox2d, ...)`: project the geographic quadrilateral into
+    /// dataset space and list the tiles the blend will read.
+    pub fn plan(&self, geographic: &CornerBounds) -> Result<GridPlan, ElevationError> {
+        let projection = self.projection.as_ref();
+        let local = geographic.from_geo(projection)?;
+        let padded = local.axis_align(projection)?.expand(f64::from(self.blend.size())).validate_projected(projection)?;
+        let size = f64::from(self.resolution);
+        let count = padded.tile_count(size);
+        if count > MAX_TILES_PER_REQUEST {
+            return Err(ElevationError::RequestTooLarge { tiles: count });
+        }
+        Ok(GridPlan { local, tiles: padded.to_tiles(size) })
+    }
+
+    /// Stage two: sample a `size_x` by `size_z` grid (`x * size_z + z`) over the planned
+    /// quadrilateral. Tiles absent from `tiles`, or present as `None` (HTTP 404), read as `NaN`.
+    pub fn sample(&self, plan: &GridPlan, size_x: usize, size_z: usize, tiles: &LoadedTiles) -> Vec<f64> {
+        let mut out = Vec::with_capacity(size_x * size_z);
+        if size_x == 0 || size_z == 0 {
+            return out;
+        }
+        let shift = self.shift;
+        let mask = (self.resolution - 1) as i32;
+        // Every blend tap needs its tile: index the planned tiles densely once (as upstream's
+        // per-request state does) instead of hashing per tap, which cost about 3/4 of the
+        // chunk's sampling time. Taps outside the plan fall back to the map, so the values read
+        // are exactly the same.
+        let table = DenseTiles::new(&plan.tiles, tiles);
+        // Consecutive taps almost always fall in the same tile: remember the last one.
+        let last: std::cell::Cell<Option<LastTile<'_>>> = std::cell::Cell::new(None);
+        let sampler = |x: i32, z: i32| {
+            let position = TilePosition { x: x >> shift, z: z >> shift };
+            let tile = match last.get() {
+                Some((cached, tile)) if cached == position => tile,
+                _ => {
+                    let tile = match table.get(position) {
+                        Some(tile) => Some(tile),
+                        None => tiles.get(&position).and_then(|tile| tile.as_deref()),
+                    };
+                    last.set(Some((position, tile)));
+                    tile
+                }
+            };
+            match tile {
+                Some(tile) => tile[(((z & mask) << shift) | (x & mask)) as usize],
+                None => f64::NAN,
+            }
+        };
+        let step_x = 1.0 / size_x as f64;
+        let step_z = 1.0 / size_z as f64;
+        // Upstream accumulates the fractions by repeated addition; multiplying would round differently.
+        let mut fx = 0.0;
+        for _ in 0..size_x {
+            let mut fz = 0.0;
+            for _ in 0..size_z {
+                let (x, z) = plan.local.point(fx, fz);
+                out.push(self.blend.get(x, z, sampler));
+                fz += step_z;
+            }
+            fx += step_x;
+        }
+        out
+    }
+
+    pub fn decode(&self, bytes: &[u8]) -> Result<Tile, ElevationError> {
+        Ok(self.format.parse(bytes, self.resolution)?.into())
+    }
+}
+
+fn validate_template(template: &str, web_mercator: bool) -> Result<(), ElevationError> {
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(ElevationError::InvalidConfiguration(format!("unterminated placeholder in {template}")));
+        };
+        let key = &after[..end];
+        if key == "bbox_3857" && !web_mercator {
+            return Err(ElevationError::InvalidConfiguration(format!("${{bbox_3857}} needs a plain web_mercator projection, in {template}")));
+        }
+        if key != "x" && key != "z" && key != "bbox_3857" {
+            return Err(ElevationError::InvalidConfiguration(format!("unsupported url property \"{key}\" in {template}")));
+        }
+        rest = &after[end + 1..];
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct GridPlan {
+    pub local: CornerBounds,
+    pub tiles: Vec<TilePosition>,
+}
+
+/// Loaded tiles for one request; `None` records a tile the provider reported as absent.
+pub type LoadedTiles = HashMap<TilePosition, Option<Tile>>;
+
+/// The tile of the previous blend tap (`None` inside: the tile is absent).
+type LastTile<'a> = (TilePosition, Option<&'a [f64]>);
+
+/// The planned tiles of one request in a row-major grid over their bounding box.
+struct DenseTiles<'a> {
+    min_x: i32,
+    min_z: i32,
+    width: u32,
+    height: u32,
+    cells: Vec<Option<&'a [f64]>>,
+}
+
+impl<'a> DenseTiles<'a> {
+    /// Plans are bounded by `MAX_TILES_PER_REQUEST`; a sparse plan with a larger bounding box
+    /// (projection folds) gets an empty table and every tap uses the map.
+    const MAX_CELLS: u64 = 4096;
+
+    fn new(planned: &[TilePosition], tiles: &'a LoadedTiles) -> Self {
+        let empty = Self { min_x: 0, min_z: 0, width: 0, height: 0, cells: Vec::new() };
+        let (Some(min_x), Some(max_x)) = (planned.iter().map(|p| p.x).min(), planned.iter().map(|p| p.x).max()) else { return empty };
+        let (Some(min_z), Some(max_z)) = (planned.iter().map(|p| p.z).min(), planned.iter().map(|p| p.z).max()) else { return empty };
+        let width = (i64::from(max_x) - i64::from(min_x) + 1) as u64;
+        let height = (i64::from(max_z) - i64::from(min_z) + 1) as u64;
+        if width * height > Self::MAX_CELLS {
+            return empty;
+        }
+        let (width, height) = (width as u32, height as u32);
+        let mut cells = vec![None; (width * height) as usize];
+        for (position, tile) in tiles {
+            if let Some(index) = Self::index(min_x, min_z, width, height, *position) {
+                cells[index] = tile.as_deref();
+            }
+        }
+        Self { min_x, min_z, width, height, cells }
+    }
+
+    fn index(min_x: i32, min_z: i32, width: u32, height: u32, position: TilePosition) -> Option<usize> {
+        let dx = u32::try_from(i64::from(position.x) - i64::from(min_x)).ok().filter(|dx| *dx < width)?;
+        let dz = u32::try_from(i64::from(position.z) - i64::from(min_z)).ok().filter(|dz| *dz < height)?;
+        Some((dz * width + dx) as usize)
+    }
+
+    /// `None` when the position is outside the table (the caller then asks the map); a cell for
+    /// an absent tile is also `None`, which the map answers the same way.
+    fn get(&self, position: TilePosition) -> Option<&'a [f64]> {
+        Self::index(self.min_x, self.min_z, self.width, self.height, position).and_then(|index| self.cells[index])
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The dense table must answer exactly as the map: same tile, same absence, and a fallback
+    /// (`None`) for anything outside the plan, including far-away and extreme positions.
+    #[test]
+    fn dense_tiles_agree_with_the_map() {
+        let tile = |value: f64| -> Option<Tile> { Some(Arc::from(vec![value; 4])) };
+        let mut tiles = LoadedTiles::new();
+        tiles.insert(TilePosition { x: -1, z: 5 }, tile(1.0));
+        tiles.insert(TilePosition { x: 0, z: 5 }, None);
+        tiles.insert(TilePosition { x: 1, z: 6 }, tile(2.0));
+        tiles.insert(TilePosition { x: 40, z: 40 }, tile(3.0)); // loaded but outside the plan
+        let planned = [TilePosition { x: -1, z: 5 }, TilePosition { x: 0, z: 5 }, TilePosition { x: 1, z: 6 }];
+        let table = DenseTiles::new(&planned, &tiles);
+        let mut positions: Vec<TilePosition> = (-3..5).flat_map(|x| (3..9).map(move |z| TilePosition { x, z })).collect();
+        positions.extend([TilePosition { x: 40, z: 40 }, TilePosition { x: i32::MIN, z: i32::MAX }, TilePosition { x: i32::MAX, z: i32::MIN }]);
+        for position in positions {
+            let expected = tiles.get(&position).and_then(|tile| tile.as_deref()).map(|t| t[0]);
+            let dense = table.get(position).or_else(|| tiles.get(&position).and_then(|tile| tile.as_deref())).map(|t| t[0]);
+            assert_eq!(dense, expected, "{position:?}");
+        }
+        assert!(table.get(TilePosition { x: 40, z: 40 }).is_none(), "outside the plan the map answers");
+        // A plan whose bounding box is too large gets no table at all.
+        let sparse = DenseTiles::new(&[TilePosition { x: i32::MIN, z: 0 }, TilePosition { x: i32::MAX, z: 0 }], &tiles);
+        assert!(sparse.cells.is_empty());
+        assert!(DenseTiles::new(&[], &tiles).cells.is_empty());
+    }
+
+    /// A minimal little-endian, uncompressed, single-strip float32 TIFF. The no-data text must
+    /// be longer than three characters (shorter ASCII values belong inline in the entry).
+    pub(crate) fn float_tiff(size: u32, values: &[f32], nodata: Option<&str>) -> Vec<u8> {
+        let pixel_offset = 8u32;
+        let pixel_bytes = size * size * 4;
+        let mut nodata_bytes = nodata.map(|text| format!("{text}\0").into_bytes()).unwrap_or_default();
+        if nodata_bytes.len() % 2 == 1 {
+            nodata_bytes.push(0);
+        }
+        let nodata_offset = pixel_offset + pixel_bytes;
+        let ifd_offset = nodata_offset + nodata_bytes.len() as u32;
+        let mut out = b"II*\0".to_vec();
+        out.extend_from_slice(&ifd_offset.to_le_bytes());
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&nodata_bytes);
+        let mut entries: Vec<(u16, u16, u32, u32)> = vec![
+            (256, 4, 1, size),
+            (257, 4, 1, size),
+            (258, 3, 1, 32),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (273, 4, 1, pixel_offset),
+            (277, 3, 1, 1),
+            (278, 4, 1, size),
+            (279, 4, 1, pixel_bytes),
+            (339, 3, 1, 3),
+        ];
+        if let Some(text) = nodata {
+            entries.push((42113, 2, text.len() as u32 + 1, nodata_offset));
+        }
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    fn tiff(inner: TileFormat) -> Box<TileFormat> {
+        Box::new(inner)
+    }
+
+    #[test]
+    fn operators_follow_the_upstream_parsers() {
+        // Row-major 2x2: z = 0 is [1, 2], z = 1 is [3, 4].
+        let bytes = float_tiff(2, &[1.0, 2.0, 3.0, 4.0], None);
+        let parse = |format: TileFormat| format.parse(&bytes, 2).unwrap();
+        assert_eq!(parse(TileFormat::Tiff), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(parse(TileFormat::FlipX(tiff(TileFormat::Tiff))), vec![2.0, 1.0, 4.0, 3.0]);
+        assert_eq!(parse(TileFormat::FlipZ(tiff(TileFormat::Tiff))), vec![3.0, 4.0, 1.0, 2.0]);
+        assert_eq!(parse(TileFormat::SwapAxes(tiff(TileFormat::Tiff))), vec![1.0, 3.0, 2.0, 4.0]);
+        assert_eq!(parse(TileFormat::Add(tiff(TileFormat::Tiff), 0.5)), vec![1.5, 2.5, 3.5, 4.5]);
+        assert_eq!(parse(TileFormat::Multiply(tiff(TileFormat::Tiff), 3.0)), vec![3.0, 6.0, 9.0, 12.0]);
+        // `divide` multiplies by the reciprocal: 3 * (1/10) is 0.30000000000000004, not 0.3.
+        let divided = parse(TileFormat::Divide(tiff(TileFormat::Tiff), 10.0));
+        assert_eq!(divided[2], 3.0 * (1.0 / 10.0));
+        assert_ne!(divided[2], 0.3);
+    }
+
+    #[test]
+    fn gdal_nodata_becomes_nan_after_widening_and_resolution_is_enforced() {
+        let bytes = float_tiff(2, &[-9999.0, 0.1, 5.0, -9999.0], Some(" -9999.0"));
+        let values = TileFormat::Tiff.parse(&bytes, 2).unwrap();
+        assert!(values[0].is_nan() && values[3].is_nan());
+        assert_eq!(values[1], f64::from(0.1f32));
+        // A no-data value that a float cannot hold exactly never matches, as upstream.
+        let bytes = float_tiff(2, &[0.1, 0.0, 0.0, 0.0], Some("0.100"));
+        assert_eq!(TileFormat::Tiff.parse(&bytes, 2).unwrap()[0], f64::from(0.1f32));
+        assert!(TileFormat::Tiff.parse(&float_tiff(2, &[0.0; 4], None), 4).is_err());
+        assert!(TileFormat::Tiff.parse(&float_tiff(2, &[0.0; 4], Some("none!")), 2).is_err());
+    }
+}

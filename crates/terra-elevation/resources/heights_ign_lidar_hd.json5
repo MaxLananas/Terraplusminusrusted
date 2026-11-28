@@ -1,0 +1,139 @@
+/*
+ * IGN LiDAR HD terrain model (MNT LiDAR HD) for France, from the IGN Géoplateforme WMS-Raster
+ * service. This port's addition; loaded above the heights config when `elevation.ign_lidar_hd`
+ * is on (the default).
+ *
+ * Data: Institut national de l'information géographique et forestière (IGN), MNT LiDAR HD,
+ * Licence Ouverte Etalab 2.0 (attribution: "IGN"). Bare-earth model at 0.5 m from at least
+ * 10 laser pulses per square metre, about 30 cm vertical accuracy, acquired 2020-2026 over
+ * mainland France, Corsica and the overseas regions except French Guiana.
+ *
+ * Why it sits above upstream's France layer (IGN RGE ALTI 1 m, a 2021 snapshot mirrored by
+ * cloud.daporkchop.net): RGE ALTI mixes LiDAR with image correlation (0.5-0.7 m), radar in the
+ * mountains and old 25 m data patched in under forests (2-8 m). The Mont Blanc summit is
+ * 4755.6 m in RGE ALTI and 4805.4 m in LiDAR HD (surveyed: 4805.59 m in 2021).
+ *
+ * How:
+ * - GetMap with FORMAT=image/geotiff returns raw float32 heights, not a picture.
+ * - CRS=EPSG:3857 with ${bbox_3857}: the server resamples its native grid (Lambert-93 for the
+ *   mainland and Corsica, a global geographic pyramid overseas) onto exactly the pixels of web
+ *   Mercator zoom 17, about 0.8 m at French latitudes, i.e. finer than one block.
+ * - Where LiDAR HD is not published yet, the service answers -9999 or -99999. `filter` turns
+ *   anything below -1000 m into NaN before blending, so the layers below (RGE ALTI, then AWS
+ *   Terrain Tiles) fill exactly those columns and no sentinel leaks into the interpolation.
+ * - LINEAR blending, as upstream uses for its 1 m LiDAR layers.
+ * - "optional": true (this port's extension): if the service fails (unreachable, an XML
+ *   ServiceException, an undecodable answer), these layers are left out for a minute and the
+ *   columns come from the layers below rather than the chunk failing. Chunks generated during
+ *   such an outage use RGE ALTI, so turn elevation.ign_lidar_hd off if you need every chunk to
+ *   come from one source.
+ * - The service allows 40 requests per second per IP; network.max_concurrent_requests limits
+ *   data.geopf.fr to 6 requests in flight by default, and 429 answers are retried after their
+ *   Retry-After.
+ */
+[
+    // Mainland France and Corsica: the native Lambert-93 pyramid.
+    {
+        "dataset": {
+            "urls": [
+                "https://data.geopf.fr/wms-r?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93&STYLES=&FORMAT=image/geotiff&CRS=EPSG:3857&BBOX=${bbox_3857}&WIDTH=256&HEIGHT=256"
+            ],
+            "projection": {
+                "web_mercator": {
+                    "zoom": 17
+                }
+            },
+            "resolution": 256,
+            "blend": "LINEAR",
+            "parse": {
+                "filter": {
+                    "condition": { "greater_than": -1000.0 },
+                    "delegate": { "parse_tiff": {} }
+                }
+            }
+        },
+        // upstream's France bounds for these two areas
+        "bounds": [
+            { //mainland
+                "minX": -5.525741271738985,
+                "maxX": 8.4457560000525,
+                "minZ": 42.084591062423684,
+                "maxZ": 51.094491264318115
+            },
+            { //corsica
+                "minX": 8.439030884289942,
+                "maxX": 9.663139671429384,
+                "minZ": 41.31562355548702,
+                "maxZ": 43.07772251306459
+            }
+        ],
+        "zooms": {
+            "min": 0,
+            "max": 1
+        },
+        "priority": 150.0,
+        "optional": true
+    },
+
+    // Overseas regions covered by the programme (not French Guiana): the global pyramid. Where
+    // nothing is published yet (Guadeloupe in November 2026), every column falls back to RGE ALTI.
+    {
+        "dataset": {
+            "urls": [
+                "https://data.geopf.fr/wms-r?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.WGS84G&STYLES=&FORMAT=image/geotiff&CRS=EPSG:3857&BBOX=${bbox_3857}&WIDTH=256&HEIGHT=256"
+            ],
+            "projection": {
+                "web_mercator": {
+                    "zoom": 17
+                }
+            },
+            "resolution": 256,
+            "blend": "LINEAR",
+            "parse": {
+                "filter": {
+                    "condition": { "greater_than": -1000.0 },
+                    "delegate": { "parse_tiff": {} }
+                }
+            }
+        },
+        // upstream's France bounds for these areas
+        "bounds": [
+            { //guadeloupe
+                "minX": -61.81409124584721,
+                "maxX": -61.09799405805051,
+                "minZ": 15.820541927239256,
+                "maxZ": 16.52152874837736
+            },
+            { //la desirade
+                "minX": -61.10027282858061,
+                "maxX": -60.996642204201514,
+                "minZ": 16.280399297378494,
+                "maxZ": 16.353627538064533
+            },
+            { //martinique
+                "minX": -61.23786900488246,
+                "maxX": -60.79722443213224,
+                "minZ": 14.38106889343109,
+                "maxZ": 14.881760655885616
+            },
+            { //la reunion
+                "minX": 55.196110973497824,
+                "maxX": 55.84655968104969,
+                "minZ": -21.40125613948719,
+                "maxZ": -20.844657687804492
+            },
+            { //mayotte
+                "minX": 44.97232980398946,
+                "maxX": 45.30431345232376,
+                "minZ": -13.007809708589537,
+                "maxZ": -12.627838529024446
+            }
+        ],
+        "zooms": {
+            "min": 0,
+            "max": 1
+        },
+        "priority": 150.0,
+        "optional": true
+    }
+]

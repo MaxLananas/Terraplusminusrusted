@@ -1,0 +1,169 @@
+//! `/tpll` end to end on the offline fixture: config, stack assembly, argument parsing,
+//! authorization, bounds, asynchronous surface lookup and linked-world height routing.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
+
+use common::stack;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+use terra_server::{Authorization, LevelHeight, PendingTeleports, TeleportOutcome, TeleportWorld, TerraStack, TpllRequest, TpllStep};
+
+const CANYON: &str = "35.995, -113.247";
+const EARTH: &str = "terraplusminus:earth";
+const SKY: &str = "terraplusminus:sky";
+
+#[derive(Default)]
+struct World {
+    generated: HashSet<(String, i32, i32)>,
+    heights: Vec<(String, LevelHeight)>,
+}
+
+impl TeleportWorld for World {
+    fn level_height(&self, world: &str) -> Option<LevelHeight> {
+        self.heights.iter().find(|(name, _)| name == world).map(|(_, height)| *height)
+    }
+    fn is_chunk_generated(&self, world: &str, chunk_x: i32, chunk_z: i32) -> bool {
+        self.generated.contains(&(world.to_owned(), chunk_x, chunk_z))
+    }
+    fn highest_block_y(&self, _: &str, _: i32, _: i32) -> Option<i32> {
+        None
+    }
+}
+
+const PLAYER: Authorization = Authorization { sender_is_target: true, admin: false, may_generate_chunks: true };
+
+fn world(levels: &[(&str, i32, i32)]) -> World {
+    World { heights: levels.iter().map(|(name, min_y, max_y)| ((*name).to_owned(), LevelHeight { min_y: *min_y, max_y: *max_y })).collect(), ..World::default() }
+}
+
+fn start(stack: &TerraStack, arguments: &str, authorization: Authorization, world: &World) -> (Option<TpllRequest>, TpllStep) {
+    let config = stack.config();
+    TpllRequest::start(arguments, EARTH, stack.generator().projection().as_ref(), &config.team_bounds, authorization, &config.linked_worlds, config.generator.y_offset, world)
+}
+
+fn wait_for(pending: &mut PendingTeleports<u32>, stack: &TerraStack, world: &World) -> TeleportOutcome {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((_, outcome)) = pending.poll(&stack.config().linked_worlds, world).pop() {
+            return outcome;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn teleports_onto_the_generated_surface() {
+    let (stack, directory) = stack("surface", "");
+    let world = world(&[(EARTH, -64, 2032)]);
+    let (request, step) = start(&stack, CANYON, PLAYER, &world);
+    let TpllStep::NeedsSurface { chunk_x, chunk_z, local_x, local_z } = step.clone() else { panic!("{step:?}") };
+    let mut pending = PendingTeleports::new(4, Duration::from_secs(30));
+    pending.submit(7, request.unwrap(), &step, PLAYER, stack.loader()).unwrap();
+    let TeleportOutcome::Step(TpllStep::Teleport { world: level, y, reported_height, .. }) = wait_for(&mut pending, &stack, &world) else { panic!() };
+    let terrain = stack.loader().load_blocking(chunk_x, chunk_z, Duration::from_secs(1)).unwrap();
+    let surface = terrain.surface_height(local_x, local_z);
+    assert_eq!((level.as_str(), y as i32, reported_height), (EARTH, surface + 1, surface + 1));
+    assert!((600..2200).contains(&surface));
+    assert!(directory.join("tile-cache/v1").is_dir());
+    assert_eq!(stack.verify_world(&directory.join("world")).unwrap(), terra_chunk_generation::FingerprintStatus::Created);
+}
+
+#[test]
+fn enforces_authorization_and_bounds() {
+    let (stack, _) = stack("authorization", r#", "min_latitude": 46.9, "max_latitude": 55.3, "min_longitude": 1.9, "max_longitude": 15.6"#);
+    let world = world(&[(EARTH, -64, 2032)]);
+    assert_eq!(start(&stack, "not coordinates", PLAYER, &world).1, TpllStep::Usage);
+    assert_eq!(start(&stack, CANYON, PLAYER, &world).1, TpllStep::OutsideTeamBounds);
+    let admin = Authorization { admin: true, ..PLAYER };
+    assert!(matches!(start(&stack, CANYON, admin, &world).1, TpllStep::NeedsSurface { .. }));
+    let other_player = Authorization { sender_is_target: false, ..PLAYER };
+    assert!(matches!(start(&stack, CANYON, other_player, &world).1, TpllStep::NeedsSurface { .. }));
+    let restricted = Authorization { may_generate_chunks: false, admin: true, ..PLAYER };
+    assert_eq!(start(&stack, CANYON, restricted, &world).1, TpllStep::UngeneratedChunkDenied);
+    // Upstream accepts a latitude above 90 when the pair would fit swapped, but does not swap it.
+    assert_eq!(start(&stack, "100 50", admin, &world).1, TpllStep::OutsideProjection);
+}
+
+#[test]
+fn explicit_heights_route_through_linked_worlds() {
+    let linked = r#", "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "terraplusminus:earth", "offset": 0}, {"name": "Terraplusminus:Sky", "offset": -2032}]}"#;
+    let (stack, _) = stack("linked", linked);
+    let world = world(&[(EARTH, -64, 2032), (SKY, -64, 2032)]);
+    let TpllStep::Teleport { world: level, y, .. } = start(&stack, "35.995 -113.247 100", PLAYER, &world).1 else { panic!() };
+    assert_eq!((level.as_str(), y), (EARTH, 100.0));
+    let TpllStep::Teleport { world: level, y, reported_height, .. } = start(&stack, "35.995 -113.247 3000", PLAYER, &world).1 else { panic!() };
+    assert_eq!((level.as_str(), y, reported_height), (SKY, 3000.0 - 2032.0 + 1.0, 3000));
+    assert_eq!(start(&stack, "35.995 -113.247 9000", PLAYER, &world).1, TpllStep::Unreachable);
+}
+
+#[test]
+fn pending_teleports_are_bounded_and_replaceable() {
+    let (stack, _) = stack("bounded", "");
+    let world = world(&[(EARTH, -64, 2032)]);
+    let mut pending = PendingTeleports::new(1, Duration::from_secs(30));
+    let (request, step) = start(&stack, CANYON, PLAYER, &world);
+    pending.submit(1, request.clone().unwrap(), &step, PLAYER, stack.loader()).unwrap();
+    pending.submit(1, request.clone().unwrap(), &step, PLAYER, stack.loader()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.submit(2, request.unwrap(), &step, PLAYER, stack.loader()), Err(terra_server::TeleportRefusal::TooManyPending));
+    assert!(matches!(wait_for(&mut pending, &stack, &world), TeleportOutcome::Step(TpllStep::Teleport { .. })));
+}
+
+#[test]
+fn the_exclusive_top_of_the_world_is_a_valid_feet_position() {
+    // `y` is where the player's feet go, one above the block stood on; upstream compares it with
+    // `getMaxHeight()` the same way (`TpllCommand`: `mcCoords.getBlockY() > tpWorld.getMaxHeight()`).
+    // Feet at max_y stand on the topmost block (max_y - 1); one higher is outside the world.
+    let (stack, _) = stack("top-boundary", "");
+    let world = world(&[(EARTH, -64, 2032)]);
+    let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 2032", PLAYER, &world).1 else { panic!("feet at max_y must teleport") };
+    assert_eq!(y, 2032.0);
+    assert_eq!(start(&stack, "35.995 -113.247 2033", PLAYER, &world).1, TpllStep::Unreachable);
+    // The bottom is exclusive the other way: feet must be above min_y.
+    assert_eq!(start(&stack, "35.995 -113.247 -64", PLAYER, &world).1, TpllStep::Unreachable);
+    let TpllStep::Teleport { y, .. } = start(&stack, "35.995 -113.247 -63", PLAYER, &world).1 else { panic!() };
+    assert_eq!(y, -63.0);
+}
+
+/// Java parses `NaN` and `Infinity`; teleporting to them would corrupt the player's position.
+#[test]
+fn non_finite_heights_are_usage_errors() {
+    let linked = r#", "linked_worlds": {"enabled": true, "method": "MULTIVERSE", "worlds": [{"name": "terraplusminus:earth", "offset": 0}, {"name": "Terraplusminus:Sky", "offset": -2032}]}"#;
+    let (stack, _) = stack("nonfinite", linked);
+    let world = world(&[(EARTH, 64, 2032), (SKY, 64, 2032)]);
+    for height in ["NaN", "Infinity", "-Infinity", "1e400"] {
+        assert_eq!(start(&stack, &format!("35.995 -113.247 {height}"), PLAYER, &world).1, TpllStep::Usage, "{height}");
+    }
+}
+
+/// A projection that answers NaN (some do outside their outline) or a point past the world's
+/// edge must not become a teleport.
+#[test]
+fn projections_answering_nan_or_far_points_are_outside() {
+    use terra_projection::{GeoCoordinate, GeographicProjection, ProjectedCoordinate, ProjectionResult};
+    #[derive(Debug)]
+    struct Answering(f64);
+    impl GeographicProjection for Answering {
+        fn to_geo(&self, _: ProjectedCoordinate) -> ProjectionResult<GeoCoordinate> {
+            Ok(GeoCoordinate::new(0.0, 0.0))
+        }
+        fn from_geo(&self, _: GeoCoordinate) -> ProjectionResult<ProjectedCoordinate> {
+            Ok(ProjectedCoordinate { x: self.0, y: 0.0 })
+        }
+        fn meters_per_unit(&self) -> f64 {
+            1.0
+        }
+    }
+    let (stack, _) = stack("nanprojection", "");
+    let config = stack.config();
+    let world = world(&[(EARTH, -64, 2032)]);
+    for x in [f64::NAN, f64::INFINITY, 3.1e7, -1e300] {
+        let step = TpllRequest::start("1 2 100", EARTH, &Answering(x), &config.team_bounds, PLAYER, &config.linked_worlds, config.generator.y_offset, &world).1;
+        assert_eq!(step, TpllStep::OutsideProjection, "{x}");
+    }
+    let step = TpllRequest::start("1 2 100", EARTH, &Answering(12.5), &config.team_bounds, PLAYER, &config.linked_worlds, config.generator.y_offset, &world).1;
+    assert!(matches!(step, TpllStep::Teleport { x: 12.5, .. }), "{step:?}");
+}

@@ -1,0 +1,23 @@
+//! Engine-neutral TerraPlusMinus server behaviour: configuration, `/tpll` parsing and
+//! authorization, teleport planning across linked worlds, and assembly of the generation stack.
+
+pub mod autoteleport;
+pub mod bridge;
+pub mod config;
+pub mod coordinates;
+pub mod engine_bridge;
+pub mod java_text;
+pub mod messages;
+pub mod region_index;
+pub mod stack;
+pub mod teleports;
+pub mod tpll;
+pub mod updates;
+
+pub use coordinates::{LatLng, UpstreamParseOutcome, parse_coordinates, parse_coordinates_upstream};
+pub use config::{ConfigError, DATAPACK_WORLD, EARTH_PATH, LevelPlan, MOD_NAMESPACE, NetworkConfig, OpenStreetMapConfig, PermissionLevels, ServerConfig, parse_server_config};
+pub use tpll::{Authorization, LevelHeight, LinkedWorld, LinkedWorlds, LinkedWorldsMethod, TeamBounds, TeleportWorld, TpllRequest, TpllStep, TpllTarget, parse_tpll_arguments};
+pub use stack::{LogSink, OSM_MAPPING_FILE, StackError, TerraStack, extract_default_osm_mapping};
+pub use teleports::{PendingTeleports, TeleportOutcome, TeleportRefusal};
+pub use region_index::RegionIndex;
+pub use engine_bridge::{BiomeLookup, BlockPalette, BlockWriter, GateState, GenerationControl, GenerationCounters, GenerationFailure, GenerationGate, split_block_state, terrain_for_generation, validate_block_state, write_chunk, write_chunk_at, write_trees, TreeTarget};

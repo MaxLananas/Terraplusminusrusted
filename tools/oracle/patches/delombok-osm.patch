@@ -1,0 +1,1770 @@
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/AbstractGeoJsonDeserializer.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/AbstractGeoJsonDeserializer.java
+@@ -131,4 +131,11 @@
+     }
+ 
+     protected abstract GeometryDeserializer geometryDeserializer();
++
++    public AbstractGeoJsonDeserializer(String name) {
++        if (name == null) {
++            throw new NullPointerException("name is marked non-null but is null");
++        }
++        this.name = name;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/ObjectDeserializer.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/ObjectDeserializer.java
+@@ -131,4 +131,8 @@
+ 
+         return new Reference(in.nextString());
+     }
++
++    public GeometryDeserializer geometryDeserializer() {
++        return this.geometryDeserializer;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/GeometryCollection.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/GeometryCollection.java
+@@ -38,4 +38,45 @@
+     public Bounds2d bounds() {
+         return Arrays.stream(this.geometries).map(Geometry::bounds).reduce(Bounds2d::union).orElse(null);
+     }
++
++    public GeometryCollection(Geometry[] geometries) {
++        if (geometries == null) {
++            throw new NullPointerException("geometries is marked non-null but is null");
++        }
++        this.geometries = geometries;
++    }
++
++    public Geometry[] geometries() {
++        return this.geometries;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof GeometryCollection)) {
++            return false;
++        }
++        final GeometryCollection other = (GeometryCollection) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.geometries, other.geometries)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof GeometryCollection;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.geometries);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/LineString.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/LineString.java
+@@ -56,4 +56,38 @@
+         }
+         return Bounds2d.of(minLon, maxLon, minLat, maxLat);
+     }
++
++    public Point[] points() {
++        return this.points;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof LineString)) {
++            return false;
++        }
++        final LineString other = (LineString) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.points, other.points)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof LineString;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.points);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiLineString.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiLineString.java
+@@ -38,4 +38,45 @@
+     public Bounds2d bounds() {
+         return Arrays.stream(this.lines).map(LineString::bounds).reduce(Bounds2d::union).orElse(null);
+     }
++
++    public MultiLineString(LineString[] lines) {
++        if (lines == null) {
++            throw new NullPointerException("lines is marked non-null but is null");
++        }
++        this.lines = lines;
++    }
++
++    public LineString[] lines() {
++        return this.lines;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof MultiLineString)) {
++            return false;
++        }
++        final MultiLineString other = (MultiLineString) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.lines, other.lines)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof MultiLineString;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.lines);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiPoint.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiPoint.java
+@@ -54,4 +54,45 @@
+         }
+         return Bounds2d.of(minLon, maxLon, minLat, maxLat);
+     }
++
++    public MultiPoint(Point[] points) {
++        if (points == null) {
++            throw new NullPointerException("points is marked non-null but is null");
++        }
++        this.points = points;
++    }
++
++    public Point[] points() {
++        return this.points;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof MultiPoint)) {
++            return false;
++        }
++        final MultiPoint other = (MultiPoint) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.points, other.points)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof MultiPoint;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.points);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiPolygon.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/MultiPolygon.java
+@@ -38,4 +38,45 @@
+     public Bounds2d bounds() {
+         return Arrays.stream(this.polygons).map(Polygon::bounds).reduce(Bounds2d::union).orElse(null);
+     }
++
++    public MultiPolygon(Polygon[] polygons) {
++        if (polygons == null) {
++            throw new NullPointerException("polygons is marked non-null but is null");
++        }
++        this.polygons = polygons;
++    }
++
++    public Polygon[] polygons() {
++        return this.polygons;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof MultiPolygon)) {
++            return false;
++        }
++        final MultiPolygon other = (MultiPolygon) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.polygons, other.polygons)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof MultiPolygon;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.polygons);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/Point.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/Point.java
+@@ -25,4 +25,53 @@
+     public Bounds2d bounds() {
+         return Bounds2d.of(this.lon, this.lon, this.lat, this.lat);
+     }
++
++    public Point(double lon, double lat) {
++        this.lon = lon;
++        this.lat = lat;
++    }
++
++    public double lon() {
++        return this.lon;
++    }
++
++    public double lat() {
++        return this.lat;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof Point)) {
++            return false;
++        }
++        final Point other = (Point) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (Double.compare(this.lon, other.lon) != 0) {
++            return false;
++        }
++        if (Double.compare(this.lat, other.lat) != 0) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof Point;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        final long $lon = Double.doubleToLongBits(this.lon);
++        result = result * PRIME + (int) ($lon >>> 32 ^ $lon);
++        final long $lat = Double.doubleToLongBits(this.lat);
++        result = result * PRIME + (int) ($lat >>> 32 ^ $lat);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/geometry/Polygon.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/geometry/Polygon.java
+@@ -40,4 +40,46 @@
+     public Bounds2d bounds() {
+         return this.outerRing.bounds();
+     }
++
++    public LineString outerRing() {
++        return this.outerRing;
++    }
++
++    public LineString[] innerRings() {
++        return this.innerRings;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof Polygon)) {
++            return false;
++        }
++        final Polygon other = (Polygon) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.outerRing, other.outerRing)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.innerRings, other.innerRings)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof Polygon;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + (this.outerRing == null ? 43 : this.outerRing.hashCode());
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.innerRings);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/object/Feature.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/object/Feature.java
+@@ -16,4 +16,63 @@
+     protected final Geometry geometry;
+     protected final Map<String, String> properties;
+     protected final String id;
++
++    public Feature(Geometry geometry, Map<String, String> properties, String id) {
++        if (geometry == null) {
++            throw new NullPointerException("geometry is marked non-null but is null");
++        }
++        this.geometry = geometry;
++        this.properties = properties;
++        this.id = id;
++    }
++
++    public Geometry geometry() {
++        return this.geometry;
++    }
++
++    public Map<String, String> properties() {
++        return this.properties;
++    }
++
++    public String id() {
++        return this.id;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof Feature)) {
++            return false;
++        }
++        final Feature other = (Feature) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.geometry, other.geometry)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.properties, other.properties)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.id, other.id)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof Feature;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + (this.geometry == null ? 43 : this.geometry.hashCode());
++        result = result * PRIME + (this.properties == null ? 43 : this.properties.hashCode());
++        result = result * PRIME + (this.id == null ? 43 : this.id.hashCode());
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/object/FeatureCollection.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/object/FeatureCollection.java
+@@ -20,4 +20,45 @@
+     public Iterator<Feature> iterator() {
+         return Iterators.forArray(this.features);
+     }
++
++    public FeatureCollection(Feature[] features) {
++        if (features == null) {
++            throw new NullPointerException("features is marked non-null but is null");
++        }
++        this.features = features;
++    }
++
++    public Feature[] features() {
++        return this.features;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof FeatureCollection)) {
++            return false;
++        }
++        final FeatureCollection other = (FeatureCollection) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Arrays.deepEquals(this.features, other.features)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof FeatureCollection;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + java.util.Arrays.deepHashCode(this.features);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/geojson/object/Reference.java
++++ b/net/buildtheearth/terraminusminus/dataset/geojson/object/Reference.java
+@@ -13,4 +13,45 @@
+ public final class Reference implements GeoJsonObject {
+     @NonNull
+     protected final String location;
++
++    public Reference(String location) {
++        if (location == null) {
++            throw new NullPointerException("location is marked non-null but is null");
++        }
++        this.location = location;
++    }
++
++    public String location() {
++        return this.location;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof Reference)) {
++            return false;
++        }
++        final Reference other = (Reference) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.location, other.location)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof Reference;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + (this.location == null ? 43 : this.location.hashCode());
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/BlockStateParser.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/BlockStateParser.java
+@@ -59,4 +59,6 @@
+         return builder.build();
+     }
+ 
++    private BlockStateParser() {
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/JsonParser.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/JsonParser.java
+@@ -83,6 +83,17 @@
+             checkArg(clazz != null, "type \"%s\" is not supported by \"%s\"!", type, this.name);
+             return TerraConstants.GSON.fromJson(in, clazz);
+         }
++
++        public AbstractTyped(String name, Map<String, Class<? extends T>> types) {
++            if (name == null) {
++                throw new NullPointerException("name is marked non-null but is null");
++            }
++            if (types == null) {
++                throw new NullPointerException("types is marked non-null but is null");
++            }
++            this.name = name;
++            this.types = types;
++        }
+     }
+ 
+     /**
+--- a/net/buildtheearth/terraminusminus/dataset/osm/OSMMapper.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/OSMMapper.java
+@@ -26,7 +26,7 @@
+ @FunctionalInterface
+ public interface OSMMapper<G extends Geometry> {
+     @SneakyThrows(IOException.class)
+-    static OSMMapper<Geometry> load() {
++    static OSMMapper<Geometry> load() throws IOException {
+         Path path = Disk.configFile("osm.json5");
+         try (JsonReader reader = new JsonReader(Files.exists(path)
+                 ? new UTF8FileReader(path.toString())
+--- a/net/buildtheearth/terraminusminus/dataset/osm/Root.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/Root.java
+@@ -88,4 +88,49 @@
+             return builder.build();
+         }
+     }
++
++    Root(LineMapper line, PolygonMapper polygon) {
++        if (line == null) {
++            throw new NullPointerException("line is marked non-null but is null");
++        }
++        if (polygon == null) {
++            throw new NullPointerException("polygon is marked non-null but is null");
++        }
++        this.line = line;
++        this.polygon = polygon;
++    }
++
++    public static RootBuilder builder() {
++        return new RootBuilder();
++    }
++
++    public static class RootBuilder {
++        private LineMapper line;
++        private PolygonMapper polygon;
++
++        RootBuilder() {
++        }
++
++        public RootBuilder line(LineMapper line) {
++            this.line = line;
++            return this;
++        }
++
++        public RootBuilder polygon(PolygonMapper polygon) {
++            this.polygon = polygon;
++            return this;
++        }
++
++        public Root build() {
++            return new Root(this.line, this.polygon);
++        }
++    }
++
++    public LineMapper line() {
++        return this.line;
++    }
++
++    public PolygonMapper polygon() {
++        return this.polygon;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/dvalue/BiOp.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/dvalue/BiOp.java
+@@ -164,4 +164,15 @@
+             }
+         }
+     }
++
++    public BiOp(DValue first, DValue second) {
++        if (first == null) {
++            throw new NullPointerException("first is marked non-null but is null");
++        }
++        if (second == null) {
++            throw new NullPointerException("second is marked non-null but is null");
++        }
++        this.first = first;
++        this.second = second;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/dvalue/Constant.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/dvalue/Constant.java
+@@ -31,4 +31,8 @@
+             return new Constant(in.nextDouble());
+         }
+     }
++
++    public Constant(double value) {
++        this.value = value;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/dvalue/Tag.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/dvalue/Tag.java
+@@ -59,4 +59,38 @@
+             return builder.build();
+         }
+     }
++
++    Tag(String key, double fallback) {
++        if (key == null) {
++            throw new NullPointerException("key is marked non-null but is null");
++        }
++        this.key = key;
++        this.fallback = fallback;
++    }
++
++    public static TagBuilder builder() {
++        return new TagBuilder();
++    }
++
++    public static class TagBuilder {
++        private String key;
++        private double fallback;
++
++        TagBuilder() {
++        }
++
++        public TagBuilder key(String key) {
++            this.key = key;
++            return this;
++        }
++
++        public TagBuilder fallback(double fallback) {
++            this.fallback = fallback;
++            return this;
++        }
++
++        public Tag build() {
++            return new Tag(this.key, this.fallback);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/All.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/All.java
+@@ -86,4 +86,11 @@
+             }
+         }
+     }
++
++    public All(M[] children) {
++        if (children == null) {
++            throw new NullPointerException("children is marked non-null but is null");
++        }
++        this.children = children;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/Any.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/Any.java
+@@ -85,4 +85,11 @@
+             }
+         }
+     }
++
++    public Any(M[] children) {
++        if (children == null) {
++            throw new NullPointerException("children is marked non-null but is null");
++        }
++        this.children = children;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/Condition.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/Condition.java
+@@ -101,4 +101,15 @@
+             }
+         }
+     }
++
++    public Condition(MatchCondition match, M emit) {
++        if (match == null) {
++            throw new NullPointerException("match is marked non-null but is null");
++        }
++        if (emit == null) {
++            throw new NullPointerException("emit is marked non-null but is null");
++        }
++        this.match = match;
++        this.emit = emit;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/First.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/First.java
+@@ -82,4 +82,11 @@
+             }
+         }
+     }
++
++    public First(M[] children) {
++        if (children == null) {
++            throw new NullPointerException("children is marked non-null but is null");
++        }
++        this.children = children;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineNarrow.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineNarrow.java
+@@ -64,4 +64,41 @@
+             return builder.build();
+         }
+     }
++
++    LineNarrow(DrawFunction draw, DValue layer) {
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        if (layer == null) {
++            throw new NullPointerException("layer is marked non-null but is null");
++        }
++        this.draw = draw;
++        this.layer = layer;
++    }
++
++    public static LineNarrowBuilder builder() {
++        return new LineNarrowBuilder();
++    }
++
++    public static class LineNarrowBuilder {
++        private DrawFunction draw;
++        private DValue layer;
++
++        LineNarrowBuilder() {
++        }
++
++        public LineNarrowBuilder draw(DrawFunction draw) {
++            this.draw = draw;
++            return this;
++        }
++
++        public LineNarrowBuilder layer(DValue layer) {
++            this.layer = layer;
++            return this;
++        }
++
++        public LineNarrow build() {
++            return new LineNarrow(this.draw, this.layer);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineSharp.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineSharp.java
+@@ -67,4 +67,40 @@
+         }
+     }
+ 
++    LineSharp(DrawFunction draw, DValue layer) {
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        if (layer == null) {
++            throw new NullPointerException("layer is marked non-null but is null");
++        }
++        this.draw = draw;
++        this.layer = layer;
++    }
++
++    public static LineSharpBuilder builder() {
++        return new LineSharpBuilder();
++    }
++
++    public static class LineSharpBuilder {
++        private DrawFunction draw;
++        private DValue layer;
++
++        LineSharpBuilder() {
++        }
++
++        public LineSharpBuilder draw(DrawFunction draw) {
++            this.draw = draw;
++            return this;
++        }
++
++        public LineSharpBuilder layer(DValue layer) {
++            this.layer = layer;
++            return this;
++        }
++
++        public LineSharp build() {
++            return new LineSharp(this.draw, this.layer);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineWide.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/LineWide.java
+@@ -71,4 +71,51 @@
+             return builder.build();
+         }
+     }
++
++    LineWide(DrawFunction draw, DValue layer, DValue radius) {
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        if (layer == null) {
++            throw new NullPointerException("layer is marked non-null but is null");
++        }
++        if (radius == null) {
++            throw new NullPointerException("radius is marked non-null but is null");
++        }
++        this.draw = draw;
++        this.layer = layer;
++        this.radius = radius;
++    }
++
++    public static LineWideBuilder builder() {
++        return new LineWideBuilder();
++    }
++
++    public static class LineWideBuilder {
++        private DrawFunction draw;
++        private DValue layer;
++        private DValue radius;
++
++        LineWideBuilder() {
++        }
++
++        public LineWideBuilder draw(DrawFunction draw) {
++            this.draw = draw;
++            return this;
++        }
++
++        public LineWideBuilder layer(DValue layer) {
++            this.layer = layer;
++            return this;
++        }
++
++        public LineWideBuilder radius(DValue radius) {
++            this.radius = radius;
++            return this;
++        }
++
++        public LineWide build() {
++            return new LineWide(this.draw, this.layer, this.radius);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonConvert.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonConvert.java
+@@ -74,5 +74,12 @@
+                 return new Line(next);
+             }
+         }
++
++        public Line(LineMapper next) {
++            if (next == null) {
++                throw new NullPointerException("next is marked non-null but is null");
++            }
++            this.next = next;
++        }
+     }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonDistance.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonDistance.java
+@@ -31,7 +31,7 @@
+     @NonNull
+     protected final DValue layer;
+     @Builder.Default
+-    protected final int maxDist = 2;
++    protected final int maxDist;
+ 
+     @Override
+     public Collection<VectorGeometry> apply(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull MultiPolygon projectedGeometry) {
+@@ -69,4 +69,54 @@
+             return builder.build();
+         }
+     }
++
++    PolygonDistance(DrawFunction draw, DValue layer, int maxDist) {
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        if (layer == null) {
++            throw new NullPointerException("layer is marked non-null but is null");
++        }
++        this.draw = draw;
++        this.layer = layer;
++        this.maxDist = maxDist;
++    }
++
++    public static PolygonDistanceBuilder builder() {
++        return new PolygonDistanceBuilder();
++    }
++
++    public static class PolygonDistanceBuilder {
++        private DrawFunction draw;
++        private DValue layer;
++        private int maxDist;
++        private boolean maxDist$set;
++
++        PolygonDistanceBuilder() {
++        }
++
++        public PolygonDistanceBuilder draw(DrawFunction draw) {
++            this.draw = draw;
++            return this;
++        }
++
++        public PolygonDistanceBuilder layer(DValue layer) {
++            this.layer = layer;
++            return this;
++        }
++
++        public PolygonDistanceBuilder maxDist(int maxDist) {
++            this.maxDist = maxDist;
++            this.maxDist$set = true;
++            return this;
++        }
++
++        public PolygonDistance build() {
++            return new PolygonDistance(this.draw, this.layer, this.maxDist$set ? this.maxDist : PolygonDistance.$default$maxDist());
++        }
++    }
++
++    private static int $default$maxDist() {
++        return 2;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonFill.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/mapper/PolygonFill.java
+@@ -64,4 +64,41 @@
+             return builder.build();
+         }
+     }
++
++    PolygonFill(DrawFunction draw, DValue layer) {
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        if (layer == null) {
++            throw new NullPointerException("layer is marked non-null but is null");
++        }
++        this.draw = draw;
++        this.layer = layer;
++    }
++
++    public static PolygonFillBuilder builder() {
++        return new PolygonFillBuilder();
++    }
++
++    public static class PolygonFillBuilder {
++        private DrawFunction draw;
++        private DValue layer;
++
++        PolygonFillBuilder() {
++        }
++
++        public PolygonFillBuilder draw(DrawFunction draw) {
++            this.draw = draw;
++            return this;
++        }
++
++        public PolygonFillBuilder layer(DValue layer) {
++            this.layer = layer;
++            return this;
++        }
++
++        public PolygonFill build() {
++            return new PolygonFill(this.draw, this.layer);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/And.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/And.java
+@@ -37,4 +37,11 @@
+             return new And(readTypedList(in, this).toArray(new MatchCondition[0]));
+         }
+     }
++
++    public And(MatchCondition[] delegates) {
++        if (delegates == null) {
++            throw new NullPointerException("delegates is marked non-null but is null");
++        }
++        this.delegates = delegates;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/Id.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/Id.java
+@@ -37,6 +37,13 @@
+         public boolean test(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull Geometry projectedGeometry) {
+             return this.expectedIds.contains(id);
+         }
++
++        public Any(Set<String> expectedIds) {
++            if (expectedIds == null) {
++                throw new NullPointerException("expectedIds is marked non-null but is null");
++            }
++            this.expectedIds = expectedIds;
++        }
+     }
+ 
+     /**
+@@ -51,6 +58,10 @@
+         @Override
+         public boolean test(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull Geometry projectedGeometry) {
+             return Objects.equals(this.expectedId, id);
++        }
++
++        public Exactly(String expectedId) {
++            this.expectedId = expectedId;
+         }
+     }
+ 
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/Intersects.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/Intersects.java
+@@ -64,4 +64,65 @@
+             return builder.build();
+         }
+     }
++
++    Intersects(double minX, double maxX, double minZ, double maxZ) {
++        this.minX = minX;
++        this.maxX = maxX;
++        this.minZ = minZ;
++        this.maxZ = maxZ;
++    }
++
++    public static IntersectsBuilder builder() {
++        return new IntersectsBuilder();
++    }
++
++    public static class IntersectsBuilder {
++        private double minX;
++        private double maxX;
++        private double minZ;
++        private double maxZ;
++
++        IntersectsBuilder() {
++        }
++
++        public IntersectsBuilder minX(double minX) {
++            this.minX = minX;
++            return this;
++        }
++
++        public IntersectsBuilder maxX(double maxX) {
++            this.maxX = maxX;
++            return this;
++        }
++
++        public IntersectsBuilder minZ(double minZ) {
++            this.minZ = minZ;
++            return this;
++        }
++
++        public IntersectsBuilder maxZ(double maxZ) {
++            this.maxZ = maxZ;
++            return this;
++        }
++
++        public Intersects build() {
++            return new Intersects(this.minX, this.maxX, this.minZ, this.maxZ);
++        }
++    }
++
++    public double minX() {
++        return this.minX;
++    }
++
++    public double maxX() {
++        return this.maxX;
++    }
++
++    public double minZ() {
++        return this.minZ;
++    }
++
++    public double maxZ() {
++        return this.maxZ;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/Not.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/Not.java
+@@ -37,4 +37,11 @@
+             return new Not(delegate);
+         }
+     }
++
++    public Not(MatchCondition delegate) {
++        if (delegate == null) {
++            throw new NullPointerException("delegate is marked non-null but is null");
++        }
++        this.delegate = delegate;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/Or.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/Or.java
+@@ -37,4 +37,11 @@
+             return new Or(readTypedList(in, this).toArray(new MatchCondition[0]));
+         }
+     }
++
++    public Or(MatchCondition[] delegates) {
++        if (delegates == null) {
++            throw new NullPointerException("delegates is marked non-null but is null");
++        }
++        this.delegates = delegates;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/osm/match/Tag.java
++++ b/net/buildtheearth/terraminusminus/dataset/osm/match/Tag.java
+@@ -36,6 +36,13 @@
+         public boolean test(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull Geometry projectedGeometry) {
+             return tags.containsKey(this.key);
+         }
++
++        public All(String key) {
++            if (key == null) {
++                throw new NullPointerException("key is marked non-null but is null");
++            }
++            this.key = key;
++        }
+     }
+ 
+     /**
+@@ -54,6 +61,17 @@
+         public boolean test(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull Geometry projectedGeometry) {
+             return this.expectedValues.contains(tags.get(this.key));
+         }
++
++        public Any(String key, Set<String> expectedValues) {
++            if (key == null) {
++                throw new NullPointerException("key is marked non-null but is null");
++            }
++            if (expectedValues == null) {
++                throw new NullPointerException("expectedValues is marked non-null but is null");
++            }
++            this.key = key;
++            this.expectedValues = expectedValues;
++        }
+     }
+ 
+     /**
+@@ -71,6 +89,17 @@
+         @Override
+         public boolean test(String id, @NonNull Map<String, String> tags, @NonNull Geometry originalGeometry, @NonNull Geometry projectedGeometry) {
+             return this.value.equals(tags.get(this.key));
++        }
++
++        public Exactly(String key, String value) {
++            if (key == null) {
++                throw new NullPointerException("key is marked non-null but is null");
++            }
++            if (value == null) {
++                throw new NullPointerException("value is marked non-null but is null");
++            }
++            this.key = key;
++            this.value = value;
+         }
+     }
+ 
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/All.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/All.java
+@@ -31,4 +31,11 @@
+             return new All(readTypedList(in, this).toArray(new DrawFunction[0]));
+         }
+     }
++
++    public All(DrawFunction[] delegates) {
++        if (delegates == null) {
++            throw new NullPointerException("delegates is marked non-null but is null");
++        }
++        this.delegates = delegates;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/Block.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/Block.java
+@@ -34,4 +34,11 @@
+             return new Block(TerraConstants.GSON.fromJson(in, BlockState.class));
+         }
+     }
++
++    public Block(BlockState state) {
++        if (state == null) {
++            throw new NullPointerException("state is marked non-null but is null");
++        }
++        this.state = state;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightAdd.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightAdd.java
+@@ -53,4 +53,38 @@
+             return builder.build();
+         }
+     }
++
++    WeightAdd(DrawFunction delegate, int value) {
++        if (delegate == null) {
++            throw new NullPointerException("delegate is marked non-null but is null");
++        }
++        this.delegate = delegate;
++        this.value = value;
++    }
++
++    public static WeightAddBuilder builder() {
++        return new WeightAddBuilder();
++    }
++
++    public static class WeightAddBuilder {
++        private DrawFunction delegate;
++        private int value;
++
++        WeightAddBuilder() {
++        }
++
++        public WeightAddBuilder delegate(DrawFunction delegate) {
++            this.delegate = delegate;
++            return this;
++        }
++
++        public WeightAddBuilder value(int value) {
++            this.value = value;
++            return this;
++        }
++
++        public WeightAdd build() {
++            return new WeightAdd(this.delegate, this.value);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightClamp.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightClamp.java
+@@ -22,9 +22,9 @@
+     @NonNull
+     protected final DrawFunction delegate;
+     @Builder.Default
+-    protected final int min = Integer.MIN_VALUE;
++    protected final int min;
+     @Builder.Default
+-    protected final int max = Integer.MAX_VALUE;
++    protected final int max;
+ 
+     @Override
+     public void drawOnto(@NonNull CachedChunkData.Builder data, int x, int z, int weight) {
+@@ -60,4 +60,57 @@
+             return builder.build();
+         }
+     }
++
++    WeightClamp(DrawFunction delegate, int min, int max) {
++        if (delegate == null) {
++            throw new NullPointerException("delegate is marked non-null but is null");
++        }
++        this.delegate = delegate;
++        this.min = min;
++        this.max = max;
++    }
++
++    public static WeightClampBuilder builder() {
++        return new WeightClampBuilder();
++    }
++
++    public static class WeightClampBuilder {
++        private DrawFunction delegate;
++        private int min;
++        private boolean min$set;
++        private int max;
++        private boolean max$set;
++
++        WeightClampBuilder() {
++        }
++
++        public WeightClampBuilder delegate(DrawFunction delegate) {
++            this.delegate = delegate;
++            return this;
++        }
++
++        public WeightClampBuilder min(int min) {
++            this.min = min;
++            this.min$set = true;
++            return this;
++        }
++
++        public WeightClampBuilder max(int max) {
++            this.max = max;
++            this.max$set = true;
++            return this;
++        }
++
++        public WeightClamp build() {
++            return new WeightClamp(this.delegate, this.min$set ? this.min : WeightClamp.$default$min(), this.max$set ? this.max : WeightClamp.$default$max());
++        }
++    }
++
++    private static int $default$min() {
++        return Integer.MIN_VALUE;
++    }
++
++    private static int $default$max() {
++        return Integer.MAX_VALUE;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightGreaterThan.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightGreaterThan.java
+@@ -55,4 +55,38 @@
+             return builder.build();
+         }
+     }
++
++    WeightGreaterThan(DrawFunction delegate, int value) {
++        if (delegate == null) {
++            throw new NullPointerException("delegate is marked non-null but is null");
++        }
++        this.delegate = delegate;
++        this.value = value;
++    }
++
++    public static WeightGreaterThanBuilder builder() {
++        return new WeightGreaterThanBuilder();
++    }
++
++    public static class WeightGreaterThanBuilder {
++        private DrawFunction delegate;
++        private int value;
++
++        WeightGreaterThanBuilder() {
++        }
++
++        public WeightGreaterThanBuilder delegate(DrawFunction delegate) {
++            this.delegate = delegate;
++            return this;
++        }
++
++        public WeightGreaterThanBuilder value(int value) {
++            this.value = value;
++            return this;
++        }
++
++        public WeightGreaterThan build() {
++            return new WeightGreaterThan(this.delegate, this.value);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightLessThan.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/draw/WeightLessThan.java
+@@ -55,4 +55,38 @@
+             return builder.build();
+         }
+     }
++
++    WeightLessThan(DrawFunction delegate, int value) {
++        if (delegate == null) {
++            throw new NullPointerException("delegate is marked non-null but is null");
++        }
++        this.delegate = delegate;
++        this.value = value;
++    }
++
++    public static WeightLessThanBuilder builder() {
++        return new WeightLessThanBuilder();
++    }
++
++    public static class WeightLessThanBuilder {
++        private DrawFunction delegate;
++        private int value;
++
++        WeightLessThanBuilder() {
++        }
++
++        public WeightLessThanBuilder delegate(DrawFunction delegate) {
++            this.delegate = delegate;
++            return this;
++        }
++
++        public WeightLessThanBuilder value(int value) {
++            this.value = value;
++            return this;
++        }
++
++        public WeightLessThan build() {
++            return new WeightLessThan(this.delegate, this.value);
++        }
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/geometry/AbstractVectorGeometry.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/geometry/AbstractVectorGeometry.java
+@@ -32,4 +32,67 @@
+     protected final double layer;
+     @NonNull
+     protected final DrawFunction draw;
++
++    public AbstractVectorGeometry(String id, double layer, DrawFunction draw) {
++        if (id == null) {
++            throw new NullPointerException("id is marked non-null but is null");
++        }
++        if (draw == null) {
++            throw new NullPointerException("draw is marked non-null but is null");
++        }
++        this.id = id;
++        this.layer = layer;
++        this.draw = draw;
++    }
++
++    public String id() {
++        return this.id;
++    }
++
++    public double layer() {
++        return this.layer;
++    }
++
++    public DrawFunction draw() {
++        return this.draw;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof AbstractVectorGeometry)) {
++            return false;
++        }
++        final AbstractVectorGeometry other = (AbstractVectorGeometry) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.id, other.id)) {
++            return false;
++        }
++        if (Double.compare(this.layer, other.layer) != 0) {
++            return false;
++        }
++        if (!java.util.Objects.equals(this.draw, other.draw)) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof AbstractVectorGeometry;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        result = result * PRIME + (this.id == null ? 43 : this.id.hashCode());
++        final long $layer = Double.doubleToLongBits(this.layer);
++        result = result * PRIME + (int) ($layer >>> 32 ^ $layer);
++        result = result * PRIME + (this.draw == null ? 43 : this.draw.hashCode());
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/geometry/Segment.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/geometry/Segment.java
+@@ -55,4 +55,73 @@
+     public double max() {
+         return this.maxX();
+     }
++
++    public Segment(double x0, double z0, double x1, double z1) {
++        this.x0 = x0;
++        this.z0 = z0;
++        this.x1 = x1;
++        this.z1 = z1;
++    }
++
++    public double x0() {
++        return this.x0;
++    }
++
++    public double z0() {
++        return this.z0;
++    }
++
++    public double x1() {
++        return this.x1;
++    }
++
++    public double z1() {
++        return this.z1;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof Segment)) {
++            return false;
++        }
++        final Segment other = (Segment) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (Double.compare(this.x0, other.x0) != 0) {
++            return false;
++        }
++        if (Double.compare(this.z0, other.z0) != 0) {
++            return false;
++        }
++        if (Double.compare(this.x1, other.x1) != 0) {
++            return false;
++        }
++        if (Double.compare(this.z1, other.z1) != 0) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof Segment;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        final long $x0 = Double.doubleToLongBits(this.x0);
++        result = result * PRIME + (int) ($x0 >>> 32 ^ $x0);
++        final long $z0 = Double.doubleToLongBits(this.z0);
++        result = result * PRIME + (int) ($z0 >>> 32 ^ $z0);
++        final long $x1 = Double.doubleToLongBits(this.x1);
++        result = result * PRIME + (int) ($x1 >>> 32 ^ $x1);
++        final long $z1 = Double.doubleToLongBits(this.z1);
++        result = result * PRIME + (int) ($z1 >>> 32 ^ $z1);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/geometry/line/AbstractLine.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/geometry/line/AbstractLine.java
+@@ -48,4 +48,8 @@
+     public double maxZ() {
+         return this.segments.maxZ();
+     }
++
++    public BVH<Segment> segments() {
++        return this.segments;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/dataset/vector/geometry/polygon/AbstractPolygon.java
++++ b/net/buildtheearth/terraminusminus/dataset/vector/geometry/polygon/AbstractPolygon.java
+@@ -99,4 +99,24 @@
+         //retried multiple times with different offsets and it still failed, abort...
+         return TerraConstants.EMPTY_DOUBLE_ARRAY;
+     }
++
++    public IntervalTree<Segment> segments() {
++        return this.segments;
++    }
++
++    public double minX() {
++        return this.minX;
++    }
++
++    public double maxX() {
++        return this.maxX;
++    }
++
++    public double minZ() {
++        return this.minZ;
++    }
++
++    public double maxZ() {
++        return this.maxZ;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/util/bvh/EmptyBVH.java
++++ b/net/buildtheearth/terraminusminus/util/bvh/EmptyBVH.java
+@@ -81,4 +81,7 @@
+     public Spliterator<V> spliterator() {
+         return Spliterators.emptySpliterator();
+     }
++
++    private EmptyBVH() {
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/util/bvh/QuadtreeBVH.java
++++ b/net/buildtheearth/terraminusminus/util/bvh/QuadtreeBVH.java
+@@ -294,4 +294,24 @@
+             }
+         }
+     }
++
++    public int size() {
++        return this.size;
++    }
++
++    public double minX() {
++        return this.minX;
++    }
++
++    public double maxX() {
++        return this.maxX;
++    }
++
++    public double minZ() {
++        return this.minZ;
++    }
++
++    public double maxZ() {
++        return this.maxZ;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/util/bvh/SingletonBVH.java
++++ b/net/buildtheearth/terraminusminus/util/bvh/SingletonBVH.java
+@@ -78,4 +78,11 @@
+     public Spliterator<V> spliterator() {
+         return this.stream().spliterator();
+     }
++
++    public SingletonBVH(V value) {
++        if (value == null) {
++            throw new NullPointerException("value is marked non-null but is null");
++        }
++        this.value = value;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/util/interval/IntervalImpl.java
++++ b/net/buildtheearth/terraminusminus/util/interval/IntervalImpl.java
+@@ -17,4 +17,53 @@
+ class IntervalImpl implements Interval {
+     protected final double min;
+     protected final double max;
++
++    public IntervalImpl(double min, double max) {
++        this.min = min;
++        this.max = max;
++    }
++
++    public double min() {
++        return this.min;
++    }
++
++    public double max() {
++        return this.max;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == this) {
++            return true;
++        }
++        if (!(o instanceof IntervalImpl)) {
++            return false;
++        }
++        final IntervalImpl other = (IntervalImpl) o;
++        if (!other.canEqual(this)) {
++            return false;
++        }
++        if (Double.compare(this.min, other.min) != 0) {
++            return false;
++        }
++        if (Double.compare(this.max, other.max) != 0) {
++            return false;
++        }
++        return true;
++    }
++
++    protected boolean canEqual(Object other) {
++        return other instanceof IntervalImpl;
++    }
++
++    @Override
++    public int hashCode() {
++        final int PRIME = 59;
++        int result = 1;
++        final long $min = Double.doubleToLongBits(this.min);
++        result = result * PRIME + (int) ($min >>> 32 ^ $min);
++        final long $max = Double.doubleToLongBits(this.max);
++        result = result * PRIME + (int) ($max >>> 32 ^ $max);
++        return result;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/util/interval/IntervalTree.java
++++ b/net/buildtheearth/terraminusminus/util/interval/IntervalTree.java
+@@ -259,4 +259,8 @@
+             return new Node<>((childIndex & 1) != 0 ? m : this.min, (childIndex & 1) != 0 ? this.max : m);
+         }
+     }
++
++    public int size() {
++        return this.size;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/substitutes/Identifier.java
++++ b/net/buildtheearth/terraminusminus/substitutes/Identifier.java
+@@ -153,4 +153,11 @@
+         return spaces != 0 ? spaces: this.path.compareTo(other.path);
+ 	}
+ 
++    public String namespace() {
++        return this.namespace;
++    }
++
++    public String path() {
++        return this.path;
++    }
+ }
+\ No newline at end of file
+--- a/net/buildtheearth/terraminusminus/substitutes/exceptions/TranslateToForeignObjectException.java
++++ b/net/buildtheearth/terraminusminus/substitutes/exceptions/TranslateToForeignObjectException.java
+@@ -27,4 +27,11 @@
+         this.foreignClass = foreignClass;
+     }
+ 
++    public Object substituteObject() {
++        return this.substituteObject;
++    }
++
++    public Class<?> foreignClass() {
++        return this.foreignClass;
++    }
+ }
+--- a/net/buildtheearth/terraminusminus/substitutes/exceptions/TranslateToSubstituteException.java
++++ b/net/buildtheearth/terraminusminus/substitutes/exceptions/TranslateToSubstituteException.java
+@@ -27,4 +27,11 @@
+         this.substituteClass = substituteClass;
+     }
+ 
++    public Object foreignObject() {
++        return this.foreignObject;
++    }
++
++    public Class<?> substituteClass() {
++        return this.substituteClass;
++    }
+ }

@@ -1,0 +1,5 @@
+# name	tile file	lon0	lat0	blocks per degree	chunk min x	chunk max x	chunk min z	chunk max z	mapping
+city	scenes/city/tile.json	2.35	48.85	100000.0	-4	3	-4	3	default
+caspian_edge	scenes/caspian_edge/tile.json	45.637	40.0	100000.0	-3	2	-3	2	default
+southern_coast	scenes/southern_coast/tile.json	-58.38	-34.6	80000.0	-3	2	-3	2	default
+custom_mapping	scenes/custom_mapping/tile.json	10.0	0.05	100000.0	-4	3	-4	3	mappings/exhaustive.json5

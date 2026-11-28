@@ -1,0 +1,22 @@
+terrarium/12/759/1608.png
+
+A single 256x256 Terrarium-encoded elevation tile (zoom 12, x 759, y 1608; roughly
+113.29W-113.20W, 35.96N-36.03N, western Grand Canyon). It is the AWS/Mapzen terrain tile
+redistributed as a test asset by MapLibre GL JS:
+
+  repository: https://github.com/maplibre/maplibre-gl-js
+  commit:     763245d93043f479f6bf3f653b33d6368b68a886
+  path:       test/integration/assets/tiles/12-759-1608.terrarium.png
+  git blob:   8587a6663d1ca001bec526c916a9c99e3139c02f
+  sha256:     0028d855e2def76dc8b5c7f484b4842f6f22185d8040718252a1142ce22bcceb
+
+MapLibre GL JS is distributed under the BSD-3-Clause license (Copyright (c) 2023, MapLibre
+contributors; Copyright (c) 2020, Mapbox).
+
+Terrain data attribution (https://github.com/tilezen/joerd/blob/master/docs/attribution.md):
+the Terrain Tiles combine USGS 3DEP/NED (public domain) and other open elevation sources,
+produced by Mapzen and distributed through the AWS Open Data registry.
+
+The upstream TerraMinusMinus configuration samples this dataset at zoom 13 (and zoom 10 below
+1 m). Only this zoom-12 tile is available offline, so offline fixtures use a zoom-12 dataset
+with the same parser and blend mode; live zoom-13 behaviour is covered by opt-in tests.

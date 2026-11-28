@@ -1,0 +1,256 @@
+//! The chat text of TerraPlusMinus' commands, reproducing upstream strings and number
+//! formatting (`Double.toString` concatenation, root-locale `String.format`).
+
+use crate::config::ServerConfig;
+use crate::java_text::{java_double_to_string, java_format_fixed};
+use crate::tpll::{LinkedWorldsMethod, TpllStep};
+use terra_projection::{GeographicProjection, ProjectedCoordinate};
+
+pub const DEFAULT_PREFIX: &str = "§2§lT+- §8» ";
+
+/// A run of chat text with one style, as Bukkit's `CraftChatMessage.fromString` splits a
+/// legacy string: a colour code starts a fresh style, `k`-`o` add a decoration, `r` resets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StyledSpan {
+    pub text: String,
+    pub color: Option<&'static str>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underlined: bool,
+    pub strikethrough: bool,
+    pub obfuscated: bool,
+}
+
+const LEGACY_COLORS: [&str; 16] = [
+    "black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red",
+    "light_purple", "yellow", "white",
+];
+
+pub fn legacy_spans(text: &str) -> Vec<StyledSpan> {
+    let mut spans = Vec::new();
+    let mut current = StyledSpan::default();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        let code = if character == '§' { characters.peek().map(char::to_ascii_lowercase) } else { None };
+        let mut style = current.clone();
+        style.text.clear();
+        match code {
+            Some(digit @ ('0'..='9' | 'a'..='f')) => {
+                let index = digit.to_digit(16).unwrap_or(15) as usize;
+                style = StyledSpan { color: Some(LEGACY_COLORS[index]), ..StyledSpan::default() };
+            }
+            Some('k') => style.obfuscated = true,
+            Some('l') => style.bold = true,
+            Some('m') => style.strikethrough = true,
+            Some('n') => style.underlined = true,
+            Some('o') => style.italic = true,
+            Some('r') => style = StyledSpan::default(),
+            _ => {
+                current.text.push(character);
+                continue;
+            }
+        }
+        characters.next();
+        if !current.text.is_empty() {
+            spans.push(std::mem::take(&mut current));
+        }
+        current = style;
+    }
+    if !current.text.is_empty() {
+        spans.push(current);
+    }
+    spans
+}
+
+/// One chat message: legacy-coded text, and optionally a URL opened on click with its hover text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub text: String,
+    pub link: Option<ChatLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLink {
+    pub url: String,
+    pub hover: String,
+}
+
+impl From<String> for ChatMessage {
+    fn from(text: String) -> Self {
+        Self { text, link: None }
+    }
+}
+
+pub fn tpll_usage(prefix: &str) -> String {
+    format!("{prefix}§7Invalid coordinates or command usage!\nUsage: /tpll <latitude> <longitude> [height]\n       /tpll -p <player/@selector> <latitude> <longitude> [height]")
+}
+
+pub fn unavailable(prefix: &str) -> String {
+    format!("{prefix}§cThis location is currently unavailable. Please try again later.")
+}
+
+/// Lines for a finished `/tpll` step, in order. A teleport's lines assume the move was accepted.
+pub fn tpll_step_lines(step: &TpllStep, prefix: &str) -> Vec<String> {
+    match step {
+        TpllStep::Usage => vec![tpll_usage(prefix)],
+        TpllStep::OutsideProjection => vec![format!("{prefix}§cLocation is not within projection bounds.")],
+        TpllStep::OutsideTeamBounds => vec![format!("{prefix}§cYou cannot tpll to these coordinates, because this area is being worked on by another build team.")],
+        TpllStep::UngeneratedChunkDenied => {
+            vec![format!("{prefix}§cYou cannot tpll to these coordinates, because the chunk is not generated yet and you are not allowed to generate new chunks.")]
+        }
+        TpllStep::Unreachable => vec![format!("{prefix}§cThese coordinates cannot be reached on this server.")],
+        TpllStep::LinkedWorldUnavailable { .. } | TpllStep::NeedsSurface { .. } => vec![unavailable(prefix)],
+        TpllStep::LinkedServer { .. } => vec![format!("{prefix}§7Teleporting to linked server...")],
+        TpllStep::Teleport { reported, reported_height, linked, .. } => {
+            let latitude = java_double_to_string(reported.latitude);
+            let longitude = java_double_to_string(reported.longitude);
+            if *linked {
+                vec![
+                    format!("{prefix}§7Teleporting to linked world..."),
+                    format!("{prefix}§7Teleported to {latitude}, {longitude}, {}.", java_double_to_string(f64::from(*reported_height))),
+                ]
+            } else {
+                vec![format!("{prefix}§7Teleported to {latitude}, {longitude}, {reported_height}.")]
+            }
+        }
+    }
+}
+
+/// `/where` at block position (`x`, `z`), `projection` including the terrain offset. Upstream
+/// makes the whole message open the location in Google Maps.
+pub fn where_message(projection: &dyn GeographicProjection, x: f64, z: f64, prefix: &str) -> ChatMessage {
+    match projection.to_geo(ProjectedCoordinate::new(x, z)) {
+        Ok(geo) => {
+            let (latitude, longitude) = (java_double_to_string(geo.latitude), java_double_to_string(geo.longitude));
+            ChatMessage {
+                text: format!("{prefix}§7Your coordinates are:\n§8{latitude}, {longitude}§7."),
+                link: Some(ChatLink {
+                    url: format!("https://maps.google.com/maps?t=k&q=loc:{latitude}+{longitude}"),
+                    hover: "§7Click here to view in Google Maps.".to_owned(),
+                }),
+            }
+        }
+        Err(_) => format!("{prefix}§cYou are currently outside of the world's projection and your location in the Minecraft world has no equivalent on Earth.").into(),
+    }
+}
+
+pub fn offset_lines(config: &ServerConfig, prefix: &str) -> Vec<String> {
+    let mut lines = vec![format!("{prefix}§7Offsets:"), format!("{prefix}§7 | X: §8{}", config.generator.x_offset)];
+    let linked = &config.linked_worlds;
+    if linked.enabled && linked.method == LinkedWorldsMethod::Levels {
+        lines.extend(linked.worlds.iter().map(|world| format!("{prefix}§9 {}§7 | Y: §8{}", world.name, world.offset)));
+    } else {
+        lines.push(format!("{prefix}§7 | Y: §8{}", config.generator.y_offset));
+    }
+    lines.push(format!("{prefix}§7 | Z: §8{}", config.generator.z_offset));
+    lines
+}
+
+/// `/distortion` at block position (`x`, `z`), one chat message with line breaks.
+pub fn distortion_message(projection: &dyn GeographicProjection, x: f64, z: f64) -> String {
+    let tissot = projection.to_geo(ProjectedCoordinate::new(x, z)).and_then(|geo| projection.tissot(geo.longitude, geo.latitude));
+    match tissot {
+        Ok([area, angular, max_scale, min_scale]) => format!(
+            "§6Distortion Analysis\n§7Avg scale: §f{} m/m\n§7Max scale: §f{}\n§7Min scale: §f{}\n§7Angular distortion: §f± {}°\n§7Area factor: §f{}",
+            java_format_fixed((max_scale + min_scale) / 2.0, 6),
+            java_format_fixed(max_scale, 6),
+            java_format_fixed(min_scale, 6),
+            java_format_fixed(angular.to_degrees(), 4),
+            java_format_fixed(area, 6),
+        ),
+        Err(_) => "§cYou are outside the projection bounds.".to_owned(),
+    }
+}
+
+/// `PlayerCommandEvent` with `passthrough_tpll`: a typed command (without its slash) that starts
+/// with `tpll` goes to that plugin's namespace instead (`/tpll 1 2` runs `/<namespace>:tpll 1 2`).
+pub fn passthrough_command(command: &str, namespace: &str) -> Option<String> {
+    command.starts_with("tpll").then(|| format!("{namespace}:{command}"))
+}
+
+/// `PlayerMoveEvent.completeTransition`.
+pub fn linked_world_transition(prefix: &str) -> String {
+    format!("{prefix}§7Teleporting to linked world...")
+}
+
+/// `/tpll -p`: what the sender is told after the targets were handled (`executeTarget`).
+pub fn forced_tpll_summary(targets: usize, prefix: &str) -> String {
+    format!("{prefix}§7Executed tpll for {targets} player(s).")
+}
+
+/// `PlayerMoveEvent.setHeightInActionBar`: `getBlockY() - offset` followed by `m`, shown bold.
+/// `y` is the player's feet position; `offset` comes from [`ServerConfig::actionbar_offset`].
+pub fn actionbar_height(y: f64, offset: i32) -> String {
+    // Location.getBlockY is `floor` into an int; saturating like Java's `(int)` of a double.
+    let block_y = y.floor() as i32;
+    format!("{}m", block_y.wrapping_sub(offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_rewrites_like_player_command_event() {
+        assert_eq!(passthrough_command("tpll 48.8 2.3", "vanillatpll").as_deref(), Some("vanillatpll:tpll 48.8 2.3"));
+        assert_eq!(passthrough_command("tpll", "vanillatpll").as_deref(), Some("vanillatpll:tpll"));
+        // Upstream tests `startsWith("/tpll")`: /tpc and other commands are left alone.
+        assert_eq!(passthrough_command("tpc 1 2", "vanillatpll"), None);
+        assert_eq!(passthrough_command("where", "vanillatpll"), None);
+        assert_eq!(passthrough_command("vanillatpll:tpll 1 2", "vanillatpll"), None, "no loop");
+        let server = TpllStep::LinkedServer { upward: true, reported: crate::coordinates::LatLng { latitude: 1.0, longitude: 2.0 } };
+        assert_eq!(tpll_step_lines(&server, "P "), vec!["P §7Teleporting to linked server...".to_owned()]);
+        assert_eq!(linked_world_transition("P "), "P §7Teleporting to linked world...");
+    }
+
+    #[test]
+    fn actionbar_and_forced_tpll_text_match_upstream() {
+        assert_eq!(actionbar_height(64.9, 0), "64m");
+        assert_eq!(actionbar_height(-0.5, 0), "-1m");
+        assert_eq!(actionbar_height(100.0, -2032), "2132m");
+        assert_eq!(actionbar_height(10.0, 2032), "-2022m");
+        assert_eq!(forced_tpll_summary(3, "§2§lT+- §8» "), "§2§lT+- §8» §7Executed tpll for 3 player(s).");
+    }
+    use crate::coordinates::LatLng;
+
+    #[test]
+    fn teleport_lines_follow_upstream_number_formatting() {
+        let reported = LatLng { latitude: 50.0, longitude: -113.25 };
+        let step = TpllStep::Teleport { world: "earth".into(), x: 0.0, y: 0.0, z: 0.0, reported, reported_height: 3000, linked: false };
+        assert_eq!(tpll_step_lines(&step, "P "), vec!["P §7Teleported to 50.0, -113.25, 3000.".to_owned()]);
+        let linked = TpllStep::Teleport { world: "sky".into(), x: 0.0, y: 0.0, z: 0.0, reported, reported_height: 3000, linked: true };
+        assert_eq!(tpll_step_lines(&linked, "")[1], "§7Teleported to 50.0, -113.25, 3000.0.");
+    }
+
+    #[test]
+    fn legacy_codes_become_styles_like_bukkit() {
+        let spans = legacy_spans(DEFAULT_PREFIX);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].text.as_str(), spans[0].color, spans[0].bold), ("T+- ", Some("dark_green"), true));
+        assert_eq!((spans[1].text.as_str(), spans[1].color, spans[1].bold), ("» ", Some("dark_gray"), false));
+        let spans = legacy_spans("a§Lb§rc§zd§");
+        assert_eq!(spans.iter().map(|span| (span.text.as_str(), span.bold)).collect::<Vec<_>>(), vec![("a", false), ("b", true), ("c§zd§", false)]);
+    }
+
+    #[test]
+    fn where_links_the_reported_coordinates() {
+        let projection = terra_projection::terraplusminus_projection(0, 0).unwrap();
+        let message = where_message(projection.as_ref(), 3517417.0, -5288234.0, "");
+        let link = message.link.unwrap();
+        assert!(message.text.starts_with("§7Your coordinates are:\n§8"));
+        assert!(link.url.starts_with("https://maps.google.com/maps?t=k&q=loc:"));
+        assert!(where_message(projection.as_ref(), 1e9, 1e9, "").link.is_none());
+    }
+
+    #[test]
+    fn offsets_list_linked_levels_instead_of_y() {
+        let mut config = ServerConfig::default();
+        config.generator.y_offset = -5;
+        assert!(offset_lines(&config, "").contains(&"§7 | Y: §8-5".to_owned()));
+        config.linked_worlds.enabled = true;
+        config.linked_worlds.worlds.push(crate::tpll::LinkedWorld { name: "sky".into(), offset: -2032 });
+        let lines = offset_lines(&config, "");
+        assert_eq!(lines[2], "§9 sky§7 | Y: §8-2032");
+        assert_eq!(lines.len(), 4);
+    }
+}

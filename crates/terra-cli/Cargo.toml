@@ -1,0 +1,19 @@
+[package]
+name = "terra-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "terraplusminus"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+terra-chunk-generation = { path = "../terra-chunk-generation" }
+terra-projection = { path = "../terra-projection" }
+terra-server = { path = "../terra-server" }

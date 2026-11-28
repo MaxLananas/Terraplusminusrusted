@@ -1,0 +1,19 @@
+# Staged by scripts/stage-horizon-mod.sh, which copies the terra crates under crates/ so every
+# path stays inside the mod package, as the Horizon launcher requires. Not a workspace member.
+[package]
+name = "terraplusminus-horizon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Its own (empty) workspace: the staged copy may sit inside another Cargo workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+terra-chunk-generation = { path = "crates/terra-chunk-generation" }
+terra-server = { path = "crates/terra-server" }
